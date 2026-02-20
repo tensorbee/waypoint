@@ -9,13 +9,25 @@ Lightweight, Flyway-compatible PostgreSQL migration tool built in Rust.
 
 ## Install
 
-### CLI from crates.io
+### Quick install (Linux / macOS)
+
+```bash
+curl -sSf https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh | sh
+```
+
+Pin a specific version:
+
+```bash
+curl -sSf https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh | WAYPOINT_VERSION=v0.2.0 sh
+```
+
+### From crates.io
 
 ```bash
 cargo install waypoint-cli
 ```
 
-### CLI from source
+### From source
 
 ```bash
 cargo install --path waypoint-cli
