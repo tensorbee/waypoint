@@ -26,6 +26,10 @@ COPY waypoint-cli/ waypoint-cli/
 # Copy .git if present (for build metadata), ignore failure
 COPY .gi[t] .git
 
+# Touch sources so cargo detects changes over dummy build
+# (Docker COPY preserves original file timestamps)
+RUN touch waypoint-core/src/lib.rs waypoint-cli/src/main.rs
+
 # Build release binary
 RUN cargo build --release --bin waypoint
 
