@@ -1,0 +1,37 @@
+[database]
+# Connection URL (takes precedence over individual fields)
+# url = "postgres://user:password@localhost:5432/mydb"
+
+# Or specify individual connection fields:
+# host = "localhost"
+# port = 5432
+# user = "postgres"
+# password = "password"
+# database = "mydb"
+
+[migrations]
+locations = ["db/migrations"]
+table = "waypoint_schema_history"
+schema = "public"
+out_of_order = false
+validate_on_migrate = true
+clean_enabled = false
+baseline_version = "1"
+
+[hooks]
+# SQL files to run before/after migrations (paths relative to project root)
+# before_migrate = ["sql/hooks/pre.sql"]
+# after_migrate = ["sql/hooks/post.sql"]
+# before_each_migrate = ["sql/hooks/pre_each.sql"]
+# after_each_migrate = ["sql/hooks/post_each.sql"]
+#
+# You can also place hook files directly in migration locations:
+#   beforeMigrate.sql / beforeMigrate__*.sql
+#   afterMigrate.sql  / afterMigrate__*.sql
+#   beforeEachMigrate.sql / beforeEachMigrate__*.sql
+#   afterEachMigrate.sql  / afterEachMigrate__*.sql
+
+[placeholders]
+# Define custom placeholders to use in migration SQL files as ${key}
+# env = "production"
+# app_schema = "myapp"

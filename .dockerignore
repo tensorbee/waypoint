@@ -1,0 +1,17 @@
+target/
+.git/
+.github/
+.claude/
+
+*.md
+!CLAUDE.md
+
+deny.toml
+.env
+.env.*
+waypoint.toml
+
+*.log
+*.swp
+*.swo
+*~

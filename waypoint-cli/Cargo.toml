@@ -1,0 +1,23 @@
+[package]
+name = "waypoint-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight SQL migration tool - CLI"
+
+[[bin]]
+name = "waypoint"
+path = "src/main.rs"
+
+[dependencies]
+waypoint-core = { path = "../waypoint-core" }
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+colored = "2"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+
+[build-dependencies]
+chrono = "0.4"

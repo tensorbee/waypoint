@@ -1,0 +1,3 @@
+[workspace]
+members = ["waypoint-core", "waypoint-cli"]
+resolver = "2"
