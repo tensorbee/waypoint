@@ -1,6 +1,6 @@
 [package]
 name = "waypoint-cli"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Lightweight, Flyway-compatible PostgreSQL migration CLI"
 license = "MIT"
@@ -16,7 +16,7 @@ name = "waypoint"
 path = "src/main.rs"
 
 [dependencies]
-waypoint-core = { version = "0.3.0", path = "../waypoint-core" }
+waypoint-core = { version = "0.3.1", path = "../waypoint-core" }
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
 colored = "2"
