@@ -1,4 +1,4 @@
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use tokio_postgres::Client;
 
 use crate::db::quote_ident;
@@ -14,7 +14,7 @@ pub struct AppliedMigration {
     pub script: String,
     pub checksum: Option<i32>,
     pub installed_by: String,
-    pub installed_on: NaiveDateTime,
+    pub installed_on: DateTime<Utc>,
     pub execution_time: i32,
     pub success: bool,
 }

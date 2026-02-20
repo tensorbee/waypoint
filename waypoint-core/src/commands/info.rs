@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use chrono::NaiveDateTime;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio_postgres::Client;
 
@@ -47,7 +47,7 @@ pub struct MigrationInfo {
     pub migration_type: String,
     pub script: String,
     pub state: MigrationState,
-    pub installed_on: Option<NaiveDateTime>,
+    pub installed_on: Option<DateTime<Utc>>,
     pub execution_time: Option<i32>,
     pub checksum: Option<i32>,
 }
