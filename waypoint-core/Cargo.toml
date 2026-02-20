@@ -9,6 +9,7 @@ homepage = "https://github.com/mantissaman/waypoint"
 keywords = ["database", "migration", "postgresql", "flyway", "sql"]
 categories = ["database"]
 readme = "../README.md"
+documentation = "https://docs.rs/waypoint-core"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }

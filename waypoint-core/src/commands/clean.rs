@@ -1,3 +1,5 @@
+//! Drop all objects in managed schemas (destructive).
+
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;

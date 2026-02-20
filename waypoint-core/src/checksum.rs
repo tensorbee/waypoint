@@ -1,3 +1,5 @@
+//! CRC32 checksum calculation, compatible with Flyway's line-by-line algorithm.
+
 use crc32fast::Hasher;
 
 /// Calculate a CRC32 checksum of the given content, line by line.

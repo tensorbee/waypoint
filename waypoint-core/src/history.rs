@@ -1,3 +1,5 @@
+//! Schema history table operations (create, query, insert, update, delete).
+
 use chrono::{DateTime, Utc};
 use tokio_postgres::Client;
 

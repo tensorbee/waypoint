@@ -1,3 +1,7 @@
+//! Migration file parsing, scanning, and types.
+//!
+//! Supports versioned (`V{version}__{desc}.sql`) and repeatable (`R__{desc}.sql`) migrations.
+
 use std::cmp::Ordering;
 use std::fmt;
 use std::sync::LazyLock;
@@ -19,6 +23,7 @@ pub struct MigrationVersion {
 }
 
 impl MigrationVersion {
+    /// Parse a version string like `"1.2.3"` or `"1_2"` into segments.
     pub fn parse(raw: &str) -> Result<Self> {
         if raw.is_empty() {
             return Err(WaypointError::MigrationParseError(

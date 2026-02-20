@@ -1,3 +1,5 @@
+//! SQL callback hooks that run before/after migrations (Flyway-compatible).
+
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;

@@ -1,3 +1,5 @@
+//! Apply pending migrations to the database.
+
 use std::collections::HashMap;
 
 use serde::Serialize;
@@ -21,6 +23,7 @@ pub struct MigrateReport {
     pub hooks_time_ms: i32,
 }
 
+/// Details of a single applied migration within a migrate run.
 #[derive(Debug, Serialize)]
 pub struct MigrateDetail {
     pub version: Option<String>,

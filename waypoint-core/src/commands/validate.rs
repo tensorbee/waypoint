@@ -1,3 +1,5 @@
+//! Validate applied migrations against local files (checksum and ordering).
+
 use std::collections::HashMap;
 
 use serde::Serialize;

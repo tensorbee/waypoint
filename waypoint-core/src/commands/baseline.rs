@@ -1,3 +1,5 @@
+//! Baseline an existing database at a specific version.
+
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;

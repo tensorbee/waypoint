@@ -1,3 +1,5 @@
+//! Database connection, TLS support, advisory locking, and transaction execution.
+
 use rand::Rng;
 use tokio_postgres::Client;
 

@@ -1,3 +1,5 @@
+//! Repair the schema history table (remove failed entries, update checksums).
+
 use std::collections::HashMap;
 
 use serde::Serialize;

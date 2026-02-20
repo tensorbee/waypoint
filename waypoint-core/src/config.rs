@@ -1,3 +1,8 @@
+//! Configuration loading and resolution.
+//!
+//! Supports TOML config files, environment variables, and CLI overrides
+//! with a defined priority order (CLI > env > TOML > defaults).
+
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;

@@ -1,3 +1,32 @@
+//! Lightweight, Flyway-compatible PostgreSQL migration library.
+//!
+//! # Quick Start
+//!
+//! ```rust,no_run
+//! use waypoint_core::config::WaypointConfig;
+//! use waypoint_core::Waypoint;
+//!
+//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = WaypointConfig::load(None, None)?;
+//! let wp = Waypoint::new(config).await?;
+//! let report = wp.migrate(None).await?;
+//! println!("Applied {} migrations", report.migrations_applied);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Architecture
+//!
+//! - [`config`] — Configuration loading (TOML, env vars, CLI overrides)
+//! - [`migration`] — Migration file parsing and scanning
+//! - [`db`] — Database connections, TLS, advisory locks
+//! - [`history`] — Schema history table operations
+//! - [`commands`] — Individual command implementations (migrate, info, validate, repair, baseline, clean)
+//! - [`checksum`] — CRC32 checksums (Flyway-compatible)
+//! - [`placeholder`] — `${key}` placeholder replacement in SQL
+//! - [`hooks`] — SQL callback hooks (before/after migrate)
+//! - [`error`] — Error types
+
 pub mod checksum;
 pub mod commands;
 pub mod config;

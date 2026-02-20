@@ -1,5 +1,13 @@
 # Waypoint
 
+[![CI](https://github.com/mantissaman/waypoint/actions/workflows/ci.yml/badge.svg)](https://github.com/mantissaman/waypoint/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/waypoint-core.svg)](https://crates.io/crates/waypoint-core)
+[![docs.rs](https://docs.rs/waypoint-core/badge.svg)](https://docs.rs/waypoint-core)
+[![Downloads](https://img.shields.io/crates/d/waypoint-core.svg)](https://crates.io/crates/waypoint-core)
+[![Docker Hub](https://img.shields.io/docker/v/mantissaman/waypoint?label=docker&sort=semver)](https://hub.docker.com/r/mantissaman/waypoint)
+[![Docker Pulls](https://img.shields.io/docker/pulls/mantissaman/waypoint)](https://hub.docker.com/r/mantissaman/waypoint)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Lightweight, Flyway-compatible PostgreSQL migration tool built in Rust.
 
 - **Fast** — single static binary, ~30MB Docker image

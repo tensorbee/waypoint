@@ -1,3 +1,5 @@
+//! Error types for Waypoint operations.
+
 use thiserror::Error;
 
 /// Extract the full error message from a tokio_postgres::Error,
@@ -27,6 +29,7 @@ pub fn format_db_error(e: &tokio_postgres::Error) -> String {
     msg
 }
 
+/// All error types that Waypoint operations can produce.
 #[derive(Error, Debug)]
 pub enum WaypointError {
     #[error("Configuration error: {0}")]
@@ -79,4 +82,5 @@ pub enum WaypointError {
     },
 }
 
+/// Convenience type alias for `Result<T, WaypointError>`.
 pub type Result<T> = std::result::Result<T, WaypointError>;

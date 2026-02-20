@@ -1,3 +1,5 @@
+//! Show migration status by merging resolved files with applied history.
+
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};

@@ -9,6 +9,7 @@ homepage = "https://github.com/mantissaman/waypoint"
 keywords = ["database", "migration", "postgresql", "flyway", "cli"]
 categories = ["command-line-utilities", "database"]
 readme = "../README.md"
+documentation = "https://docs.rs/waypoint-core"
 
 [[bin]]
 name = "waypoint"

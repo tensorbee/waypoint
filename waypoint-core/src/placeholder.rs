@@ -1,3 +1,5 @@
+//! Placeholder replacement in SQL (`${key}` syntax).
+
 use std::collections::HashMap;
 
 use regex::Regex;
