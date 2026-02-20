@@ -26,7 +26,7 @@ curl -sSf https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh
 Pin a specific version:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh | WAYPOINT_VERSION=v0.2.0 sh
+curl -sSf https://raw.githubusercontent.com/mantissaman/waypoint/main/install.sh | WAYPOINT_VERSION=v0.3.0 sh
 ```
 
 ### From crates.io
