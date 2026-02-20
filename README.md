@@ -9,10 +9,24 @@ Lightweight, Flyway-compatible PostgreSQL migration tool built in Rust.
 
 ## Install
 
-### From source
+### CLI from crates.io
+
+```bash
+cargo install waypoint-cli
+```
+
+### CLI from source
 
 ```bash
 cargo install --path waypoint-cli
+```
+
+### Library
+
+```toml
+[dependencies]
+waypoint-core = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ### Docker
@@ -237,6 +251,101 @@ after_migrate = ["hooks/after.sql"]
 | 5 | Migration or hook failed |
 | 6 | Lock error |
 | 7 | Clean disabled |
+
+## Using as a Library
+
+Add `waypoint-core` to embed migrations in your Rust application:
+
+```rust
+use waypoint_core::config::WaypointConfig;
+use waypoint_core::Waypoint;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load config from waypoint.toml + env vars
+    let config = WaypointConfig::load(None, None)?;
+    let wp = Waypoint::new(config).await?;
+
+    // Apply pending migrations
+    let report = wp.migrate(None).await?;
+    println!("Applied {} migrations", report.migrations_applied);
+
+    Ok(())
+}
+```
+
+### Build config programmatically
+
+```rust
+use std::path::PathBuf;
+use waypoint_core::config::{DatabaseConfig, MigrationSettings, WaypointConfig};
+use waypoint_core::Waypoint;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = WaypointConfig {
+        database: DatabaseConfig {
+            url: Some("postgres://user:pass@localhost:5432/mydb".to_string()),
+            ..Default::default()
+        },
+        migrations: MigrationSettings {
+            locations: vec![PathBuf::from("db/migrations")],
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let wp = Waypoint::new(config).await?;
+
+    // Check migration status
+    let infos = wp.info().await?;
+    for info in &infos {
+        println!("{:?} - {} - {}", info.state, info.version.as_deref().unwrap_or("R"), info.description);
+    }
+
+    // Apply migrations
+    let report = wp.migrate(None).await?;
+    println!("Applied {} migrations in {}ms", report.migrations_applied, report.total_time_ms);
+
+    // Validate
+    let validation = wp.validate().await?;
+    println!("Valid: {}", validation.valid);
+
+    Ok(())
+}
+```
+
+### Use with an existing connection
+
+```rust
+use waypoint_core::config::WaypointConfig;
+use waypoint_core::db;
+use waypoint_core::Waypoint;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = WaypointConfig::load(None, None)?;
+    let client = db::connect("postgres://user:pass@localhost:5432/mydb").await?;
+
+    let wp = Waypoint::with_client(config, client);
+    wp.migrate(None).await?;
+
+    Ok(())
+}
+```
+
+### Available methods
+
+| Method | Returns | Description |
+|---|---|---|
+| `Waypoint::new(config)` | `Waypoint` | Connect and create instance |
+| `Waypoint::with_client(config, client)` | `Waypoint` | Use existing connection |
+| `wp.migrate(target)` | `MigrateReport` | Apply pending migrations |
+| `wp.info()` | `Vec<MigrationInfo>` | Get migration status |
+| `wp.validate()` | `ValidateReport` | Validate applied migrations |
+| `wp.repair()` | `RepairReport` | Fix history table |
+| `wp.baseline(version, desc)` | `()` | Baseline existing database |
+| `wp.clean(allow)` | `Vec<String>` | Drop all managed objects |
 
 ## Development
 

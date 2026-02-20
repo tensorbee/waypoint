@@ -2,14 +2,20 @@
 name = "waypoint-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Lightweight SQL migration tool - CLI"
+description = "Lightweight, Flyway-compatible PostgreSQL migration CLI"
+license = "MIT"
+repository = "https://github.com/mantissaman/waypoint"
+homepage = "https://github.com/mantissaman/waypoint"
+keywords = ["database", "migration", "postgresql", "flyway", "cli"]
+categories = ["command-line-utilities", "database"]
+readme = "../README.md"
 
 [[bin]]
 name = "waypoint"
 path = "src/main.rs"
 
 [dependencies]
-waypoint-core = { path = "../waypoint-core" }
+waypoint-core = { version = "0.1.0", path = "../waypoint-core" }
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
 colored = "2"
