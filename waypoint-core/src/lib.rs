@@ -146,7 +146,25 @@ impl Waypoint {
 
     /// Apply pending migrations.
     pub async fn migrate(&self, target_version: Option<&str>) -> Result<MigrateReport> {
-        commands::migrate::execute(self.client.as_postgres()?, &self.config, target_version).await
+        match self.client.dialect_kind() {
+            #[cfg(feature = "postgres")]
+            DialectKind::Postgres => {
+                commands::migrate::execute(self.client.as_postgres()?, &self.config, target_version)
+                    .await
+            }
+            #[cfg(not(feature = "postgres"))]
+            DialectKind::Postgres => Err(error::WaypointError::ConfigError(
+                "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
+            )),
+            #[cfg(feature = "mysql")]
+            DialectKind::Mysql => {
+                commands::migrate::execute_mysql(&self.client, &self.config, target_version).await
+            }
+            #[cfg(not(feature = "mysql"))]
+            DialectKind::Mysql => Err(error::WaypointError::ConfigError(
+                "MySQL support is not compiled in (enable the `mysql` feature)".into(),
+            )),
+        }
     }
 
     /// Show migration status information.

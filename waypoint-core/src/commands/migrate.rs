@@ -3,10 +3,14 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+#[cfg(feature = "postgres")]
 use crate::db;
+use crate::db::DbClient;
 use crate::directive::MigrationDirectives;
 use crate::error::{Result, WaypointError};
 use crate::history;
@@ -390,7 +394,8 @@ async fn evaluate_ensure_guards(
     Ok(())
 }
 
-/// Execute the migrate command.
+/// Execute the migrate command (PostgreSQL).
+#[cfg(feature = "postgres")]
 pub async fn execute(
     client: &Client,
     config: &WaypointConfig,
@@ -399,7 +404,8 @@ pub async fn execute(
     execute_with_options(client, config, target_version, false).await
 }
 
-/// Execute the migrate command with additional options.
+/// Execute the migrate command with additional options (PostgreSQL).
+#[cfg(feature = "postgres")]
 pub async fn execute_with_options(
     client: &Client,
     config: &WaypointConfig,
@@ -1313,6 +1319,263 @@ async fn apply_migration(
             })
         }
     }
+}
+
+// ── MySQL migrate path (Phase 1: minimal viable) ──────────────────────────────
+//
+// This is a streamlined parallel implementation that supports the core flow on
+// MySQL 8.0+: scan migrations, read history, apply pending migrations in
+// installed_rank order, record results. It deliberately does NOT support:
+//   - validate-on-migrate (Phase 2)
+//   - preflight checks (Phase 3)
+//   - guards (Phase 3)
+//   - safety analysis / DANGER blocking (Phase 3)
+//   - auto-reversal generation (Phase 3+)
+//   - --transaction batch mode (intentional: MySQL DDL is non-transactional)
+//   - per-statement progress output (cosmetic, easy add later)
+//   - hooks (Phase 2)
+//
+// Things that DO work: placeholders, environment scoping, target-version,
+// repeatable migrations, checksum recording, idempotent re-runs, advisory
+// locking via GET_LOCK.
+
+/// Execute the migrate command (MySQL).
+pub async fn execute_mysql(
+    client: &DbClient,
+    config: &WaypointConfig,
+    target_version: Option<&str>,
+) -> Result<MigrateReport> {
+    execute_mysql_with_options(client, config, target_version, false).await
+}
+
+/// Execute the migrate command with options (MySQL).
+pub async fn execute_mysql_with_options(
+    client: &DbClient,
+    config: &WaypointConfig,
+    target_version: Option<&str>,
+    _force: bool,
+) -> Result<MigrateReport> {
+    let table = &config.migrations.table;
+
+    client.acquire_lock(table).await?;
+
+    let result = run_migrate_mysql(client, config, target_version).await;
+
+    if let Err(e) = client.release_lock(table).await {
+        log::error!("Failed to release advisory lock: {}", e);
+    }
+
+    match &result {
+        Ok(report) => {
+            log::info!(
+                "Migrate completed (mysql); migrations_applied={}, total_time_ms={}",
+                report.migrations_applied,
+                report.total_time_ms
+            );
+        }
+        Err(e) => {
+            log::error!("Migrate failed (mysql): {}", e);
+        }
+    }
+
+    result
+}
+
+async fn run_migrate_mysql(
+    client: &DbClient,
+    config: &WaypointConfig,
+    target_version: Option<&str>,
+) -> Result<MigrateReport> {
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
+    let table = &config.migrations.table;
+
+    history::create_history_table_db(client, &schema, table).await?;
+
+    let resolved = scan_migrations(&config.migrations.locations)?;
+    let applied = history::get_applied_migrations_db(client, &schema, table).await?;
+
+    let db_user = client
+        .current_user()
+        .await
+        .unwrap_or_else(|_| "unknown".into());
+    let db_name = client
+        .current_database()
+        .await
+        .unwrap_or_else(|_| "unknown".into());
+    let installed_by = config
+        .migrations
+        .installed_by
+        .as_deref()
+        .unwrap_or(&db_user)
+        .to_string();
+
+    let target = target_version.map(MigrationVersion::parse).transpose()?;
+    let baseline_version = applied
+        .iter()
+        .find(|a| a.migration_type == "BASELINE")
+        .and_then(|a| a.version.as_ref())
+        .map(|v| MigrationVersion::parse(v))
+        .transpose()?;
+    let effective_versions = history::effective_applied_versions(&applied);
+    let highest_applied = effective_versions
+        .iter()
+        .filter_map(|v| MigrationVersion::parse(v).ok())
+        .max();
+    let applied_scripts: HashMap<String, Option<i32>> = applied
+        .iter()
+        .filter(|a| a.success && a.version.is_none())
+        .map(|a| (a.script.clone(), a.checksum))
+        .collect();
+    let current_env = config.migrations.environment.as_deref();
+
+    // Filter pending versioned migrations.
+    let pending_versioned: Vec<&ResolvedMigration> = resolved
+        .iter()
+        .filter(|m| {
+            if m.is_undo() {
+                return false;
+            }
+            let v = match m.version() {
+                Some(v) => v,
+                None => return false,
+            };
+            if !m.is_versioned() {
+                return false;
+            }
+            if effective_versions.contains(&v.raw) {
+                return false;
+            }
+            if let Some(ref bl) = baseline_version {
+                if v <= bl {
+                    return false;
+                }
+            }
+            if let Some(ref t) = target {
+                if v > t {
+                    return false;
+                }
+            }
+            if !config.migrations.out_of_order {
+                if let Some(ref hi) = highest_applied {
+                    if v < hi {
+                        return false;
+                    }
+                }
+            }
+            if !should_run_in_environment(&m.directives, current_env) {
+                return false;
+            }
+            true
+        })
+        .collect();
+
+    let pending_repeatables: Vec<&ResolvedMigration> = resolved
+        .iter()
+        .filter(|m| {
+            if m.version().is_some() || m.is_undo() {
+                return false;
+            }
+            if !should_run_in_environment(&m.directives, current_env) {
+                return false;
+            }
+            match applied_scripts.get(&m.script) {
+                None => true,
+                Some(prev) => prev != &Some(m.checksum),
+            }
+        })
+        .collect();
+
+    let mut report = MigrateReport {
+        migrations_applied: 0,
+        total_time_ms: 0,
+        details: Vec::new(),
+        hooks_executed: 0,
+        hooks_time_ms: 0,
+    };
+
+    let mut sorted_versioned = pending_versioned.clone();
+    sorted_versioned.sort_by(|a, b| a.version().unwrap().cmp(b.version().unwrap()));
+
+    for m in sorted_versioned {
+        let placeholders =
+            build_placeholders(&config.placeholders, &schema, &db_user, &db_name, &m.script);
+        let elapsed =
+            apply_one_mysql(client, m, &schema, table, &installed_by, &placeholders).await?;
+        report.migrations_applied += 1;
+        report.total_time_ms += elapsed;
+        report.details.push(MigrateDetail {
+            version: m.version().map(|v| v.raw.clone()),
+            description: m.description.clone(),
+            script: m.script.clone(),
+            execution_time_ms: elapsed,
+        });
+    }
+
+    for m in pending_repeatables {
+        let placeholders =
+            build_placeholders(&config.placeholders, &schema, &db_user, &db_name, &m.script);
+        let elapsed =
+            apply_one_mysql(client, m, &schema, table, &installed_by, &placeholders).await?;
+        report.migrations_applied += 1;
+        report.total_time_ms += elapsed;
+        report.details.push(MigrateDetail {
+            version: None,
+            description: m.description.clone(),
+            script: m.script.clone(),
+            execution_time_ms: elapsed,
+        });
+    }
+
+    Ok(report)
+}
+
+async fn apply_one_mysql(
+    client: &DbClient,
+    m: &ResolvedMigration,
+    schema: &str,
+    table: &str,
+    installed_by: &str,
+    placeholders: &HashMap<String, String>,
+) -> Result<i32> {
+    let sql = replace_placeholders(&m.sql, placeholders)?;
+    log::info!("Applying migration; script={}", m.script);
+    let elapsed = client
+        .execute_raw(&sql)
+        .await
+        .map_err(|e| WaypointError::MigrationFailed {
+            script: m.script.clone(),
+            reason: e.to_string(),
+        })?;
+
+    let migration_type = if m.version().is_some() {
+        "SQL"
+    } else {
+        "SQL_REPEATABLE"
+    };
+    history::insert_applied_migration_db(
+        client,
+        schema,
+        table,
+        m.version().map(|v| v.raw.as_str()),
+        &m.description,
+        migration_type,
+        &m.script,
+        Some(m.checksum),
+        installed_by,
+        elapsed,
+        true,
+    )
+    .await?;
+
+    Ok(elapsed)
+}
+
+// Suppress "unused" warnings for HookType / ResolvedHook in MySQL-only paths
+// (hooks aren't ported yet — Phase 2).
+#[allow(dead_code)]
+mod _phase1_unused {
+    use super::{HookType, ResolvedHook};
+    fn _refs(_h: HookType, _r: ResolvedHook) {}
 }
 
 #[cfg(test)]

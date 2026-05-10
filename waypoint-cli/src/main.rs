@@ -338,7 +338,10 @@ fn exit_code(error: &WaypointError) -> i32 {
         WaypointError::MissingDependency { .. } => 3,
         WaypointError::InvalidDirective { .. } => 3,
         WaypointError::MultiDbDependencyCycle { .. } => 3,
+        #[cfg(feature = "postgres")]
         WaypointError::DatabaseError(_) => 4,
+        #[cfg(feature = "mysql")]
+        WaypointError::MysqlError(_) => 4,
         WaypointError::ConnectionLost { .. } => 4,
         WaypointError::MigrationFailed { .. } => 5,
         WaypointError::MigrationParseError(_) => 5,
@@ -1048,5 +1051,7 @@ fn print_error(error: &WaypointError) {
         | WaypointError::GitError(_)
         | WaypointError::AdvisorError(_)
         | WaypointError::IoError(_) => {}
+        #[cfg(feature = "mysql")]
+        WaypointError::MysqlError(_) => {}
     }
 }

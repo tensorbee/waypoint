@@ -148,6 +148,241 @@ impl DbClient {
             }
         }
     }
+
+    /// Acquire a session-scoped advisory lock keyed by the history-table name.
+    ///
+    /// PostgreSQL: `pg_advisory_lock(<i64>)` derived from a CRC32 of the table name.
+    /// MySQL: `GET_LOCK('waypoint_<table>', -1)` (named, indefinite-wait).
+    pub async fn acquire_lock(&self, table_name: &str) -> Result<()> {
+        match self {
+            #[cfg(feature = "postgres")]
+            DbClient::Postgres(c) => acquire_advisory_lock(c, table_name).await,
+            #[cfg(feature = "mysql")]
+            DbClient::Mysql(pool) => {
+                use mysql_async::prelude::*;
+                let key = mysql_lock_key(table_name);
+                let mut conn = pool.get_conn().await?;
+                let acquired: Option<i64> = conn
+                    .exec_first("SELECT GET_LOCK(?, -1)", (key.clone(),))
+                    .await?;
+                match acquired {
+                    Some(1) => Ok(()),
+                    _ => Err(WaypointError::LockError(format!(
+                        "Failed to acquire MySQL named lock {}",
+                        key
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Try to acquire the advisory lock, polling until acquired or timeout expires.
+    pub async fn acquire_lock_with_timeout(
+        &self,
+        table_name: &str,
+        timeout_secs: u32,
+    ) -> Result<()> {
+        match self {
+            #[cfg(feature = "postgres")]
+            DbClient::Postgres(c) => {
+                acquire_advisory_lock_with_timeout(c, table_name, timeout_secs).await
+            }
+            #[cfg(feature = "mysql")]
+            DbClient::Mysql(pool) => {
+                use mysql_async::prelude::*;
+                let key = mysql_lock_key(table_name);
+                let mut conn = pool.get_conn().await?;
+                let acquired: Option<i64> = conn
+                    .exec_first("SELECT GET_LOCK(?, ?)", (key.clone(), timeout_secs as i64))
+                    .await?;
+                match acquired {
+                    Some(1) => Ok(()),
+                    Some(0) => Err(WaypointError::LockError(format!(
+                        "Timed out waiting for MySQL named lock {} after {}s",
+                        key, timeout_secs
+                    ))),
+                    _ => Err(WaypointError::LockError(format!(
+                        "Failed to acquire MySQL named lock {} (NULL result)",
+                        key
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Release the advisory lock acquired via [`Self::acquire_lock`].
+    pub async fn release_lock(&self, table_name: &str) -> Result<()> {
+        match self {
+            #[cfg(feature = "postgres")]
+            DbClient::Postgres(c) => release_advisory_lock(c, table_name).await,
+            #[cfg(feature = "mysql")]
+            DbClient::Mysql(pool) => {
+                use mysql_async::prelude::*;
+                let key = mysql_lock_key(table_name);
+                let mut conn = pool.get_conn().await?;
+                conn.exec_drop("SELECT RELEASE_LOCK(?)", (key,)).await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Get the current database user/account.
+    pub async fn current_user(&self) -> Result<String> {
+        match self {
+            #[cfg(feature = "postgres")]
+            DbClient::Postgres(c) => get_current_user(c).await,
+            #[cfg(feature = "mysql")]
+            DbClient::Mysql(pool) => {
+                use mysql_async::prelude::*;
+                let mut conn = pool.get_conn().await?;
+                let user: Option<String> = conn.query_first("SELECT CURRENT_USER()").await?;
+                user.ok_or_else(|| {
+                    WaypointError::ConfigError("CURRENT_USER() returned no rows".into())
+                })
+            }
+        }
+    }
+
+    /// Get the current database name.
+    pub async fn current_database(&self) -> Result<String> {
+        match self {
+            #[cfg(feature = "postgres")]
+            DbClient::Postgres(c) => get_current_database(c).await,
+            #[cfg(feature = "mysql")]
+            DbClient::Mysql(pool) => {
+                use mysql_async::prelude::*;
+                let mut conn = pool.get_conn().await?;
+                // DATABASE() returns NULL when no schema is selected on the connection
+                let db: Option<Option<String>> = conn.query_first("SELECT DATABASE()").await?;
+                match db.flatten() {
+                    Some(name) => Ok(name),
+                    None => Err(WaypointError::ConfigError(
+                        "MySQL connection has no current database (none selected in URL)".into(),
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Resolve the schema/database name to use for the history table.
+    ///
+    /// On PostgreSQL the configured value is used as-is. On MySQL there is no
+    /// schema concept distinct from the database; if the configured value is
+    /// the PG-default `"public"`, we fall back to the connection's current
+    /// database so a PG-shaped config keeps working when pointed at MySQL.
+    pub async fn resolve_schema(&self, configured: &str) -> Result<String> {
+        match self.dialect_kind() {
+            DialectKind::Postgres => Ok(configured.to_string()),
+            DialectKind::Mysql => {
+                if configured == "public" {
+                    self.current_database().await
+                } else {
+                    Ok(configured.to_string())
+                }
+            }
+        }
+    }
+
+    /// Run one or more `;`-separated SQL statements without an explicit transaction.
+    ///
+    /// On PostgreSQL this is a single `batch_execute` call. On MySQL it splits
+    /// the batch into individual statements (mysql_async's underlying protocol
+    /// doesn't accept multiple statements unless the connection is built with
+    /// `CLIENT_MULTI_STATEMENTS`, which we deliberately avoid). Returns elapsed
+    /// time in milliseconds.
+    pub async fn execute_raw(&self, sql: &str) -> Result<i32> {
+        match self {
+            #[cfg(feature = "postgres")]
+            DbClient::Postgres(c) => execute_raw(c, sql).await,
+            #[cfg(feature = "mysql")]
+            DbClient::Mysql(pool) => {
+                use mysql_async::prelude::*;
+                let start = std::time::Instant::now();
+                let mut conn = pool.get_conn().await?;
+                for stmt in split_simple_statements(sql) {
+                    conn.query_drop(&stmt).await?;
+                }
+                Ok(start.elapsed().as_millis() as i32)
+            }
+        }
+    }
+
+    /// Run SQL inside a transaction where the engine supports DDL rollback.
+    ///
+    /// On PostgreSQL this issues `BEGIN` / `COMMIT` (with `ROLLBACK` on failure)
+    /// around `batch_execute`. On MySQL most DDL implicitly commits, so a
+    /// transaction wrapper provides no rollback guarantee for DDL — we issue
+    /// the statements without a wrapper and surface failures as they arise.
+    /// Callers needing strict batch atomicity should consult
+    /// [`DatabaseDialect::supports_transactional_ddl`] before invoking.
+    pub async fn execute_in_transaction(&self, sql: &str) -> Result<i32> {
+        match self {
+            #[cfg(feature = "postgres")]
+            DbClient::Postgres(c) => execute_in_transaction(c, sql).await,
+            #[cfg(feature = "mysql")]
+            DbClient::Mysql(_) => self.execute_raw(sql).await,
+        }
+    }
+}
+
+/// Split a `;`-delimited SQL batch into individual statements for engines that
+/// don't accept multi-statement batches over the wire (currently MySQL).
+///
+/// This is a deliberately simple splitter — it does NOT handle dollar-quoting
+/// (PG-only), `DELIMITER //` blocks, or string-literal `;` characters with full
+/// fidelity. For Phase 1 it covers the history-table DDL we generate; richer
+/// MySQL splitting (DELIMITER awareness for stored procedures) lives in
+/// [`crate::sql_parser`] and will be plumbed in when migrate is ported.
+#[cfg(feature = "mysql")]
+fn split_simple_statements(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
+    for c in sql.chars() {
+        match c {
+            '\'' if !in_double && !in_backtick => {
+                in_single = !in_single;
+                buf.push(c);
+            }
+            '"' if !in_single && !in_backtick => {
+                in_double = !in_double;
+                buf.push(c);
+            }
+            '`' if !in_single && !in_double => {
+                in_backtick = !in_backtick;
+                buf.push(c);
+            }
+            ';' if !in_single && !in_double && !in_backtick => {
+                let stmt = buf.trim();
+                if !stmt.is_empty() {
+                    out.push(stmt.to_string());
+                }
+                buf.clear();
+            }
+            _ => buf.push(c),
+        }
+    }
+    let tail = buf.trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
+}
+
+/// Compute the MySQL named-lock key for a given history table name.
+///
+/// MySQL `GET_LOCK` keys are arbitrary strings (truncated to 64 chars in 8.0+).
+/// We prefix `waypoint_` to avoid clashes with application locks and keep the
+/// key stable across versions.
+#[cfg(feature = "mysql")]
+fn mysql_lock_key(table_name: &str) -> String {
+    let mut k = format!("waypoint_{}", table_name);
+    if k.len() > 64 {
+        k.truncate(64);
+    }
+    k
 }
 
 // ── PostgreSQL-specific connection helpers (legacy entry points) ──────────────
