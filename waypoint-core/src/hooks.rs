@@ -250,7 +250,7 @@ mod tests {
         fs::write(dir.join("V1__Create_table.sql"), "CREATE TABLE t(id INT);").unwrap();
         fs::write(dir.join("R__Create_view.sql"), "CREATE VIEW v AS SELECT 1;").unwrap();
 
-        let hooks = scan_hooks(&[dir.clone()]).unwrap();
+        let hooks = scan_hooks(std::slice::from_ref(&dir)).unwrap();
 
         assert_eq!(hooks.len(), 2);
 
@@ -277,7 +277,7 @@ mod tests {
         fs::write(dir.join("beforeMigrate__A_first.sql"), "SELECT 1;").unwrap();
         fs::write(dir.join("beforeMigrate.sql"), "SELECT 0;").unwrap();
 
-        let hooks = scan_hooks(&[dir.clone()]).unwrap();
+        let hooks = scan_hooks(std::slice::from_ref(&dir)).unwrap();
 
         assert_eq!(hooks.len(), 3);
         assert_eq!(hooks[0].script_name, "beforeMigrate.sql");

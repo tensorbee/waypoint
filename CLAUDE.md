@@ -34,7 +34,7 @@ Cargo workspace with two crates:
 | `history.rs` | Schema history table CRUD (`waypoint_schema_history`) |
 | `db.rs` | Connection with TLS (rustls), advisory locks, transaction execution |
 | `hooks.rs` | SQL callback hooks (beforeMigrate, afterEachMigrate, etc.) |
-| `error.rs` | `WaypointError` enum (28 variants) with `thiserror` |
+| `error.rs` | `WaypointError` enum (35 variants) with `thiserror` |
 | `directive.rs` | Parse `-- waypoint:*` directives (env, depends, require, ensure, safety-override) |
 | `guard.rs` | Guard expression parser + evaluator (10 built-in assertion functions) |
 | `reversal.rs` | Auto-reversal generation from schema diffs, storage/retrieval |

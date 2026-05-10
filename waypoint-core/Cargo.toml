@@ -13,11 +13,6 @@ documentation = "https://docs.rs/waypoint-core"
 
 [dependencies]
 tokio = { version = "1", features = ["rt", "macros", "time"] }
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
-tokio-postgres-rustls = "0.12"
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pki-types = "1"
-webpki-roots = "0.26"
 fastrand = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +22,22 @@ thiserror = "2"
 log = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 regex-lite = "0.1"
+async-trait = "0.1"
+
+# PostgreSQL backend (default)
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"], optional = true }
+tokio-postgres-rustls = { version = "0.12", optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
+rustls-pki-types = { version = "1", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# MySQL backend (opt-in)
+mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust", "rustls-tls"], optional = true }
+
+[features]
+default = ["postgres"]
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
+mysql = ["dep:mysql_async"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

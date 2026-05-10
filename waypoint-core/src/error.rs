@@ -4,6 +4,7 @@ use thiserror::Error;
 
 /// Extract the full error message from a tokio_postgres::Error,
 /// including the underlying DbError details that Display hides.
+#[cfg(feature = "postgres")]
 pub fn format_db_error(e: &tokio_postgres::Error) -> String {
     // The source chain contains the actual DbError with message/detail/hint
     if let Some(db_err) = e.as_db_error() {
@@ -40,9 +41,15 @@ pub enum WaypointError {
     #[error("Configuration error: {0}")]
     ConfigError(String),
 
-    /// A database query or connection operation failed.
+    /// A database query or connection operation failed (PostgreSQL).
+    #[cfg(feature = "postgres")]
     #[error("Database error: {}", format_db_error(.0))]
     DatabaseError(#[from] tokio_postgres::Error),
+
+    /// A database query or connection operation failed (MySQL).
+    #[cfg(feature = "mysql")]
+    #[error("Database error: {0}")]
+    MysqlError(#[from] mysql_async::Error),
 
     /// A migration filename could not be parsed into a valid migration.
     #[error("Migration parse error: {0}")]

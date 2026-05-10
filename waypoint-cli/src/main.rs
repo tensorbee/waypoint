@@ -584,7 +584,9 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
     if dry_run {
         if let Commands::Migrate { .. } = &cli.command {
             let wp = Waypoint::new(config).await?;
-            let report = waypoint_core::commands::explain::execute(wp.client(), &wp.config).await?;
+            let report =
+                waypoint_core::commands::explain::execute(wp.postgres_client()?, &wp.config)
+                    .await?;
             print_report!(report, json_output, output::print_explain_report);
             return Ok(());
         }
@@ -659,7 +661,7 @@ async fn run_single_db_command(
             }
 
             let report = waypoint_core::commands::migrate::execute_with_options(
-                wp.client(),
+                wp.postgres_client()?,
                 &wp.config,
                 target.as_deref(),
                 force,
@@ -783,9 +785,12 @@ async fn run_single_db_command(
         }
         Commands::Safety { file } => {
             if let Some(path) = file {
-                let report =
-                    waypoint_core::commands::safety::execute_file(wp.client(), &wp.config, path)
-                        .await?;
+                let report = waypoint_core::commands::safety::execute_file(
+                    wp.postgres_client()?,
+                    &wp.config,
+                    path,
+                )
+                .await?;
                 print_report!(report, json_output, output::print_safety_report);
             } else {
                 let report = wp.safety().await?;
