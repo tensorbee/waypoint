@@ -226,12 +226,7 @@ impl Waypoint {
         &self,
         snapshot_config: &commands::snapshot::SnapshotConfig,
     ) -> Result<SnapshotReport> {
-        commands::snapshot::execute_snapshot(
-            self.client.as_postgres()?,
-            &self.config,
-            snapshot_config,
-        )
-        .await
+        commands::snapshot::execute_snapshot_db(&self.client, &self.config, snapshot_config).await
     }
 
     /// Restore from a schema snapshot.
@@ -240,8 +235,8 @@ impl Waypoint {
         snapshot_config: &commands::snapshot::SnapshotConfig,
         snapshot_id: &str,
     ) -> Result<RestoreReport> {
-        commands::snapshot::execute_restore(
-            self.client.as_postgres()?,
+        commands::snapshot::execute_restore_db(
+            &self.client,
             &self.config,
             snapshot_config,
             snapshot_id,

@@ -6,10 +6,15 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+use crate::db::DbClient;
+use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
+#[cfg(feature = "postgres")]
 use crate::schema;
 
 /// Configuration for snapshots.
@@ -66,7 +71,8 @@ pub struct SnapshotInfo {
     pub created: String,
 }
 
-/// Take a snapshot of the current schema.
+/// Take a snapshot of the current schema (PostgreSQL legacy entry).
+#[cfg(feature = "postgres")]
 pub async fn execute_snapshot(
     client: &Client,
     config: &WaypointConfig,
@@ -127,7 +133,8 @@ pub async fn execute_snapshot(
     })
 }
 
-/// Restore a schema from a snapshot.
+/// Restore a schema from a snapshot (PostgreSQL legacy entry).
+#[cfg(feature = "postgres")]
 pub async fn execute_restore(
     client: &Client,
     config: &WaypointConfig,
@@ -234,6 +241,323 @@ pub fn list_snapshots(snapshot_config: &SnapshotConfig) -> Result<Vec<SnapshotIn
 
     snapshots.sort_by(|a, b| b.id.cmp(&a.id)); // Newest first
     Ok(snapshots)
+}
+
+/// Take a snapshot of the current schema (dialect-aware entry).
+pub async fn execute_snapshot_db(
+    client: &DbClient,
+    config: &WaypointConfig,
+    snapshot_config: &SnapshotConfig,
+) -> Result<SnapshotReport> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => {
+            execute_snapshot(client.as_postgres()?, config, snapshot_config).await
+        }
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => execute_snapshot_mysql(client, config, snapshot_config).await,
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
+        )),
+    }
+}
+
+/// Restore a schema from a snapshot (dialect-aware entry).
+pub async fn execute_restore_db(
+    client: &DbClient,
+    config: &WaypointConfig,
+    snapshot_config: &SnapshotConfig,
+    snapshot_id: &str,
+) -> Result<RestoreReport> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => {
+            execute_restore(client.as_postgres()?, config, snapshot_config, snapshot_id).await
+        }
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => {
+            execute_restore_mysql(client, config, snapshot_config, snapshot_id).await
+        }
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
+        )),
+    }
+}
+
+// ── MySQL snapshot/restore ────────────────────────────────────────────────────
+//
+// MySQL doesn't get the full schema:: introspection treatment yet. Instead we
+// use SHOW CREATE TABLE / SHOW CREATE VIEW as the canonical DDL source. This
+// captures: tables (with columns, indexes, constraints, AUTO_INCREMENT,
+// ENGINE/CHARSET clauses) and views. It deliberately skips: routines, triggers,
+// events. Add those when the underlying use cases need them.
+
+#[cfg(feature = "mysql")]
+async fn execute_snapshot_mysql(
+    client: &DbClient,
+    config: &WaypointConfig,
+    snapshot_config: &SnapshotConfig,
+) -> Result<SnapshotReport> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let schema_name = client.resolve_schema(&config.migrations.schema).await?;
+    let mut conn = pool.get_conn().await?;
+
+    let dir = &snapshot_config.directory;
+    std::fs::create_dir_all(dir)?;
+    let snapshot_id = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let sql_path = dir.join(format!("{}.sql", snapshot_id));
+    let meta_path = dir.join(format!("{}.json", snapshot_id));
+
+    // Tables (excluding views, which information_schema reports separately
+    // but SHOW FULL TABLES bundles together with a Table_type column).
+    let tables: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' \
+             ORDER BY TABLE_NAME",
+            (schema_name.as_str(),),
+        )
+        .await?;
+
+    // Views in dependency-safe alphabetical order (good enough for most cases;
+    // cyclic view dependencies aren't allowed by MySQL).
+    let views: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.VIEWS \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (schema_name.as_str(),),
+        )
+        .await?;
+
+    let mut ddl = String::new();
+    ddl.push_str(&format!(
+        "-- Waypoint MySQL snapshot\n-- database: {}\n-- created: {}\n\n",
+        schema_name,
+        chrono::Utc::now().to_rfc3339()
+    ));
+
+    for table_name in &tables {
+        let stmt = format!("SHOW CREATE TABLE `{}`.`{}`", schema_name, table_name);
+        let row: Option<(String, String)> = conn.query_first(&stmt).await?;
+        if let Some((_, create_sql)) = row {
+            ddl.push_str(&format!("-- Table: {}\n", table_name));
+            ddl.push_str(&create_sql);
+            ddl.push_str(";\n\n");
+        }
+    }
+
+    for view_name in &views {
+        let stmt = format!("SHOW CREATE VIEW `{}`.`{}`", schema_name, view_name);
+        // SHOW CREATE VIEW returns (View, Create View, character_set_client, collation_connection)
+        let row: Option<(String, String, String, String)> = conn.query_first(&stmt).await?;
+        if let Some((_, create_sql, _, _)) = row {
+            ddl.push_str(&format!("-- View: {}\n", view_name));
+            ddl.push_str(&create_sql);
+            ddl.push_str(";\n\n");
+        }
+    }
+
+    let objects_captured = tables.len() + views.len();
+    std::fs::write(&sql_path, &ddl)?;
+    let meta = serde_json::json!({
+        "snapshot_id": snapshot_id,
+        "engine": "mysql",
+        "database": schema_name,
+        "objects_captured": objects_captured,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+        "tables": tables.len(),
+        "views": views.len(),
+    });
+    std::fs::write(&meta_path, serde_json::to_string_pretty(&meta).unwrap())?;
+    prune_snapshots(dir, snapshot_config.max_snapshots)?;
+
+    Ok(SnapshotReport {
+        snapshot_id,
+        snapshot_path: sql_path.display().to_string(),
+        objects_captured,
+    })
+}
+
+#[cfg(feature = "mysql")]
+async fn execute_restore_mysql(
+    client: &DbClient,
+    config: &WaypointConfig,
+    snapshot_config: &SnapshotConfig,
+    snapshot_id: &str,
+) -> Result<RestoreReport> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let schema_name = client.resolve_schema(&config.migrations.schema).await?;
+    let sql_path = snapshot_config
+        .directory
+        .join(format!("{}.sql", snapshot_id));
+
+    if !sql_path.exists() {
+        return Err(WaypointError::SnapshotError {
+            reason: format!(
+                "Snapshot '{}' not found at {}",
+                snapshot_id,
+                sql_path.display()
+            ),
+        });
+    }
+
+    let sql = std::fs::read_to_string(&sql_path)?;
+    let mut conn = pool.get_conn().await?;
+
+    // Make sure we're operating against the right database. Pool URL has it,
+    // but USE makes the session unambiguous and protects against connection
+    // state quirks across checkout.
+    let use_stmt = format!("USE `{}`", schema_name);
+    conn.query_drop(&use_stmt).await?;
+
+    // Wipe the database in the same destructive way PG's restore wipes the
+    // schema. We disable FK checks to make drops happen in any order.
+    conn.query_drop("SET FOREIGN_KEY_CHECKS = 0").await?;
+    // Drop views first
+    let views: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = ?",
+            (schema_name.as_str(),),
+        )
+        .await?;
+    for v in &views {
+        let s = format!("DROP VIEW IF EXISTS `{}`.`{}`", schema_name, v);
+        conn.query_drop(&s).await?;
+    }
+    let tables: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+            (schema_name.as_str(),),
+        )
+        .await?;
+    for t in &tables {
+        let s = format!("DROP TABLE IF EXISTS `{}`.`{}`", schema_name, t);
+        conn.query_drop(&s).await?;
+    }
+    conn.query_drop("SET FOREIGN_KEY_CHECKS = 1").await?;
+
+    // Apply snapshot. The snapshot is a series of SHOW CREATE TABLE outputs,
+    // each terminated with `;`. We use a MySQL-aware splitter that respects
+    // backtick-quoted identifiers and string literals.
+    let mut objects_restored = 0;
+    for stmt in split_mysql_statements(&sql) {
+        let trimmed = stmt.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // MySQL accepts leading `--` comments before a statement, so we don't
+        // pre-filter comment-only chunks (the chunk may carry real DDL after
+        // the comments). If the chunk is truly comments-only it executes as
+        // a no-op.
+        match conn.query_drop(trimmed).await {
+            Ok(()) => objects_restored += 1,
+            Err(e) => {
+                log::warn!(
+                    "Failed to restore statement, continuing; statement={}, error={}",
+                    &trimmed[..trimmed.len().min(80)],
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(RestoreReport {
+        snapshot_id: snapshot_id.to_string(),
+        objects_restored,
+    })
+}
+
+/// MySQL-aware `;`-delimited statement splitter. Respects single-quoted and
+/// double-quoted string literals, backtick-quoted identifiers, single-line
+/// `--` comments, and `/* ... */` block comments.
+#[cfg(feature = "mysql")]
+fn split_mysql_statements(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i < len {
+        let c = bytes[i];
+        // Line comment
+        if c == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        // Block comment
+        if c == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(len);
+            continue;
+        }
+        // Single-quoted string
+        if c == b'\'' {
+            i += 1;
+            while i < len && bytes[i] != b'\'' {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // Double-quoted string
+        if c == b'"' {
+            i += 1;
+            while i < len && bytes[i] != b'"' {
+                if bytes[i] == b'\\' && i + 1 < len {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // Backtick-quoted identifier
+        if c == b'`' {
+            i += 1;
+            while i < len && bytes[i] != b'`' {
+                i += 1;
+            }
+            i += 1;
+            continue;
+        }
+        // Statement terminator
+        if c == b';' {
+            out.push(sql[start..i].to_string());
+            i += 1;
+            start = i;
+            continue;
+        }
+        i += 1;
+    }
+    // Trailing chunk if any
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail.to_string());
+    }
+    out
 }
 
 fn prune_snapshots(dir: &PathBuf, max: usize) -> Result<()> {

@@ -215,10 +215,7 @@ async fn execute_inner_pg(client: &Client, config: &WaypointConfig) -> Result<Ve
 }
 
 #[cfg(feature = "mysql")]
-async fn execute_inner_mysql(
-    client: &DbClient,
-    config: &WaypointConfig,
-) -> Result<Vec<String>> {
+async fn execute_inner_mysql(client: &DbClient, config: &WaypointConfig) -> Result<Vec<String>> {
     use mysql_async::prelude::*;
     let pool = client.as_mysql()?;
     let schema = client.resolve_schema(&config.migrations.schema).await?;

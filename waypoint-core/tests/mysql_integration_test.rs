@@ -384,7 +384,117 @@ async fn clean_drops_all_objects_in_database() {
         )
         .await
         .unwrap();
-    assert!(after.is_empty(), "expected no objects left, got: {:?}", after);
+    assert!(
+        after.is_empty(),
+        "expected no objects left, got: {:?}",
+        after
+    );
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
+async fn snapshot_captures_tables_and_views_via_show_create() {
+    use waypoint_core::commands::snapshot::SnapshotConfig;
+    let name = fresh_database("snap").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            (
+                "V1__T.sql",
+                "CREATE TABLE thing (id INT PRIMARY KEY, name VARCHAR(100));",
+            ),
+            (
+                "V2__V.sql",
+                "CREATE OR REPLACE VIEW thing_names AS SELECT name FROM thing;",
+            ),
+        ],
+    );
+    let config = config_for(&name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    let snap_dir = tempfile::tempdir().unwrap();
+    let snap_config = SnapshotConfig {
+        directory: snap_dir.path().to_path_buf(),
+        auto_snapshot_on_migrate: false,
+        max_snapshots: 10,
+    };
+    let report = wp.snapshot(&snap_config).await.expect("snapshot");
+    // 1 table + 1 view + waypoint_schema_history table = 3 objects
+    assert!(report.objects_captured >= 2);
+
+    let snapshot_sql = std::fs::read_to_string(&report.snapshot_path).unwrap();
+    assert!(snapshot_sql.contains("CREATE TABLE"));
+    assert!(snapshot_sql.contains("`thing`"));
+    assert!(snapshot_sql.contains("thing_names"));
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
+async fn restore_recreates_schema_from_snapshot() {
+    use waypoint_core::commands::snapshot::SnapshotConfig;
+    let name = fresh_database("restore").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__T.sql",
+            "CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255));",
+        )],
+    );
+    let mut config = config_for(&name, migrations);
+    config.migrations.clean_enabled = true;
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    let snap_dir = tempfile::tempdir().unwrap();
+    let snap_config = SnapshotConfig {
+        directory: snap_dir.path().to_path_buf(),
+        auto_snapshot_on_migrate: false,
+        max_snapshots: 10,
+    };
+    let report = wp.snapshot(&snap_config).await.expect("snapshot");
+
+    // Clean: blow everything away
+    wp.clean(true).await.expect("clean");
+
+    // Verify it's gone
+    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let before: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
+            (name.as_str(),),
+        )
+        .await
+        .unwrap();
+    assert!(before.is_empty());
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    // Restore from snapshot
+    wp.restore(&snap_config, &report.snapshot_id)
+        .await
+        .expect("restore");
+
+    // users table should be back
+    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let after: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = ?",
+            (name.as_str(),),
+        )
+        .await
+        .unwrap();
+    assert!(after.contains(&"users".to_string()));
     drop(conn);
     pool.disconnect().await.ok();
 
