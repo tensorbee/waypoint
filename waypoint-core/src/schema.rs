@@ -1,14 +1,25 @@
-//! PostgreSQL schema introspection, diff, and DDL generation.
+//! Schema introspection, diff, and DDL generation.
 //!
-//! Used by diff, drift, and snapshot commands.
+//! Used by diff, drift, and snapshot commands. Introspection has both a
+//! PostgreSQL implementation ([`introspect`]) and a MySQL implementation
+//! ([`introspect_mysql`]); [`introspect_db`] dispatches based on engine.
+//! [`diff`] is engine-agnostic — it consumes [`SchemaSnapshot`] regardless
+//! of which engine produced it. [`generate_ddl`] / [`to_ddl`] currently
+//! emit PostgreSQL-flavored DDL only; MySQL diff results can be rendered
+//! as structured `SchemaDiff` JSON.
 
 use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
-use crate::db::quote_ident;
+use crate::db::{quote_ident, DbClient};
+use crate::dialect::DialectKind;
 use crate::error::Result;
+#[cfg(any(not(feature = "postgres"), not(feature = "mysql")))]
+use crate::error::WaypointError;
 
 /// Complete snapshot of a PostgreSQL schema.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -260,7 +271,26 @@ impl std::fmt::Display for SchemaDiff {
     }
 }
 
+/// Introspect the current state of a schema (dialect-aware entry).
+pub async fn introspect_db(client: &DbClient, schema: &str) -> Result<SchemaSnapshot> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => introspect(client.as_postgres()?, schema).await,
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => introspect_mysql(client, schema).await,
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in".into(),
+        )),
+    }
+}
+
 /// Introspect the current state of a PostgreSQL schema.
+#[cfg(feature = "postgres")]
 pub async fn introspect(client: &Client, schema: &str) -> Result<SchemaSnapshot> {
     let (tables, views, indexes, sequences, functions, enums, constraints, triggers, extensions) =
         tokio::try_join!(
@@ -288,6 +318,7 @@ pub async fn introspect(client: &Client, schema: &str) -> Result<SchemaSnapshot>
     })
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_tables(client: &Client, schema: &str) -> Result<Vec<TableDef>> {
     let rows = client
         .query(
@@ -343,6 +374,7 @@ async fn introspect_tables(client: &Client, schema: &str) -> Result<Vec<TableDef
     Ok(tables)
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_views(client: &Client, schema: &str) -> Result<Vec<ViewDef>> {
     // Regular views
     let rows = client
@@ -389,6 +421,7 @@ async fn introspect_views(client: &Client, schema: &str) -> Result<Vec<ViewDef>>
     Ok(views)
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_indexes(client: &Client, schema: &str) -> Result<Vec<IndexDef>> {
     let rows = client
         .query(
@@ -415,6 +448,7 @@ async fn introspect_indexes(client: &Client, schema: &str) -> Result<Vec<IndexDe
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_sequences(client: &Client, schema: &str) -> Result<Vec<SequenceDef>> {
     let rows = client
         .query(
@@ -436,6 +470,7 @@ async fn introspect_sequences(client: &Client, schema: &str) -> Result<Vec<Seque
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_functions(client: &Client, schema: &str) -> Result<Vec<FunctionDef>> {
     let rows = client
         .query(
@@ -467,6 +502,7 @@ async fn introspect_functions(client: &Client, schema: &str) -> Result<Vec<Funct
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_enums(client: &Client, schema: &str) -> Result<Vec<EnumDef>> {
     let rows = client
         .query(
@@ -491,6 +527,7 @@ async fn introspect_enums(client: &Client, schema: &str) -> Result<Vec<EnumDef>>
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_constraints(client: &Client, schema: &str) -> Result<Vec<ConstraintDef>> {
     let rows = client
         .query(
@@ -517,6 +554,7 @@ async fn introspect_constraints(client: &Client, schema: &str) -> Result<Vec<Con
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_triggers(client: &Client, schema: &str) -> Result<Vec<TriggerDef>> {
     let rows = client
         .query(
@@ -539,6 +577,7 @@ async fn introspect_triggers(client: &Client, schema: &str) -> Result<Vec<Trigge
         .collect())
 }
 
+#[cfg(feature = "postgres")]
 async fn introspect_extensions(client: &Client) -> Result<Vec<String>> {
     let rows = client
         .query(
@@ -1093,4 +1132,192 @@ pub fn to_ddl(snapshot: &SchemaSnapshot) -> String {
     }
 
     statements.join("\n\n")
+}
+
+// ── MySQL schema introspection ───────────────────────────────────────────────
+//
+// Produces the same SchemaSnapshot shape as PG `introspect()` so `diff()`
+// works on either dialect. Concepts that don't exist on MySQL (sequences,
+// PG-style enums, extensions) come back as empty vectors. Materialized views
+// don't exist on MySQL 8.0 so `is_materialized` is always false here.
+
+#[cfg(feature = "mysql")]
+pub async fn introspect_mysql(client: &DbClient, schema: &str) -> Result<SchemaSnapshot> {
+    use mysql_async::prelude::*;
+    let pool = client.as_mysql()?;
+    let mut conn = pool.get_conn().await?;
+
+    // Tables + columns (one row per column).
+    let column_rows: Vec<(String, String, String, String, Option<String>, i32)> = conn
+        .exec(
+            "SELECT t.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE, \
+                    c.COLUMN_DEFAULT, c.ORDINAL_POSITION \
+             FROM information_schema.TABLES t \
+             JOIN information_schema.COLUMNS c \
+               ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME \
+             WHERE t.TABLE_SCHEMA = ? AND t.TABLE_TYPE = 'BASE TABLE' \
+             ORDER BY t.TABLE_NAME, c.ORDINAL_POSITION",
+            (schema,),
+        )
+        .await?;
+    let mut table_map: HashMap<String, Vec<ColumnDef>> = HashMap::new();
+    for (table, col, dtype, nullable, default, ord) in column_rows {
+        table_map.entry(table).or_default().push(ColumnDef {
+            name: col,
+            data_type: dtype,
+            is_nullable: nullable == "YES",
+            default,
+            ordinal_position: ord,
+        });
+    }
+    let mut tables: Vec<TableDef> = table_map
+        .into_iter()
+        .map(|(name, columns)| TableDef {
+            schema: schema.to_string(),
+            name,
+            columns,
+        })
+        .collect();
+    tables.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Views.
+    let view_rows: Vec<(String, String)> = conn
+        .exec(
+            "SELECT TABLE_NAME, VIEW_DEFINITION FROM information_schema.VIEWS \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (schema,),
+        )
+        .await?;
+    let views: Vec<ViewDef> = view_rows
+        .into_iter()
+        .map(|(name, def)| ViewDef {
+            schema: schema.to_string(),
+            name,
+            definition: def,
+            is_materialized: false,
+        })
+        .collect();
+
+    // Indexes — group STATISTICS rows by (table, index_name). PRIMARY indexes
+    // surface as primary-key constraints instead.
+    let index_rows: Vec<(String, String, i32, String, i64)> = conn
+        .exec(
+            "SELECT TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, NON_UNIQUE \
+             FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = ? AND INDEX_NAME <> 'PRIMARY' \
+             ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+            (schema,),
+        )
+        .await?;
+    let mut idx_map: HashMap<(String, String), (Vec<String>, bool)> = HashMap::new();
+    for (table, idx_name, _seq, col, non_unique) in index_rows {
+        let entry = idx_map
+            .entry((table, idx_name))
+            .or_insert_with(|| (Vec::new(), non_unique == 0));
+        entry.0.push(col);
+    }
+    let mut indexes: Vec<IndexDef> = idx_map
+        .into_iter()
+        .map(|((table, name), (cols, is_unique))| {
+            let kw = if is_unique {
+                "CREATE UNIQUE INDEX"
+            } else {
+                "CREATE INDEX"
+            };
+            let definition = format!(
+                "{} `{}` ON `{}` ({})",
+                kw,
+                name,
+                table,
+                cols.iter()
+                    .map(|c| format!("`{}`", c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            IndexDef {
+                schema: schema.to_string(),
+                name,
+                table_name: table,
+                definition,
+                is_unique,
+            }
+        })
+        .collect();
+    indexes.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Routines (procedures + functions). We store both via FunctionDef.
+    let routine_rows: Vec<(String, String, String, String)> = conn
+        .exec(
+            "SELECT ROUTINE_NAME, \
+                    COALESCE(DTD_IDENTIFIER, ''), \
+                    COALESCE(EXTERNAL_LANGUAGE, ROUTINE_BODY), \
+                    COALESCE(ROUTINE_DEFINITION, '') \
+             FROM information_schema.ROUTINES \
+             WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_NAME",
+            (schema,),
+        )
+        .await?;
+    let functions: Vec<FunctionDef> = routine_rows
+        .into_iter()
+        .map(|(name, return_type, language, definition)| FunctionDef {
+            schema: schema.to_string(),
+            name,
+            arguments: String::new(),
+            return_type,
+            language,
+            definition,
+        })
+        .collect();
+
+    // Constraints — PK / UNIQUE / FK. Definition is left empty for the diff
+    // shape; the constraint type + name is the structural signal.
+    let constraint_rows: Vec<(String, String, String)> = conn
+        .exec(
+            "SELECT TABLE_NAME, CONSTRAINT_NAME, CONSTRAINT_TYPE \
+             FROM information_schema.TABLE_CONSTRAINTS \
+             WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME, CONSTRAINT_NAME",
+            (schema,),
+        )
+        .await?;
+    let constraints: Vec<ConstraintDef> = constraint_rows
+        .into_iter()
+        .map(|(table, name, ctype)| ConstraintDef {
+            schema: schema.to_string(),
+            table_name: table,
+            name,
+            constraint_type: ctype,
+            definition: String::new(),
+        })
+        .collect();
+
+    // Triggers.
+    let trigger_rows: Vec<(String, String, String)> = conn
+        .exec(
+            "SELECT EVENT_OBJECT_TABLE, TRIGGER_NAME, ACTION_STATEMENT \
+             FROM information_schema.TRIGGERS \
+             WHERE TRIGGER_SCHEMA = ? ORDER BY EVENT_OBJECT_TABLE, TRIGGER_NAME",
+            (schema,),
+        )
+        .await?;
+    let triggers: Vec<TriggerDef> = trigger_rows
+        .into_iter()
+        .map(|(table_name, name, definition)| TriggerDef {
+            schema: schema.to_string(),
+            table_name,
+            name,
+            definition,
+        })
+        .collect();
+
+    Ok(SchemaSnapshot {
+        tables,
+        views,
+        indexes,
+        sequences: Vec::new(),
+        functions,
+        enums: Vec::new(),
+        constraints,
+        triggers,
+        extensions: Vec::new(),
+    })
 }

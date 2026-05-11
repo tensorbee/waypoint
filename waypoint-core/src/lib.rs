@@ -213,12 +213,12 @@ impl Waypoint {
 
     /// Compare database schema against a target.
     pub async fn diff(&self, target: commands::diff::DiffTarget) -> Result<DiffReport> {
-        commands::diff::execute(self.client.as_postgres()?, &self.config, target).await
+        commands::diff::execute_db(&self.client, &self.config, target).await
     }
 
     /// Detect schema drift.
     pub async fn drift(&self) -> Result<DriftReport> {
-        commands::drift::execute(self.client.as_postgres()?, &self.config).await
+        commands::drift::execute_db(&self.client, &self.config).await
     }
 
     /// Take a schema snapshot.
