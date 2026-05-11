@@ -3,5 +3,6 @@
 //! Each submodule provides the PostgreSQL implementation of a feature whose
 //! engine-agnostic types and dispatcher live at the top level of the crate.
 
+pub mod advisor;
 pub mod history;
 pub mod migrate;
