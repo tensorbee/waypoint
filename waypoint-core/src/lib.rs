@@ -48,6 +48,7 @@ pub mod db;
 pub mod dependency;
 pub mod dialect;
 pub mod directive;
+pub mod engines;
 pub mod error;
 pub mod guard;
 pub mod history;

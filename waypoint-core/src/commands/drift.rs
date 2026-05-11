@@ -370,6 +370,7 @@ async fn run_drift_check_mysql(
 
 /// Convert a list of structural [`SchemaDiff`]s to user-facing [`DriftEntry`]s.
 /// Pulled out so the MySQL path can reuse the PG drift-categorization rules.
+#[cfg(feature = "mysql")]
 fn diffs_to_drift_entries(diffs: &[SchemaDiff], history_table: &str) -> Vec<DriftEntry> {
     let mut drifts = Vec::new();
     for d in diffs {
