@@ -1394,6 +1394,11 @@ async fn run_migrate_mysql(
     let resolved = scan_migrations(&config.migrations.locations)?;
     let applied = history::get_applied_migrations_db(client, &schema, table).await?;
 
+    // Load hooks (engine-agnostic file scanning + config-declared hooks).
+    let mut all_hooks: Vec<ResolvedHook> = hooks::scan_hooks(&config.migrations.locations)?;
+    let config_hooks = hooks::load_config_hooks(&config.hooks)?;
+    all_hooks.extend(config_hooks);
+
     let db_user = client
         .current_user()
         .await
@@ -1496,9 +1501,43 @@ async fn run_migrate_mysql(
     let mut sorted_versioned = pending_versioned.clone();
     sorted_versioned.sort_by(|a, b| a.version().unwrap().cmp(b.version().unwrap()));
 
+    let has_pending = !sorted_versioned.is_empty() || !pending_repeatables.is_empty();
+
+    // beforeMigrate hooks (only when there's actually pending work).
+    if has_pending {
+        let hook_placeholders = build_placeholders(
+            &config.placeholders,
+            &schema,
+            &db_user,
+            &db_name,
+            "beforeMigrate",
+        );
+        let (count, ms) = hooks::run_hooks_db(
+            client,
+            &all_hooks,
+            &HookType::BeforeMigrate,
+            &hook_placeholders,
+        )
+        .await?;
+        report.hooks_executed += count;
+        report.hooks_time_ms += ms;
+    }
+
     for m in sorted_versioned {
         let placeholders =
             build_placeholders(&config.placeholders, &schema, &db_user, &db_name, &m.script);
+
+        // beforeEachMigrate hooks fire before each individual migration.
+        let (count, ms) = hooks::run_hooks_db(
+            client,
+            &all_hooks,
+            &HookType::BeforeEachMigrate,
+            &placeholders,
+        )
+        .await?;
+        report.hooks_executed += count;
+        report.hooks_time_ms += ms;
+
         let elapsed =
             apply_one_mysql(client, m, &schema, table, &installed_by, &placeholders).await?;
         report.migrations_applied += 1;
@@ -1509,11 +1548,33 @@ async fn run_migrate_mysql(
             script: m.script.clone(),
             execution_time_ms: elapsed,
         });
+
+        // afterEachMigrate hooks fire after each individual migration.
+        let (count, ms) = hooks::run_hooks_db(
+            client,
+            &all_hooks,
+            &HookType::AfterEachMigrate,
+            &placeholders,
+        )
+        .await?;
+        report.hooks_executed += count;
+        report.hooks_time_ms += ms;
     }
 
     for m in pending_repeatables {
         let placeholders =
             build_placeholders(&config.placeholders, &schema, &db_user, &db_name, &m.script);
+
+        let (count, ms) = hooks::run_hooks_db(
+            client,
+            &all_hooks,
+            &HookType::BeforeEachMigrate,
+            &placeholders,
+        )
+        .await?;
+        report.hooks_executed += count;
+        report.hooks_time_ms += ms;
+
         let elapsed =
             apply_one_mysql(client, m, &schema, table, &installed_by, &placeholders).await?;
         report.migrations_applied += 1;
@@ -1524,6 +1585,36 @@ async fn run_migrate_mysql(
             script: m.script.clone(),
             execution_time_ms: elapsed,
         });
+
+        let (count, ms) = hooks::run_hooks_db(
+            client,
+            &all_hooks,
+            &HookType::AfterEachMigrate,
+            &placeholders,
+        )
+        .await?;
+        report.hooks_executed += count;
+        report.hooks_time_ms += ms;
+    }
+
+    // afterMigrate hooks (only when there was actually pending work).
+    if has_pending {
+        let hook_placeholders = build_placeholders(
+            &config.placeholders,
+            &schema,
+            &db_user,
+            &db_name,
+            "afterMigrate",
+        );
+        let (count, ms) = hooks::run_hooks_db(
+            client,
+            &all_hooks,
+            &HookType::AfterMigrate,
+            &hook_placeholders,
+        )
+        .await?;
+        report.hooks_executed += count;
+        report.hooks_time_ms += ms;
     }
 
     Ok(report)
@@ -1568,14 +1659,6 @@ async fn apply_one_mysql(
     .await?;
 
     Ok(elapsed)
-}
-
-// Suppress "unused" warnings for HookType / ResolvedHook in MySQL-only paths
-// (hooks aren't ported yet — Phase 2).
-#[allow(dead_code)]
-mod _phase1_unused {
-    use super::{HookType, ResolvedHook};
-    fn _refs(_h: HookType, _r: ResolvedHook) {}
 }
 
 #[cfg(test)]

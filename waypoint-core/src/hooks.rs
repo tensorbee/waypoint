@@ -4,10 +4,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 use crate::config::HooksConfig;
+#[cfg(feature = "postgres")]
 use crate::db;
+use crate::db::DbClient;
 use crate::error::{Result, WaypointError};
 use crate::placeholder::replace_placeholders;
 
@@ -179,6 +182,7 @@ pub fn load_config_hooks(config: &HooksConfig) -> Result<Vec<ResolvedHook>> {
 /// Run all hooks of a given type.
 ///
 /// Returns total execution time in milliseconds.
+#[cfg(feature = "postgres")]
 pub async fn run_hooks(
     client: &Client,
     hooks: &[ResolvedHook],
@@ -207,6 +211,49 @@ pub async fn run_hooks(
                     phase: phase.to_string(),
                     script: hook.script_name.clone(),
                     reason,
+                });
+            }
+        }
+    }
+
+    Ok((count, total_ms))
+}
+
+/// Run all hooks of a given phase (dialect-aware entry).
+///
+/// On PostgreSQL each hook is wrapped in a transaction (matching the legacy
+/// `run_hooks` PG entry). On MySQL hooks execute via `execute_raw` — MySQL DDL
+/// auto-commits, so a transaction wrapper would buy nothing for DDL hooks.
+/// Returns `(hook_count, total_ms)`.
+pub async fn run_hooks_db(
+    client: &DbClient,
+    hooks: &[ResolvedHook],
+    phase: &HookType,
+    placeholders: &HashMap<String, String>,
+) -> Result<(usize, i32)> {
+    let mut total_ms = 0;
+    let mut count = 0;
+
+    for hook in hooks.iter().filter(|h| &h.hook_type == phase) {
+        log::info!("Running {} hook: {}", phase, hook.script_name);
+
+        let sql = replace_placeholders(&hook.sql, placeholders)?;
+
+        let exec_result = match client.dialect_kind() {
+            crate::dialect::DialectKind::Postgres => client.execute_in_transaction(&sql).await,
+            crate::dialect::DialectKind::Mysql => client.execute_raw(&sql).await,
+        };
+
+        match exec_result {
+            Ok(exec_time) => {
+                total_ms += exec_time;
+                count += 1;
+            }
+            Err(e) => {
+                return Err(WaypointError::HookFailed {
+                    phase: phase.to_string(),
+                    script: hook.script_name.clone(),
+                    reason: e.to_string(),
                 });
             }
         }

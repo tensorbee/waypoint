@@ -521,6 +521,99 @@ async fn clean_refuses_when_disabled_unless_force() {
 }
 
 #[tokio::test]
+async fn migrate_runs_lifecycle_hooks() {
+    let name = fresh_database("hooks").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    std::fs::create_dir_all(&migrations).unwrap();
+
+    // Hooks: beforeMigrate creates a marker table, afterMigrate inserts into it.
+    std::fs::write(
+        migrations.join("beforeMigrate.sql"),
+        "CREATE TABLE _wp_hook_marker (phase VARCHAR(64), n INT NOT NULL DEFAULT 0);",
+    )
+    .unwrap();
+    std::fs::write(
+        migrations.join("beforeEachMigrate.sql"),
+        "INSERT INTO _wp_hook_marker (phase, n) VALUES ('before_each', 1);",
+    )
+    .unwrap();
+    std::fs::write(
+        migrations.join("afterEachMigrate.sql"),
+        "INSERT INTO _wp_hook_marker (phase, n) VALUES ('after_each', 1);",
+    )
+    .unwrap();
+    std::fs::write(
+        migrations.join("afterMigrate.sql"),
+        "INSERT INTO _wp_hook_marker (phase, n) VALUES ('after', 1);",
+    )
+    .unwrap();
+    std::fs::write(
+        migrations.join("V1__T.sql"),
+        "CREATE TABLE t (id INT PRIMARY KEY);",
+    )
+    .unwrap();
+    std::fs::write(
+        migrations.join("V2__T2.sql"),
+        "CREATE TABLE t2 (id INT PRIMARY KEY);",
+    )
+    .unwrap();
+
+    let config = config_for(&name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    let report = wp.migrate(None).await.expect("migrate with hooks");
+    assert_eq!(report.migrations_applied, 2);
+    // 1 beforeMigrate + 2 beforeEachMigrate + 2 afterEachMigrate + 1 afterMigrate = 6
+    assert_eq!(report.hooks_executed, 6);
+
+    // Verify marker rows
+    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let rows: Vec<(String, i32)> = conn
+        .query("SELECT phase, n FROM _wp_hook_marker ORDER BY phase, n")
+        .await
+        .unwrap();
+    let phase_counts: std::collections::HashMap<&str, i64> = {
+        let mut m: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+        for (p, _) in &rows {
+            *m.entry(p.as_str()).or_insert(0) += 1;
+        }
+        // Move into HashMap<&'static str, _>-equivalent for assertions
+        let mut out: std::collections::HashMap<&'static str, i64> =
+            std::collections::HashMap::new();
+        for (k, v) in m.iter() {
+            match *k {
+                "before_each" => {
+                    out.insert("before_each", *v);
+                }
+                "after_each" => {
+                    out.insert("after_each", *v);
+                }
+                "after" => {
+                    out.insert("after", *v);
+                }
+                _ => {}
+            }
+        }
+        out
+    };
+    assert_eq!(phase_counts.get("before_each").copied(), Some(2));
+    assert_eq!(phase_counts.get("after_each").copied(), Some(2));
+    assert_eq!(phase_counts.get("after").copied(), Some(1));
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    // Re-running migrate with nothing pending should NOT fire beforeMigrate /
+    // afterMigrate (only fire when there's pending work).
+    let report2 = wp.migrate(None).await.expect("migrate no-op");
+    assert_eq!(report2.migrations_applied, 0);
+    assert_eq!(report2.hooks_executed, 0);
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
 async fn simulate_runs_pending_migrations_in_throwaway_db() {
     let name = fresh_database("sim").await;
     let tempdir = tempfile::tempdir().unwrap();
