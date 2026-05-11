@@ -1,12 +1,13 @@
 //! Schema introspection, diff, and DDL generation.
 //!
-//! Used by diff, drift, and snapshot commands. Introspection has both a
-//! PostgreSQL implementation ([`introspect`]) and a MySQL implementation
+//! Used by diff, drift, snapshot, and reversal commands. Introspection has
+//! a PostgreSQL implementation ([`introspect`]) and a MySQL implementation
 //! ([`introspect_mysql`]); [`introspect_db`] dispatches based on engine.
 //! [`diff`] is engine-agnostic — it consumes [`SchemaSnapshot`] regardless
-//! of which engine produced it. [`generate_ddl`] / [`to_ddl`] currently
-//! emit PostgreSQL-flavored DDL only; MySQL diff results can be rendered
-//! as structured `SchemaDiff` JSON.
+//! of which engine produced it. DDL generation comes in two flavours:
+//! [`generate_ddl`] for PostgreSQL and [`generate_ddl_mysql`] for MySQL
+//! (the latter omits CASCADE and filters dependent constraint/index diffs
+//! when their parent table is being dropped, since MySQL has no CASCADE).
 
 use std::collections::{HashMap, HashSet};
 

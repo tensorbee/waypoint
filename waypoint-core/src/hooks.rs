@@ -250,10 +250,21 @@ pub async fn run_hooks_db(
                 count += 1;
             }
             Err(e) => {
+                // Match the legacy `run_hooks` error format: when the cause is
+                // a tokio_postgres::Error, surface the inner DbError detail/hint
+                // (`format_db_error`) without the "Database error: " prefix
+                // that WaypointError::Display would prepend.
+                #[cfg(feature = "postgres")]
+                let reason = match &e {
+                    WaypointError::DatabaseError(db_err) => crate::error::format_db_error(db_err),
+                    other => other.to_string(),
+                };
+                #[cfg(not(feature = "postgres"))]
+                let reason = e.to_string();
                 return Err(WaypointError::HookFailed {
                     phase: phase.to_string(),
                     script: hook.script_name.clone(),
-                    reason: e.to_string(),
+                    reason,
                 });
             }
         }

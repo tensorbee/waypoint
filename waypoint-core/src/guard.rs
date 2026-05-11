@@ -1136,32 +1136,27 @@ async fn exec_builtin(
                 .get_conn()
                 .await
                 .map_err(|e| guard_failed(name, string_args, &e.to_string()))?;
+
+            // information_schema EXISTS(...) and COUNT(*) both return a single
+            // i64 column on MySQL — read as Option<i64> to share the param-
+            // binding path between the boolean and numeric builtins (avoids the
+            // chrono-feature ambiguity around bool decoding).
+            let result: Option<i64> = if param_values.is_empty() {
+                conn.query_first(&sql).await
+            } else {
+                let params: Vec<mysql_async::Value> = param_values
+                    .iter()
+                    .map(|s| mysql_async::Value::Bytes(s.as_bytes().to_vec()))
+                    .collect();
+                conn.exec_first(&sql, params).await
+            }
+            .map_err(|e| guard_failed(name, string_args, &e.to_string()))?;
+
             if is_boolean {
-                // information_schema EXISTS(...) returns 0/1 as a TINYINT on
-                // MySQL — read it as i64 then convert to bool to avoid the
-                // chrono-feature ambiguity around bool decoding.
-                let result: Option<i64> = if param_values.is_empty() {
-                    conn.query_first(&sql).await
-                } else {
-                    let p: Vec<mysql_async::Value> = param_values
-                        .iter()
-                        .map(|s| mysql_async::Value::Bytes(s.as_bytes().to_vec()))
-                        .collect();
-                    conn.exec_first(&sql, p).await
-                }
-                .map_err(|e| guard_failed(name, string_args, &e.to_string()))?;
                 Ok(GuardValue::Bool(matches!(result, Some(n) if n != 0)))
             } else {
-                let result: Option<i64> = if param_values.is_empty() {
-                    conn.query_first(&sql).await
-                } else {
-                    let p: Vec<mysql_async::Value> = param_values
-                        .iter()
-                        .map(|s| mysql_async::Value::Bytes(s.as_bytes().to_vec()))
-                        .collect();
-                    conn.exec_first(&sql, p).await
-                }
-                .map_err(|e| guard_failed(name, string_args, &e.to_string()))?;
+                // COUNT(*) always returns a row, so None here means a malformed
+                // builtin query — treat as 0 rather than panic.
                 Ok(GuardValue::Number(result.unwrap_or(0)))
             }
         }
