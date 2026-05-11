@@ -29,6 +29,11 @@ pub struct SimulationReport {
     pub temp_schema: String,
     /// Errors encountered during simulation.
     pub errors: Vec<SimulationError>,
+    /// Non-fatal warnings — most commonly partial-replication failures on
+    /// MySQL (e.g. views that reference a database we couldn't recreate in
+    /// the simulation environment). Empty on PG today.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 /// An error encountered during simulation.
@@ -197,6 +202,7 @@ async fn run_simulation(
         migrations_simulated: simulated,
         temp_schema: temp_schema.to_string(),
         errors,
+        warnings: Vec::new(),
     })
 }
 
@@ -293,6 +299,8 @@ async fn run_simulation_mysql(
 
     conn.query_drop(format!("USE `{}`", temp_db)).await?;
 
+    let mut warnings: Vec<String> = Vec::new();
+
     for table_name in &tables {
         let show_stmt = format!("SHOW CREATE TABLE `{}`.`{}`", source_db, table_name);
         if let Ok(Some((_, create_sql))) = conn.query_first::<(String, String), _>(&show_stmt).await
@@ -300,11 +308,11 @@ async fn run_simulation_mysql(
             // The DDL is "CREATE TABLE `name` (...)"; since USE has set our
             // default database to temp_db it lands there.
             if let Err(e) = conn.query_drop(&create_sql).await {
-                log::debug!(
-                    "Partial replication for {}: {} (simulation continuing)",
-                    table_name,
-                    e
-                );
+                warnings.push(format!(
+                    "Could not replicate table `{}` into the simulation database: {}. \
+                     Migrations that depend on this table may report misleading errors.",
+                    table_name, e
+                ));
             }
         }
     }
@@ -328,13 +336,22 @@ async fn run_simulation_mysql(
         if let Ok(Some(row)) = conn.query_first::<mysql_async::Row, _>(&show_stmt).await {
             let mut row = row;
             if let Some(create_sql) = row.take::<String, _>(1) {
+                let other_db = first_other_db_qualifier(&create_sql, source_db);
                 let rewritten = rewrite_view_db_qualifier(&create_sql, source_db);
                 if let Err(e) = conn.query_drop(&rewritten).await {
-                    log::debug!(
-                        "Partial replication for view {}: {} (simulation continuing)",
-                        view_name,
-                        e
-                    );
+                    if let Some(other) = other_db {
+                        warnings.push(format!(
+                            "View `{}` references database `{}` which is not replicated \
+                             into the simulation environment; skipped (error: {}). \
+                             Migrations that read from this view may surface misleading errors.",
+                            view_name, other, e
+                        ));
+                    } else {
+                        warnings.push(format!(
+                            "Could not replicate view `{}` into the simulation database: {}.",
+                            view_name, e
+                        ));
+                    }
                 }
             }
         }
@@ -402,6 +419,7 @@ async fn run_simulation_mysql(
         migrations_simulated: simulated,
         temp_schema: temp_db.to_string(),
         errors,
+        warnings,
     })
 }
 
@@ -413,11 +431,54 @@ async fn run_simulation_mysql(
 /// qualifiers would still point at the original — so we strip them and let
 /// the current `USE` provide the binding. Simple string-replace; for views
 /// that legitimately reference *other* databases this won't work and the
-/// replay will fail (logged as a debug message, not fatal).
+/// replay will fail (surfaced as a SimulationReport warning).
 #[cfg(feature = "mysql")]
 fn rewrite_view_db_qualifier(create_sql: &str, source_db: &str) -> String {
     let qualifier = format!("`{}`.", source_db);
     create_sql.replace(&qualifier, "")
+}
+
+/// If a view DDL references a database *other* than `source_db`, return its
+/// name. Used to produce a clearer warning when replication into the
+/// simulation env fails. Looks for backtick-quoted identifiers that are the
+/// *first* segment of a qualified name (preceded by something other than `.`)
+/// and followed by a dot — that's the shape MySQL's `SHOW CREATE VIEW` emits
+/// for database qualifiers. Identifiers preceded by `.` are table/column
+/// names within a qualified reference, not databases.
+#[cfg(feature = "mysql")]
+fn first_other_db_qualifier(create_sql: &str, source_db: &str) -> Option<String> {
+    let bytes = create_sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            // Find the matching closing backtick.
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j] != b'`' {
+                j += 1;
+            }
+            if j >= bytes.len() {
+                return None;
+            }
+            // Only treat this as a DB qualifier if (a) the char before the
+            // opening backtick is not `.` (otherwise this ident is the table
+            // or column part of `db.table.col`), and (b) the char after the
+            // closing backtick is `.` (this ident has at least one trailing
+            // segment, so it's a leading qualifier).
+            let preceded_by_dot = i > 0 && bytes[i - 1] == b'.';
+            let followed_by_dot = j + 1 < bytes.len() && bytes[j + 1] == b'.';
+            if !preceded_by_dot && followed_by_dot {
+                let ident = &create_sql[start..j];
+                if ident != source_db && !ident.is_empty() {
+                    return Some(ident.to_string());
+                }
+            }
+            i = j + 1;
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 #[cfg(all(test, feature = "mysql"))]
@@ -443,5 +504,40 @@ mod tests {
         let sql = "CREATE VIEW `v` AS SELECT 1 AS x";
         let out = rewrite_view_db_qualifier(sql, "db1");
         assert_eq!(out, sql);
+    }
+
+    #[test]
+    fn first_other_db_detects_cross_db_ref() {
+        let sql = "CREATE VIEW `v` AS SELECT `shared`.`t`.`c` FROM `shared`.`t`";
+        assert_eq!(
+            first_other_db_qualifier(sql, "app"),
+            Some("shared".to_string())
+        );
+    }
+
+    #[test]
+    fn first_other_db_ignores_source_db() {
+        // The source-db prefix is *not* a cross-database reference. Only an
+        // unrelated database name should be flagged.
+        let sql = "CREATE VIEW `v` AS SELECT `app`.`t`.`c` FROM `app`.`t`";
+        assert_eq!(first_other_db_qualifier(sql, "app"), None);
+    }
+
+    #[test]
+    fn first_other_db_returns_none_for_no_qualifier() {
+        let sql = "CREATE VIEW `v` AS SELECT 1 AS x";
+        assert_eq!(first_other_db_qualifier(sql, "app"), None);
+    }
+
+    #[test]
+    fn first_other_db_reports_first_match() {
+        // When multiple foreign DBs are referenced, surface the first one.
+        let sql = "CREATE VIEW `v` AS \
+                   SELECT `shared`.`t`.`c`, `audit`.`log`.`m` \
+                   FROM `shared`.`t` JOIN `audit`.`log`";
+        assert_eq!(
+            first_other_db_qualifier(sql, "app"),
+            Some("shared".to_string())
+        );
     }
 }

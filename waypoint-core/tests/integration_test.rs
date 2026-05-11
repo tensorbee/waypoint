@@ -1079,6 +1079,7 @@ async fn test_snapshot_and_drift() {
         directory: snap_dir.clone(),
         auto_snapshot_on_migrate: false,
         max_snapshots: 10,
+        strip_definer_mysql: true,
     };
 
     let client2 = db::connect(&get_test_url()).await.unwrap();

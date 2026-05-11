@@ -692,4 +692,18 @@ pub fn print_simulation_report(report: &waypoint_core::SimulationReport) {
             println!("  {} {} — {}", "✗".red(), error.script, error.error);
         }
     }
+
+    if !report.warnings.is_empty() {
+        println!(
+            "{}",
+            format!(
+                "Simulation warnings ({}): some source objects could not be replicated into the temp schema.",
+                report.warnings.len()
+            )
+            .yellow()
+        );
+        for w in &report.warnings {
+            println!("  {} {}", "!".yellow(), w);
+        }
+    }
 }

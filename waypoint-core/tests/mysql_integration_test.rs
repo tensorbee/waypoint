@@ -453,6 +453,7 @@ async fn snapshot_captures_tables_and_views_via_show_create() {
         directory: snap_dir.path().to_path_buf(),
         auto_snapshot_on_migrate: false,
         max_snapshots: 10,
+        strip_definer_mysql: true,
     };
     let report = wp.snapshot(&snap_config).await.expect("snapshot");
     // 1 table + 1 view + waypoint_schema_history table = 3 objects
@@ -462,6 +463,55 @@ async fn snapshot_captures_tables_and_views_via_show_create() {
     assert!(snapshot_sql.contains("CREATE TABLE"));
     assert!(snapshot_sql.contains("`thing`"));
     assert!(snapshot_sql.contains("thing_names"));
+    // Default config strips DEFINER from view DDL so cross-account restores
+    // don't fail on a missing definer user.
+    assert!(
+        !snapshot_sql.contains("DEFINER="),
+        "expected DEFINER to be stripped from view DDL with default config; \
+         snapshot:\n{}",
+        snapshot_sql
+    );
+}
+
+#[tokio::test]
+async fn snapshot_preserves_definer_when_strip_disabled() {
+    use waypoint_core::commands::snapshot::SnapshotConfig;
+    let db = fresh_database("snap_def").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            ("V1__T.sql", "CREATE TABLE rows_t (id INT PRIMARY KEY);"),
+            (
+                "V2__V.sql",
+                "CREATE OR REPLACE VIEW rows_v AS SELECT id FROM rows_t;",
+            ),
+        ],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    let snap_dir = tempfile::tempdir().unwrap();
+    let snap_config = SnapshotConfig {
+        directory: snap_dir.path().to_path_buf(),
+        auto_snapshot_on_migrate: false,
+        max_snapshots: 10,
+        strip_definer_mysql: false,
+    };
+    let report = wp.snapshot(&snap_config).await.expect("snapshot");
+    let snapshot_sql = std::fs::read_to_string(&report.snapshot_path).unwrap();
+    // With stripping disabled we should see the DEFINER MySQL emitted on
+    // SHOW CREATE VIEW. MySQL always emits one for views, even if the test
+    // connection ran the CREATE — the definer becomes the current user.
+    assert!(
+        snapshot_sql.contains("DEFINER="),
+        "expected DEFINER to be preserved with strip_definer_mysql=false; \
+         snapshot:\n{}",
+        snapshot_sql
+    );
 }
 
 #[tokio::test]
@@ -488,6 +538,7 @@ async fn restore_recreates_schema_from_snapshot() {
         directory: snap_dir.path().to_path_buf(),
         auto_snapshot_on_migrate: false,
         max_snapshots: 10,
+        strip_definer_mysql: true,
     };
     let report = wp.snapshot(&snap_config).await.expect("snapshot");
 
@@ -1154,6 +1205,7 @@ async fn restore_handles_foreign_keys_across_dependency_order() {
         directory: snap_dir.path().to_path_buf(),
         auto_snapshot_on_migrate: false,
         max_snapshots: 10,
+        strip_definer_mysql: true,
     };
     let report = wp.snapshot(&snap_config).await.expect("snapshot");
 

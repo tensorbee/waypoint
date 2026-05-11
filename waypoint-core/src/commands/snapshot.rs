@@ -26,6 +26,13 @@ pub struct SnapshotConfig {
     pub auto_snapshot_on_migrate: bool,
     /// Maximum number of snapshots to retain (oldest are pruned).
     pub max_snapshots: usize,
+    /// MySQL only: strip `DEFINER=...` clauses from view (and routine) DDL in
+    /// the snapshot. Defaults to `true` because the most common restore
+    /// scenario is cross-account/cross-host, where the original definer user
+    /// doesn't exist on the target. Set to `false` to preserve `DEFINER`
+    /// clauses verbatim (the restoring user then needs `SUPER` /
+    /// `SET_USER_ID` privileges).
+    pub strip_definer_mysql: bool,
 }
 
 impl Default for SnapshotConfig {
@@ -34,6 +41,7 @@ impl Default for SnapshotConfig {
             directory: PathBuf::from(".waypoint/snapshots"),
             auto_snapshot_on_migrate: false,
             max_snapshots: 10,
+            strip_definer_mysql: true,
         }
     }
 }
@@ -362,6 +370,11 @@ async fn execute_snapshot_mysql(
         // SHOW CREATE VIEW returns (View, Create View, character_set_client, collation_connection)
         let row: Option<(String, String, String, String)> = conn.query_first(&stmt).await?;
         if let Some((_, create_sql, _, _)) = row {
+            let create_sql = if snapshot_config.strip_definer_mysql {
+                strip_mysql_definer(&create_sql)
+            } else {
+                create_sql
+            };
             ddl.push_str(&format!("-- View: {}\n", view_name));
             ddl.push_str(&create_sql);
             ddl.push_str(";\n\n");
@@ -387,6 +400,29 @@ async fn execute_snapshot_mysql(
         snapshot_path: sql_path.display().to_string(),
         objects_captured,
     })
+}
+
+/// Strip a `DEFINER=...` clause (and an `SQL SECURITY DEFINER` clause, which
+/// inherits the missing definer's privileges) from a MySQL `SHOW CREATE VIEW`
+/// result. The clause appears between `CREATE ALGORITHM=...` and the `VIEW
+/// name` keyword, in the form `DEFINER=`user`@`host``. Stripping it makes the
+/// view restore as the current user, which is what callers want for
+/// cross-account snapshot restores.
+#[cfg(feature = "mysql")]
+fn strip_mysql_definer(create_sql: &str) -> String {
+    use std::sync::LazyLock;
+    // `DEFINER=`u`@`h`` — both identifier parts are quoted with backticks
+    // (MySQL escapes backticks inside them by doubling, so [^`]* is safe).
+    // We also strip an optional trailing `SQL SECURITY DEFINER` since after
+    // removing the definer that clause refers to a now-absent user. Match
+    // is case-insensitive (MySQL keywords) and tolerant of extra whitespace.
+    static DEFINER_RE: LazyLock<regex_lite::Regex> =
+        LazyLock::new(|| regex_lite::Regex::new(r"(?i)\s*DEFINER\s*=\s*`[^`]*`@`[^`]*`").unwrap());
+    static SECURITY_DEFINER_RE: LazyLock<regex_lite::Regex> =
+        LazyLock::new(|| regex_lite::Regex::new(r"(?i)\s+SQL\s+SECURITY\s+DEFINER").unwrap());
+
+    let stripped = DEFINER_RE.replace(create_sql, "");
+    SECURITY_DEFINER_RE.replace(&stripped, "").into_owned()
 }
 
 #[cfg(feature = "mysql")]
@@ -520,4 +556,63 @@ fn prune_snapshots(dir: &PathBuf, max: usize) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "mysql"))]
+mod tests_mysql_definer {
+    use super::strip_mysql_definer;
+
+    #[test]
+    fn strip_typical_show_create_view() {
+        let input = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` \
+                     SQL SECURITY DEFINER VIEW `v_active_users` AS \
+                     select `u`.`id` AS `id` from `users` `u` where `u`.`active` = 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER"), "definer not stripped: {}", out);
+        assert!(
+            !out.contains("SQL SECURITY"),
+            "SQL SECURITY not stripped: {}",
+            out
+        );
+        // The view body should still be intact.
+        assert!(out.contains("VIEW `v_active_users`"));
+        assert!(out.contains("from `users`"));
+    }
+
+    #[test]
+    fn strip_view_with_at_in_host() {
+        // Host can be `%` or contain dots — the regex uses [^`]* so any
+        // non-backtick char inside the host part is fine.
+        let input = "CREATE ALGORITHM=UNDEFINED DEFINER=`app_user`@`10.0.%.%` \
+                     SQL SECURITY DEFINER VIEW `v` AS select 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER"));
+        assert!(!out.contains("SQL SECURITY"));
+    }
+
+    #[test]
+    fn strip_without_security_clause() {
+        // Older MySQL or non-default config: no SQL SECURITY clause emitted.
+        let input = "CREATE DEFINER=`root`@`localhost` VIEW `v` AS select 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER"));
+        assert_eq!(out, "CREATE VIEW `v` AS select 1");
+    }
+
+    #[test]
+    fn passthrough_when_no_definer() {
+        // SHOW CREATE TABLE output (no DEFINER clause) must be unchanged.
+        let input =
+            "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB";
+        assert_eq!(strip_mysql_definer(input), input);
+    }
+
+    #[test]
+    fn strip_sql_security_invoker_preserved() {
+        // We only strip "SQL SECURITY DEFINER". "SQL SECURITY INVOKER" must be left.
+        let input = "CREATE DEFINER=`u`@`h` SQL SECURITY INVOKER VIEW `v` AS select 1";
+        let out = strip_mysql_definer(input);
+        assert!(!out.contains("DEFINER=`u`"));
+        assert!(out.contains("SQL SECURITY INVOKER"));
+    }
 }

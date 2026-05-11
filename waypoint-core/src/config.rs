@@ -312,6 +312,7 @@ struct TomlSnapshotConfig {
     directory: Option<String>,
     auto_snapshot_on_migrate: Option<bool>,
     max_snapshots: Option<usize>,
+    strip_definer_mysql: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -531,6 +532,7 @@ impl WaypointConfig {
             }
             apply_option!(s.auto_snapshot_on_migrate => self.snapshots.auto_snapshot_on_migrate);
             apply_option!(s.max_snapshots => self.snapshots.max_snapshots);
+            apply_option!(s.strip_definer_mysql => self.snapshots.strip_definer_mysql);
         }
 
         if let Some(p) = toml.preflight {
