@@ -109,7 +109,7 @@ curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh |
 Pin a specific version:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | WAYPOINT_VERSION=v0.3.2 sh
+curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | WAYPOINT_VERSION=v0.4.0 sh
 ```
 
 ### Self-update
@@ -136,7 +136,7 @@ cargo install --path waypoint-cli
 ```toml
 [dependencies]
 # PostgreSQL only (default)
-waypoint-core = "0.3"
+waypoint-core = "0.4"
 
 # Or MySQL 8.0+ only
 # waypoint-core = { version = "0.3", default-features = false, features = ["mysql"] }
