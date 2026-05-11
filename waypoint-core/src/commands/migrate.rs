@@ -352,10 +352,105 @@ async fn evaluate_require_guards(
     Ok(GuardAction::Continue)
 }
 
+/// Dialect-aware `require` guard evaluator (mirrors the PG version but uses
+/// `guard::evaluate_db` so the underlying SQL is dispatched per engine).
+async fn evaluate_require_guards_db(
+    client: &DbClient,
+    schema: &str,
+    migration: &ResolvedMigration,
+    config: &WaypointConfig,
+) -> Result<GuardAction> {
+    if migration.directives.require.is_empty() {
+        return Ok(GuardAction::Continue);
+    }
+    for expr_str in &migration.directives.require {
+        match crate::guard::parse(expr_str) {
+            Ok(expr) => match crate::guard::evaluate_db(client, schema, &expr).await {
+                Ok(true) => {}
+                Ok(false) => match config.guards.on_require_fail {
+                    crate::guard::OnRequireFail::Skip => {
+                        log::info!(
+                            "Guard require failed, skipping migration; script={}, expr={}",
+                            migration.script,
+                            expr_str
+                        );
+                        return Ok(GuardAction::Skip);
+                    }
+                    crate::guard::OnRequireFail::Warn => log::warn!(
+                        "Guard require failed (continuing); script={}, expr={}",
+                        migration.script,
+                        expr_str
+                    ),
+                    crate::guard::OnRequireFail::Error => {
+                        return Ok(GuardAction::Error(WaypointError::GuardFailed {
+                            kind: "require".to_string(),
+                            script: migration.script.clone(),
+                            expression: expr_str.clone(),
+                        }));
+                    }
+                },
+                Err(e) => {
+                    return Ok(GuardAction::Error(WaypointError::GuardFailed {
+                        kind: "require".to_string(),
+                        script: migration.script.clone(),
+                        expression: format!("{} (evaluation error: {})", expr_str, e),
+                    }));
+                }
+            },
+            Err(e) => {
+                return Ok(GuardAction::Error(WaypointError::GuardFailed {
+                    kind: "require".to_string(),
+                    script: migration.script.clone(),
+                    expression: format!("{} (parse error: {})", expr_str, e),
+                }));
+            }
+        }
+    }
+    Ok(GuardAction::Continue)
+}
+
+/// Dialect-aware `ensure` guard evaluator.
+async fn evaluate_ensure_guards_db(
+    client: &DbClient,
+    schema: &str,
+    migration: &ResolvedMigration,
+) -> Result<()> {
+    for expr_str in &migration.directives.ensure {
+        match crate::guard::parse(expr_str) {
+            Ok(expr) => match crate::guard::evaluate_db(client, schema, &expr).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(WaypointError::GuardFailed {
+                        kind: "ensure".to_string(),
+                        script: migration.script.clone(),
+                        expression: expr_str.clone(),
+                    });
+                }
+                Err(e) => {
+                    return Err(WaypointError::GuardFailed {
+                        kind: "ensure".to_string(),
+                        script: migration.script.clone(),
+                        expression: format!("{} (evaluation error: {})", expr_str, e),
+                    });
+                }
+            },
+            Err(e) => {
+                return Err(WaypointError::GuardFailed {
+                    kind: "ensure".to_string(),
+                    script: migration.script.clone(),
+                    expression: format!("{} (parse error: {})", expr_str, e),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Evaluate all `-- waypoint:ensure` guard postconditions for a migration.
 ///
 /// Returns `Ok(())` if all postconditions pass. Returns an error if any
 /// postcondition fails or cannot be evaluated.
+#[cfg(feature = "postgres")]
 async fn evaluate_ensure_guards(
     client: &Client,
     schema: &str,
@@ -1562,6 +1657,13 @@ async fn run_migrate_mysql(
         let placeholders =
             build_placeholders(&config.placeholders, &schema, &db_user, &db_name, &m.script);
 
+        // require guards: skip migration or abort per on_require_fail policy.
+        match evaluate_require_guards_db(client, &schema, m, config).await? {
+            GuardAction::Continue => {}
+            GuardAction::Skip => continue,
+            GuardAction::Error(e) => return Err(e),
+        }
+
         fire_hooks(
             client,
             &all_hooks,
@@ -1582,6 +1684,12 @@ async fn run_migrate_mysql(
             execution_time_ms: elapsed,
         });
 
+        // ensure guards run AFTER the migration. On MySQL DDL has already
+        // auto-committed, so an ensure-failure does NOT roll back the
+        // migration — it surfaces as a hard error and leaves the schema in
+        // the post-migration state. This is the documented MySQL caveat.
+        evaluate_ensure_guards_db(client, &schema, m).await?;
+
         fire_hooks(
             client,
             &all_hooks,
@@ -1595,6 +1703,12 @@ async fn run_migrate_mysql(
     for m in pending_repeatables {
         let placeholders =
             build_placeholders(&config.placeholders, &schema, &db_user, &db_name, &m.script);
+
+        match evaluate_require_guards_db(client, &schema, m, config).await? {
+            GuardAction::Continue => {}
+            GuardAction::Skip => continue,
+            GuardAction::Error(e) => return Err(e),
+        }
 
         fire_hooks(
             client,
@@ -1615,6 +1729,8 @@ async fn run_migrate_mysql(
             script: m.script.clone(),
             execution_time_ms: elapsed,
         });
+
+        evaluate_ensure_guards_db(client, &schema, m).await?;
 
         fire_hooks(
             client,

@@ -11,6 +11,8 @@
 //! operators (`<`, `>`, `<=`, `>=`), and built-in assertion functions that
 //! query the database schema.
 
+use crate::db::DbClient;
+use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
 
 /// Maximum nesting depth for guard expression parsing.
@@ -553,7 +555,7 @@ pub fn parse(input: &str) -> Result<GuardExpr> {
 // Built-in function SQL generation
 // ---------------------------------------------------------------------------
 
-/// Generate the SQL query for a built-in guard function.
+/// Generate the SQL query for a built-in guard function (PostgreSQL).
 ///
 /// Returns `(sql, params, is_boolean)` — `params` contains the parameter values
 /// in order ($1, $2, $3...), and `is_boolean` is `true` when the query returns
@@ -691,6 +693,131 @@ fn builtin_sql(name: &str, args: &[String], schema: &str) -> Result<(String, Vec
     }
 }
 
+/// Generate the SQL query for a built-in guard function (MySQL 8.0+).
+///
+/// Mirrors [`builtin_sql`] but emits `?` placeholders and uses MySQL system
+/// tables (`information_schema.*`). The `enum_exists` builtin is rejected
+/// because MySQL has no enum *type* — ENUM is a column type modifier and
+/// can't exist independently in the schema.
+#[cfg(feature = "mysql")]
+fn builtin_sql_mysql(
+    name: &str,
+    args: &[String],
+    schema: &str,
+) -> Result<(String, Vec<String>, bool)> {
+    match name {
+        "table_exists" => {
+            require_args(name, args, 1)?;
+            Ok((
+                "SELECT EXISTS(SELECT 1 FROM information_schema.tables \
+                 WHERE table_schema = ? AND table_name = ?)"
+                    .to_string(),
+                vec![schema.to_string(), args[0].clone()],
+                true,
+            ))
+        }
+        "column_exists" => {
+            require_args(name, args, 2)?;
+            Ok((
+                "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = ? AND table_name = ? AND column_name = ?)"
+                    .to_string(),
+                vec![schema.to_string(), args[0].clone(), args[1].clone()],
+                true,
+            ))
+        }
+        "column_type" => {
+            require_args(name, args, 3)?;
+            // MySQL stores the base type in DATA_TYPE (e.g. "varchar", "int")
+            // and the full declaration in COLUMN_TYPE (e.g. "varchar(255)").
+            // We match DATA_TYPE for consistency with the PG behaviour where
+            // `column_type("t","c","character varying")` matches the type name.
+            Ok((
+                "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = ? AND table_name = ? \
+                 AND column_name = ? AND data_type = ?)"
+                    .to_string(),
+                vec![
+                    schema.to_string(),
+                    args[0].clone(),
+                    args[1].clone(),
+                    args[2].clone(),
+                ],
+                true,
+            ))
+        }
+        "column_nullable" => {
+            require_args(name, args, 2)?;
+            Ok((
+                "SELECT EXISTS(SELECT 1 FROM information_schema.columns \
+                 WHERE table_schema = ? AND table_name = ? \
+                 AND column_name = ? AND is_nullable = 'YES')"
+                    .to_string(),
+                vec![schema.to_string(), args[0].clone(), args[1].clone()],
+                true,
+            ))
+        }
+        "index_exists" => {
+            require_args(name, args, 1)?;
+            Ok((
+                "SELECT EXISTS(SELECT 1 FROM information_schema.statistics \
+                 WHERE table_schema = ? AND index_name = ?)"
+                    .to_string(),
+                vec![schema.to_string(), args[0].clone()],
+                true,
+            ))
+        }
+        "constraint_exists" => {
+            require_args(name, args, 2)?;
+            Ok((
+                "SELECT EXISTS(SELECT 1 FROM information_schema.table_constraints \
+                 WHERE table_schema = ? AND table_name = ? AND constraint_name = ?)"
+                    .to_string(),
+                vec![schema.to_string(), args[0].clone(), args[1].clone()],
+                true,
+            ))
+        }
+        "function_exists" => {
+            require_args(name, args, 1)?;
+            Ok((
+                "SELECT EXISTS(SELECT 1 FROM information_schema.routines \
+                 WHERE routine_schema = ? AND routine_name = ? \
+                 AND routine_type = 'FUNCTION')"
+                    .to_string(),
+                vec![schema.to_string(), args[0].clone()],
+                true,
+            ))
+        }
+        "enum_exists" => Err(WaypointError::ConfigError(
+            "Guard expression: enum_exists() is not supported on MySQL — \
+             MySQL has no enum *type* (ENUM is a column type modifier, not a \
+             schema object). Use column_type(..., \"enum\") instead."
+                .into(),
+        )),
+        "row_count" => {
+            require_args(name, args, 1)?;
+            // information_schema.tables.table_rows is an approximate count
+            // (storage-engine dependent). InnoDB returns NULL for empty/new
+            // tables in some cases — COALESCE so callers get 0 rather than
+            // a NULL surfacing as a type-conversion error.
+            Ok((
+                "SELECT COALESCE(table_rows, 0) FROM information_schema.tables \
+                 WHERE table_schema = ? AND table_name = ?"
+                    .to_string(),
+                vec![schema.to_string(), args[0].clone()],
+                false,
+            ))
+        }
+        "sql" => {
+            require_args(name, args, 1)?;
+            Ok((args[0].clone(), vec![], true))
+        }
+        _ => Err(WaypointError::ConfigError(format!(
+            "Guard expression: unknown function '{name}'"
+        ))),
+    }
+}
+
 /// Validate that a function received the expected number of string arguments.
 fn require_args(name: &str, args: &[String], expected: usize) -> Result<()> {
     if args.len() != expected {
@@ -734,6 +861,7 @@ fn extract_string_args(args: &[GuardExpr]) -> Result<Vec<String>> {
 ///
 /// Returns `WaypointError::GuardFailed` when a function execution fails, or
 /// `WaypointError::ConfigError` for type mismatches and unknown functions.
+#[cfg(feature = "postgres")]
 pub async fn evaluate(
     client: &tokio_postgres::Client,
     schema: &str,
@@ -748,7 +876,8 @@ pub async fn evaluate(
     }
 }
 
-/// Recursively evaluate an expression node, returning its value.
+/// Recursively evaluate an expression node, returning its value (PostgreSQL).
+#[cfg(feature = "postgres")]
 fn eval_expr<'a>(
     client: &'a tokio_postgres::Client,
     schema: &'a str,
@@ -860,6 +989,200 @@ fn eval_expr<'a>(
             }
         }
     })
+}
+
+// ---------------------------------------------------------------------------
+// Dialect-aware evaluator
+// ---------------------------------------------------------------------------
+
+/// Evaluate a guard expression against a [`DbClient`] (dialect-aware entry).
+///
+/// Dispatches to the PostgreSQL or MySQL implementation based on the connection
+/// kind. Recursion shape mirrors the legacy [`evaluate`] function; only the
+/// leaf `FunctionCall` arm differs per engine.
+pub async fn evaluate_db(client: &DbClient, schema: &str, expr: &GuardExpr) -> Result<bool> {
+    let value = eval_expr_db(client, schema, expr).await?;
+    match value {
+        GuardValue::Bool(b) => Ok(b),
+        other => Err(WaypointError::ConfigError(format!(
+            "Guard expression: expected boolean result, got {other}"
+        ))),
+    }
+}
+
+fn eval_expr_db<'a>(
+    client: &'a DbClient,
+    schema: &'a str,
+    expr: &'a GuardExpr,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<GuardValue>> + Send + 'a>> {
+    Box::pin(async move {
+        match expr {
+            GuardExpr::BoolLiteral(b) => Ok(GuardValue::Bool(*b)),
+            GuardExpr::NumberLiteral(n) => Ok(GuardValue::Number(*n)),
+            GuardExpr::StringLiteral(s) => Ok(GuardValue::Str(s.clone())),
+
+            GuardExpr::Not(inner) => {
+                let val = eval_expr_db(client, schema, inner).await?;
+                match val {
+                    GuardValue::Bool(b) => Ok(GuardValue::Bool(!b)),
+                    other => Err(WaypointError::ConfigError(format!(
+                        "Guard expression: NOT requires boolean, got {other}"
+                    ))),
+                }
+            }
+
+            GuardExpr::And(left, right) => {
+                let lval = eval_expr_db(client, schema, left).await?;
+                match lval {
+                    GuardValue::Bool(false) => Ok(GuardValue::Bool(false)),
+                    GuardValue::Bool(true) => {
+                        let rval = eval_expr_db(client, schema, right).await?;
+                        match rval {
+                            GuardValue::Bool(b) => Ok(GuardValue::Bool(b)),
+                            other => Err(WaypointError::ConfigError(format!(
+                                "Guard expression: AND requires boolean operands, got {other}"
+                            ))),
+                        }
+                    }
+                    other => Err(WaypointError::ConfigError(format!(
+                        "Guard expression: AND requires boolean operands, got {other}"
+                    ))),
+                }
+            }
+
+            GuardExpr::Or(left, right) => {
+                let lval = eval_expr_db(client, schema, left).await?;
+                match lval {
+                    GuardValue::Bool(true) => Ok(GuardValue::Bool(true)),
+                    GuardValue::Bool(false) => {
+                        let rval = eval_expr_db(client, schema, right).await?;
+                        match rval {
+                            GuardValue::Bool(b) => Ok(GuardValue::Bool(b)),
+                            other => Err(WaypointError::ConfigError(format!(
+                                "Guard expression: OR requires boolean operands, got {other}"
+                            ))),
+                        }
+                    }
+                    other => Err(WaypointError::ConfigError(format!(
+                        "Guard expression: OR requires boolean operands, got {other}"
+                    ))),
+                }
+            }
+
+            GuardExpr::Comparison { left, op, right } => {
+                let lval = eval_expr_db(client, schema, left).await?;
+                let rval = eval_expr_db(client, schema, right).await?;
+                match (&lval, &rval) {
+                    (GuardValue::Number(a), GuardValue::Number(b)) => {
+                        let result = match op {
+                            ComparisonOp::Lt => a < b,
+                            ComparisonOp::Gt => a > b,
+                            ComparisonOp::Le => a <= b,
+                            ComparisonOp::Ge => a >= b,
+                        };
+                        Ok(GuardValue::Bool(result))
+                    }
+                    _ => Err(WaypointError::ConfigError(format!(
+                        "Guard expression: comparison requires numeric operands, got {lval} {op} {rval}"
+                    ))),
+                }
+            }
+
+            GuardExpr::FunctionCall { name, args } => {
+                let string_args = extract_string_args(args)?;
+                exec_builtin(client, schema, name, &string_args).await
+            }
+        }
+    })
+}
+
+/// Execute a built-in guard function against the configured backend.
+async fn exec_builtin(
+    client: &DbClient,
+    schema: &str,
+    name: &str,
+    string_args: &[String],
+) -> Result<GuardValue> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => {
+            let (sql, param_values, is_boolean) = builtin_sql(name, string_args, schema)?;
+            let pg = client.as_postgres()?;
+            let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = param_values
+                .iter()
+                .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
+                .collect();
+            let row = pg
+                .query_one(&sql, &params)
+                .await
+                .map_err(|e| guard_failed(name, string_args, &e.to_string()))?;
+            if is_boolean {
+                Ok(GuardValue::Bool(row.get(0)))
+            } else {
+                Ok(GuardValue::Number(row.get(0)))
+            }
+        }
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => {
+            use mysql_async::prelude::*;
+            let (sql, param_values, is_boolean) = builtin_sql_mysql(name, string_args, schema)?;
+            let pool = client.as_mysql()?;
+            let mut conn = pool
+                .get_conn()
+                .await
+                .map_err(|e| guard_failed(name, string_args, &e.to_string()))?;
+            if is_boolean {
+                // information_schema EXISTS(...) returns 0/1 as a TINYINT on
+                // MySQL — read it as i64 then convert to bool to avoid the
+                // chrono-feature ambiguity around bool decoding.
+                let result: Option<i64> = if param_values.is_empty() {
+                    conn.query_first(&sql).await
+                } else {
+                    let p: Vec<mysql_async::Value> = param_values
+                        .iter()
+                        .map(|s| mysql_async::Value::Bytes(s.as_bytes().to_vec()))
+                        .collect();
+                    conn.exec_first(&sql, p).await
+                }
+                .map_err(|e| guard_failed(name, string_args, &e.to_string()))?;
+                Ok(GuardValue::Bool(matches!(result, Some(n) if n != 0)))
+            } else {
+                let result: Option<i64> = if param_values.is_empty() {
+                    conn.query_first(&sql).await
+                } else {
+                    let p: Vec<mysql_async::Value> = param_values
+                        .iter()
+                        .map(|s| mysql_async::Value::Bytes(s.as_bytes().to_vec()))
+                        .collect();
+                    conn.exec_first(&sql, p).await
+                }
+                .map_err(|e| guard_failed(name, string_args, &e.to_string()))?;
+                Ok(GuardValue::Number(result.unwrap_or(0)))
+            }
+        }
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in".into(),
+        )),
+    }
+}
+
+fn guard_failed(name: &str, args: &[String], reason: &str) -> WaypointError {
+    WaypointError::GuardFailed {
+        kind: "evaluation".to_string(),
+        script: String::new(),
+        expression: format!(
+            "{name}({}) failed: {reason}",
+            args.iter()
+                .map(|a| format!("\"{a}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
