@@ -55,7 +55,15 @@ pub enum WaypointError {
     #[error("Migration parse error: {0}")]
     MigrationParseError(String),
 
-    /// The on-disk checksum of a migration does not match the recorded checksum.
+    /// **Reserved / unused.** No code path currently constructs this variant —
+    /// checksum mismatches surface as `ValidationFailed(String)` from the
+    /// `validate` command (which aggregates one or more mismatches into a
+    /// single human-readable string). Kept for back-compat with external
+    /// matchers; scheduled for removal in 0.4.0.
+    #[deprecated(
+        since = "0.3.4",
+        note = "Never produced — checksum mismatches surface as ValidationFailed. Will be removed in 0.4.0."
+    )]
     #[error("Checksum mismatch for migration {script}: expected {expected}, found {found}")]
     ChecksumMismatch {
         script: String,
@@ -121,7 +129,14 @@ pub enum WaypointError {
     #[error("Lint found {error_count} error(s): {details}")]
     LintFailed { error_count: usize, details: String },
 
-    /// A schema diff operation failed.
+    /// **Reserved / unused.** No code path currently constructs this variant —
+    /// the `diff` command surfaces failures as `ConfigError(String)` or
+    /// `DatabaseError`. Kept for back-compat with external matchers; scheduled
+    /// for removal in 0.4.0.
+    #[deprecated(
+        since = "0.3.4",
+        note = "Never produced — diff failures surface as ConfigError or DatabaseError. Will be removed in 0.4.0."
+    )]
     #[error("Diff failed: {reason}")]
     DiffFailed { reason: String },
 

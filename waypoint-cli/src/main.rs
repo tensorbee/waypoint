@@ -325,6 +325,10 @@ async fn main() {
 }
 
 /// Map error types to differentiated exit codes.
+// ChecksumMismatch and DiffFailed are deprecated reserved variants that no
+// code path actually constructs. Their arms below are dead but kept until
+// the variants are removed in 0.4.0 (so the match remains exhaustive).
+#[allow(deprecated)]
 fn exit_code(error: &WaypointError) -> i32 {
     match error {
         WaypointError::ConfigError(_) => 2,
@@ -837,6 +841,9 @@ async fn run_single_db_command(
 }
 
 /// Print a formatted error message with actionable hints to stderr.
+// Same deprecation-suppression as `exit_code` — keeps the match arms for
+// reserved variants until 0.4.0 drops the variants entirely.
+#[allow(deprecated)]
 fn print_error(error: &WaypointError) {
     eprintln!("{} {}", "ERROR:".red().bold(), error);
 
