@@ -21,7 +21,9 @@ Lightweight, Flyway-compatible SQL migration tool built in Rust. Targets Postgre
 
 ## Database support
 
-Waypoint targets two engines with different levels of coverage:
+Waypoint targets two engines with different levels of coverage. For a
+deeper look at parity, behavior differences, and production cautions, see
+[`docs/ENGINES.md`](docs/ENGINES.md).
 
 | | PostgreSQL 12+ | MySQL 8.0+ |
 |---|:---:|:---:|
