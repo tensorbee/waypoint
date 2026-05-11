@@ -588,8 +588,7 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
         if let Commands::Migrate { .. } = &cli.command {
             let wp = Waypoint::new(config).await?;
             let report =
-                waypoint_core::commands::explain::execute(wp.postgres_client()?, &wp.config)
-                    .await?;
+                waypoint_core::commands::explain::execute_db(wp.client(), &wp.config).await?;
             print_report!(report, json_output, output::print_explain_report);
             return Ok(());
         }

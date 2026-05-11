@@ -246,7 +246,7 @@ impl Waypoint {
 
     /// Run enhanced dry-run with EXPLAIN.
     pub async fn explain(&self) -> Result<ExplainReport> {
-        commands::explain::execute(self.client.as_postgres()?, &self.config).await
+        commands::explain::execute_db(&self.client, &self.config).await
     }
 
     /// Run pre-flight health checks.

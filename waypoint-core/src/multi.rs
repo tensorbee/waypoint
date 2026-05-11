@@ -1,14 +1,17 @@
 //! Multi-database orchestration.
 //!
-//! Allows managing migrations across multiple named databases
-//! with dependency ordering between them.
+//! Allows managing migrations across multiple named databases with dependency
+//! ordering between them. Supports mixed-engine deployments — one config can
+//! mix `postgres://` and `mysql://` databases; the engine is auto-detected per
+//! database from the URL scheme.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde::Serialize;
-use tokio_postgres::Client;
 
 use crate::config::{DatabaseConfig, HooksConfig, MigrationSettings, WaypointConfig};
+use crate::db::DbClient;
+use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
 
 /// Configuration for a single named database within a multi-db setup.
@@ -75,7 +78,6 @@ impl MultiWaypoint {
     pub fn execution_order(databases: &[NamedDatabaseConfig]) -> Result<Vec<String>> {
         let all_names: HashSet<&str> = databases.iter().map(|d| d.name.as_str()).collect();
 
-        // Build in-degree map using borrowed names
         let mut in_degree: HashMap<&str, usize> = HashMap::new();
         let mut reverse_edges: HashMap<&str, Vec<&str>> = HashMap::new();
 
@@ -133,11 +135,13 @@ impl MultiWaypoint {
         Ok(sorted)
     }
 
-    /// Connect to all databases (or a filtered subset).
+    /// Connect to all databases (or a filtered subset). The engine for each
+    /// database is auto-detected from the URL scheme — mixed PG/MySQL configs
+    /// are fully supported here.
     pub async fn connect(
         databases: &[NamedDatabaseConfig],
         filter: Option<&str>,
-    ) -> Result<HashMap<String, Client>> {
+    ) -> Result<HashMap<String, DbClient>> {
         let mut clients = HashMap::new();
 
         for db in databases {
@@ -149,15 +153,7 @@ impl MultiWaypoint {
 
             let config = db.to_waypoint_config();
             let conn_string = config.connection_string()?;
-            let client = crate::db::connect_with_full_config(
-                &conn_string,
-                &config.database.ssl_mode,
-                config.database.connect_retries,
-                config.database.connect_timeout_secs,
-                config.database.statement_timeout_secs,
-                config.database.keepalive_secs,
-            )
-            .await?;
+            let client = connect_one(&conn_string, &config).await?;
             clients.insert(db.name.clone(), client);
         }
 
@@ -181,7 +177,7 @@ impl MultiWaypoint {
     /// Run migrate on all databases in dependency order.
     pub async fn migrate(
         databases: &[NamedDatabaseConfig],
-        clients: &HashMap<String, Client>,
+        clients: &HashMap<String, DbClient>,
         order: &[String],
         target_version: Option<&str>,
         fail_fast: bool,
@@ -195,7 +191,8 @@ impl MultiWaypoint {
             match (db, client) {
                 (Some(db), Some(client)) => {
                     let config = db.to_waypoint_config();
-                    match crate::commands::migrate::execute(client, &config, target_version).await {
+                    let outcome = dispatch_migrate(client, &config, target_version).await;
+                    match outcome {
                         Ok(report) => {
                             results.push(DatabaseResult {
                                 name: name.clone(),
@@ -241,7 +238,7 @@ impl MultiWaypoint {
     /// Run info on all databases in dependency order.
     pub async fn info(
         databases: &[NamedDatabaseConfig],
-        clients: &HashMap<String, Client>,
+        clients: &HashMap<String, DbClient>,
         order: &[String],
     ) -> Result<HashMap<String, Vec<crate::commands::info::MigrationInfo>>> {
         let mut all_info = HashMap::new();
@@ -252,11 +249,71 @@ impl MultiWaypoint {
 
             if let (Some(db), Some(client)) = (db, client) {
                 let config = db.to_waypoint_config();
-                let info = crate::commands::info::execute(client, &config).await?;
+                let info = crate::commands::info::execute_db(client, &config).await?;
                 all_info.insert(name.clone(), info);
             }
         }
 
         Ok(all_info)
+    }
+}
+
+/// Connect to one named database, auto-detecting the engine from the URL.
+async fn connect_one(conn_string: &str, config: &WaypointConfig) -> Result<DbClient> {
+    let kind = DialectKind::from_url(conn_string).unwrap_or(DialectKind::Postgres);
+    match kind {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => {
+            let client = crate::db::connect_with_full_config(
+                conn_string,
+                &config.database.ssl_mode,
+                config.database.connect_retries,
+                config.database.connect_timeout_secs,
+                config.database.statement_timeout_secs,
+                config.database.keepalive_secs,
+            )
+            .await?;
+            Ok(DbClient::with_postgres(client))
+        }
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => {
+            let pool = mysql_async::Pool::from_url(conn_string)
+                .map_err(|e| WaypointError::ConfigError(format!("Invalid MySQL URL: {}", e)))?;
+            Ok(DbClient::with_mysql(pool))
+        }
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
+        )),
+    }
+}
+
+/// Dispatch migrate to the appropriate engine-specific implementation.
+async fn dispatch_migrate(
+    client: &DbClient,
+    config: &WaypointConfig,
+    target_version: Option<&str>,
+) -> Result<crate::commands::migrate::MigrateReport> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => {
+            crate::commands::migrate::execute(client.as_postgres()?, config, target_version).await
+        }
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => {
+            crate::commands::migrate::execute_mysql(client, config, target_version).await
+        }
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
+        )),
     }
 }
