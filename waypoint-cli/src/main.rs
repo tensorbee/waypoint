@@ -662,13 +662,7 @@ async fn run_single_db_command(
                 }
             }
 
-            let report = waypoint_core::commands::migrate::execute_with_options(
-                wp.postgres_client()?,
-                &wp.config,
-                target.as_deref(),
-                force,
-            )
-            .await?;
+            let report = wp.migrate_with_options(target.as_deref(), force).await?;
             print_report!(report, json_output, quiet, output::print_migrate_summary);
         }
         Commands::Info => {

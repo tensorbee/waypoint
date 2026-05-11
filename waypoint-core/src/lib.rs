@@ -146,11 +146,27 @@ impl Waypoint {
 
     /// Apply pending migrations.
     pub async fn migrate(&self, target_version: Option<&str>) -> Result<MigrateReport> {
+        self.migrate_with_options(target_version, false).await
+    }
+
+    /// Apply pending migrations with the additional `force` flag for
+    /// overriding DANGER safety verdicts (PostgreSQL only; MySQL safety
+    /// analysis does not currently gate migrations).
+    pub async fn migrate_with_options(
+        &self,
+        target_version: Option<&str>,
+        force: bool,
+    ) -> Result<MigrateReport> {
         match self.client.dialect_kind() {
             #[cfg(feature = "postgres")]
             DialectKind::Postgres => {
-                commands::migrate::execute(self.client.as_postgres()?, &self.config, target_version)
-                    .await
+                commands::migrate::execute_with_options(
+                    self.client.as_postgres()?,
+                    &self.config,
+                    target_version,
+                    force,
+                )
+                .await
             }
             #[cfg(not(feature = "postgres"))]
             DialectKind::Postgres => Err(error::WaypointError::ConfigError(
@@ -158,7 +174,13 @@ impl Waypoint {
             )),
             #[cfg(feature = "mysql")]
             DialectKind::Mysql => {
-                commands::migrate::execute_mysql(&self.client, &self.config, target_version).await
+                commands::migrate::execute_mysql_with_options(
+                    &self.client,
+                    &self.config,
+                    target_version,
+                    force,
+                )
+                .await
             }
             #[cfg(not(feature = "mysql"))]
             DialectKind::Mysql => Err(error::WaypointError::ConfigError(

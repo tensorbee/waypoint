@@ -1122,6 +1122,37 @@ async fn drift_detects_manual_schema_change() {
 }
 
 #[tokio::test]
+async fn migrate_with_options_routes_to_mysql_path() {
+    // Regression: the CLI's Migrate handler historically called
+    // `migrate::execute_with_options(wp.postgres_client()?, ..., force)` to
+    // pass the force flag, which errored on MySQL with "operation is not yet
+    // implemented for MySQL." `Waypoint::migrate_with_options` now dispatches
+    // on dialect_kind so the CLI works on both engines.
+    let db = fresh_database("mwo").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__Init.sql",
+            "CREATE TABLE mwo_target (id INT PRIMARY KEY);",
+        )],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    // force=true is benign on MySQL (safety analysis doesn't gate migrations
+    // there), so we mainly check the call goes through without "operation is
+    // not yet implemented for MySQL".
+    let report = wp
+        .migrate_with_options(None, true)
+        .await
+        .expect("migrate_with_options should dispatch to MySQL path");
+    assert_eq!(report.migrations_applied, 1);
+}
+
+#[tokio::test]
 async fn explain_classifies_ddl_and_dml() {
     let db = fresh_database("explain").await;
     let name = db.name();
