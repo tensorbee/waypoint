@@ -36,13 +36,19 @@ zero changes — the `postgres` feature is on by default.
 - New `[preflight] max_replication_lag_secs` (default 30) — MySQL replica-lag threshold. Existing `max_replication_lag_mb` (default 100) remains PostgreSQL-only.
 - New `mysql` Cargo feature on both `waypoint-core` and `waypoint-cli`. Build with `--features mysql` to opt in.
 
-**Not yet ported to MySQL (deferred):**
+**Additional commands now working on MySQL:**
 
-- `guards` (`require` / `ensure`) — builtin functions use `pg_catalog`; need an `information_schema` port.
-- `auto-reversal generation`, `diff`, `drift` — need a parallel MySQL schema-introspection module.
-- `safety` analysis — PostgreSQL lock-level mapping is engine-specific; MySQL needs `ALGORITHM=INSTANT/INPLACE/COPY` rules.
-- `advisor` — `A001`–`A010` rules are PG-shaped; need a parallel MySQL rule set.
-- `explain` — EXPLAIN output format differs significantly.
+- `guards` (`require` / `ensure`) — 9 of 10 builtin assertion functions ported to `information_schema` (`table_exists`, `column_exists`, `column_type`, `column_nullable`, `index_exists`, `constraint_exists`, `function_exists`, `row_count`, `sql`). `enum_exists` is explicitly unsupported on MySQL since ENUM is a column-type modifier, not a schema object.
+- `safety` — `lock_level_for_ddl_mysql` mapping that's pessimistic by design (assumes worst-case `ALGORITHM=COPY` for ALTER TABLE, since MySQL may upgrade to INSTANT/INPLACE but won't always). Size classification from `information_schema.tables.table_rows`. Suggestions tailored to MySQL (gh-ost for large index creation, etc.).
+- `advise` — new MySQL rule set `M001`-`M005`: FK column without index, table without primary key, non-utf8mb4 charset, non-InnoDB storage engine, duplicate indexes.
+- `diff` — `introspect_mysql` produces the same `SchemaSnapshot` shape as PG; structural diffs work across engines. Generated DDL is still PG-flavored; consume the structured `diffs[]` for MySQL.
+- `drift` — throwaway database + held connection with `USE temp_db`, replays applied migrations, diffs against the live database. The `diffs_to_drift_entries` helper is shared with the PG path.
+- `explain` — `EXPLAIN FORMAT=JSON` with `access_type=ALL` (full table scan) surfaced as a warning.
+- Multi-database orchestration — `MultiWaypoint::connect` auto-detects per-database engine from URL scheme; one config can mix `postgres://` and `mysql://` entries.
+
+**Still not ported to MySQL (deferred):**
+
+- Auto-reversal generation depends on emitting MySQL-flavored DDL from a `SchemaDiff`. Structural MySQL diff is in place; the DDL generator (parallel to `schema::generate_ddl`) is the remaining piece.
 
 See `CLAUDE.md` for the full per-command status table.
 

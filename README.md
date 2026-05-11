@@ -13,11 +13,11 @@ Lightweight, Flyway-compatible SQL migration tool built in Rust. Targets Postgre
 - **Fast** — single static binary, ~30MB Docker image
 - **Flyway-compatible** — same migration naming, CRC32 checksums, JDBC URL support
 - **Production-ready** — TLS via rustls, advisory locking, structured logging, retry with backoff
-- **Provably safe** — guarded migrations, safety analysis, auto-reversals, simulation (PostgreSQL)
-- **Schema intelligence** — diff, drift detection, snapshots, EXPLAIN dry-run, schema advisor (PostgreSQL)
-- **Team-friendly** — lint, changelog, branch conflict detection, multi-database orchestration
+- **Provably safe** — guarded migrations, safety analysis, auto-reversals (PG), simulation
+- **Schema intelligence** — diff, drift detection, snapshots, EXPLAIN dry-run, schema advisor
+- **Team-friendly** — lint, changelog, branch conflict detection, multi-database orchestration (mixed PG + MySQL configs)
 - **Drop-in Docker replacement** — same env vars as Flyway containers
-- **MySQL support** — `migrate`, `info`, `validate`, `repair`, `baseline`, `clean`, `snapshot`, `restore`, `undo` (manual U-files), `preflight`, `simulate` all work on MySQL 8.0+. Analysis commands (`safety`, `advisor`, `diff`, `drift`, `guards`) are PostgreSQL-only for now
+- **Dual-engine** — full command coverage on PostgreSQL 12+ and MySQL 8.0+. Auto-reversal generation remains PG-only; everything else (guards, safety, advisor, diff, drift, explain) works on both
 
 ## Database support
 
@@ -31,12 +31,14 @@ Waypoint targets two engines with different levels of coverage:
 | `snapshot`, `restore`, `simulate`, `preflight` | Yes | Yes |
 | `undo` (manual `U{ver}__*.sql` files) | Yes | Yes |
 | `lint`, `changelog`, `check-conflicts` (no-DB) | Yes | Yes |
-| Auto-reversal generation | Yes | — |
-| Guard expressions (`require` / `ensure`) | Yes | — |
-| Safety analysis (lock levels, impact, verdicts) | Yes | — |
-| Schema advisor (A001-A010 rules) | Yes | — |
-| Schema diff / drift detection | Yes | — |
-| `EXPLAIN` dry-run | Yes | — |
+| Guard expressions (`require` / `ensure`) | Yes | Yes |
+| Safety analysis (lock levels, impact, verdicts) | Yes | Yes |
+| Schema advisor | Yes (A001-A010) | Yes (M001-M005) |
+| Schema diff | Yes | Yes (structured) |
+| Drift detection | Yes | Yes |
+| `EXPLAIN` dry-run | Yes | Yes (`FORMAT=JSON`) |
+| Multi-database orchestration (mixed engines) | Yes | Yes |
+| Auto-reversal generation | Yes | — (MySQL DDL emitter pending) |
 | Transactional DDL (`batch_transaction` mode) | Yes | — (MySQL DDL auto-commits) |
 
 Build with both backends:

@@ -71,24 +71,26 @@ No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts` — 
 
 | Command | Status | Notes |
 |---|---|---|
-| `migrate` | ✅ working | Includes hooks + validate-on-migrate + preflight. Skips guards/safety/reversals. Errors on `batch_transaction = true` (MySQL DDL auto-commits, so no atomic rollback) |
+| `migrate` | ✅ working | Hooks + validate-on-migrate + preflight + guards (require/ensure). Errors on `batch_transaction = true` (MySQL DDL auto-commits). |
 | `info` | ✅ working | Dialect-aware via `execute_db` |
 | `validate` | ✅ working | Checksum check; same Flyway-compat CRC32 |
 | `repair` | ✅ working | Drops failed rows; updates checksums |
 | `baseline` | ✅ working | Refuses if history table has entries |
 | `clean` | ✅ working | Disables FOREIGN_KEY_CHECKS, drops views/tables/routines/events |
-| `snapshot` | ✅ working | `SHOW CREATE TABLE` / `SHOW CREATE VIEW` based (no full schema introspection) |
+| `snapshot` | ✅ working | `SHOW CREATE TABLE` / `SHOW CREATE VIEW` based |
 | `restore` | ✅ working | Wipes target DB, replays snapshot via MySQL-aware splitter |
-| `undo` | ✅ working | Manual U-files only — auto-reversal still PG-specific |
-| `preflight` | ✅ working | 6 MySQL-specific checks: read-only, connections, processlist, replica lag, db size, metadata locks |
-| `simulate` | ✅ working | Replicates source DDL (tables + views) into a temp database via SHOW CREATE, runs pendings, drops temp DB. View qualifiers rewritten so refs bind to the temp database |
+| `undo` | ✅ working | Manual U-files only — auto-reversal generation still PG-specific |
+| `preflight` | ✅ working | 6 MySQL checks: read-only, connections, processlist, replica lag, db size, metadata locks |
+| `simulate` | ✅ working | Replicates tables + views into a temp DB via SHOW CREATE; view DB qualifiers rewritten |
+| `safety` | ✅ working | Pessimistic worst-case ALGORITHM=COPY lock mapping; size from `information_schema.tables.table_rows` |
+| `advise` | ✅ working | MySQL rule set M001-M005 (FK without index, no PK, non-utf8mb4, non-InnoDB, dup indexes) |
+| `guards` (require / ensure) | ✅ working | 9 builtin functions ported to information_schema (`enum_exists` rejected — MySQL has no enum type) |
+| `diff` | ✅ working | Structural diffs over information_schema introspection; generated DDL is best-effort PG syntax |
+| `drift` | ✅ working | Throwaway database + USE-scoped migration replay; structural diff against live |
+| `explain` | ✅ working | `EXPLAIN FORMAT=JSON`; access_type=ALL surfaced as a warning |
 | `lint` / `changelog` / `check-conflicts` | ✅ working | No-DB; engine-agnostic |
-| `guards` (require / ensure) | ⚠️ PG only | guard.rs builtin functions use pg_catalog; need MySQL information_schema port |
-| `auto-reversal generation` | ⚠️ PG only | Depends on full schema diff; deferred with diff/drift |
-| `diff` / `drift` | ⚠️ PG only | Both need a MySQL schema-introspection module parallel to schema.rs |
-| `safety` | ⚠️ PG only | Lock-level mapping is PG-specific; MySQL needs ALGORITHM=INSTANT/INPLACE/COPY rules |
-| `advisor` | ⚠️ PG only | A001-A010 are PG-rule-shaped; need parallel MySQL rule set |
-| `explain` | ⚠️ PG only | EXPLAIN syntax differs on MySQL; not yet wired |
+| Multi-database orchestration | ✅ working | Mixed-engine configs (PG + MySQL in the same `[[databases]]` list) supported |
+| Auto-reversal generation | ⚠️ PG only | Depends on PG-specific DDL generation; structural MySQL diff lands, DDL emission deferred |
 
 ### CLI (waypoint-cli/src/)
 
