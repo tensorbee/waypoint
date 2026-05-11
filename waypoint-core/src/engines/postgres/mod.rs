@@ -6,3 +6,4 @@
 pub mod advisor;
 pub mod history;
 pub mod migrate;
+pub mod safety;
