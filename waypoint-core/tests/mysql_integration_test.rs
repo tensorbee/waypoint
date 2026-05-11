@@ -521,6 +521,77 @@ async fn clean_refuses_when_disabled_unless_force() {
 }
 
 #[tokio::test]
+async fn simulate_runs_pending_migrations_in_throwaway_db() {
+    let name = fresh_database("sim").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            ("V1__Base.sql", "CREATE TABLE base (id INT PRIMARY KEY);"),
+            (
+                "V2__Add.sql",
+                "ALTER TABLE base ADD COLUMN name VARCHAR(50);",
+            ),
+        ],
+    );
+    let config = config_for(&name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    // Apply V1 to the source DB so V2 has something to ALTER
+    wp.migrate(Some("1")).await.expect("migrate V1");
+
+    // Simulate everything pending (V2)
+    let report = wp.simulate().await.expect("simulate");
+    assert!(report.passed, "simulation failed: {:?}", report.errors);
+    assert_eq!(report.migrations_simulated, 1);
+    assert!(report.temp_schema.starts_with("waypoint_sim_"));
+
+    // Verify the temp DB was cleaned up
+    let pool = mysql_async::Pool::from_url(root_url()).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let dbs: Vec<String> = conn
+        .exec(
+            "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+            (report.temp_schema.as_str(),),
+        )
+        .await
+        .unwrap();
+    assert!(
+        dbs.is_empty(),
+        "temp DB should be dropped, found: {:?}",
+        dbs
+    );
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
+async fn simulate_reports_sql_errors_without_failing() {
+    let name = fresh_database("simerr").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__Bad.sql",
+            "CREATE TABLE t (id INT, INVALID GIBBERISH HERE);",
+        )],
+    );
+    let config = config_for(&name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    let report = wp.simulate().await.expect("simulate ran");
+    assert!(!report.passed);
+    assert_eq!(report.errors.len(), 1);
+    assert_eq!(report.errors[0].script, "V1__Bad.sql");
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
 async fn preflight_runs_mysql_checks() {
     let name = fresh_database("preflight").await;
     let tempdir = tempfile::tempdir().unwrap();

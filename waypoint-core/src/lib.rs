@@ -271,7 +271,7 @@ impl Waypoint {
 
     /// Simulate pending migrations in a throwaway schema.
     pub async fn simulate(&self) -> Result<SimulationReport> {
-        commands::simulate::execute(self.client.as_postgres()?, &self.config).await
+        commands::simulate::execute_db(&self.client, &self.config).await
     }
 }
 
