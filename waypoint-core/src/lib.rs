@@ -251,7 +251,7 @@ impl Waypoint {
 
     /// Run pre-flight health checks.
     pub async fn preflight(&self) -> Result<PreflightReport> {
-        preflight::run_preflight(self.client.as_postgres()?, &self.config.preflight).await
+        preflight::run_preflight_db(&self.client, &self.config.preflight).await
     }
 
     /// Check for branch conflicts (no DB required).

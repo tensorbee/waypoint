@@ -521,6 +521,33 @@ async fn clean_refuses_when_disabled_unless_force() {
 }
 
 #[tokio::test]
+async fn preflight_runs_mysql_checks() {
+    let name = fresh_database("preflight").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(&migrations, &[]);
+    let config = config_for(&name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    let report = wp.preflight().await.expect("preflight");
+    // 6 checks: read-only, active connections, long queries, replication lag,
+    // database size, lock contention. All should pass on the local container.
+    assert_eq!(report.checks.len(), 6);
+    assert!(report.passed, "preflight failed: {:?}", report.checks);
+
+    // Spot-check that each named check is present
+    let names: Vec<&str> = report.checks.iter().map(|c| c.name.as_str()).collect();
+    assert!(names.contains(&"Read-only"));
+    assert!(names.contains(&"Active Connections"));
+    assert!(names.contains(&"Long-Running Queries"));
+    assert!(names.contains(&"Replication Lag"));
+    assert!(names.contains(&"Database Size"));
+    assert!(names.contains(&"Lock Contention"));
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
 async fn undo_with_manual_u_file_reverts_table() {
     use waypoint_core::commands::undo::UndoTarget;
     let name = fresh_database("undo").await;
