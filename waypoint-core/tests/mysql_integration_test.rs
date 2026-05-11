@@ -908,3 +908,251 @@ async fn undo_falls_back_to_auto_reversal_on_mysql() {
         "auto_rev_target should be dropped by auto-reversal"
     );
 }
+
+// ── Phase 3 analysis-command coverage on MySQL ───────────────────────────────
+
+#[tokio::test]
+async fn safety_returns_verdicts_for_pending_migrations() {
+    use waypoint_core::safety::SafetyVerdict;
+    let db = fresh_database("safety").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            (
+                "V1__New.sql",
+                "CREATE TABLE new_table (id INT PRIMARY KEY);",
+            ),
+            (
+                "V2__Risky.sql",
+                "ALTER TABLE new_table ADD COLUMN risky VARCHAR(255) NOT NULL DEFAULT '';",
+            ),
+        ],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    let report = wp.safety().await.expect("safety");
+    assert_eq!(
+        report.reports.len(),
+        2,
+        "should analyze both pending migrations"
+    );
+    // V1 is a CREATE TABLE — pessimistic mapping says LockLevel::None → Safe.
+    // V2 is an ALTER TABLE ADD COLUMN — pessimistic worst-case ACCESS EXCLUSIVE
+    // but the empty table is Small, so verdict is Caution.
+    let v2_report = report
+        .reports
+        .iter()
+        .find(|r| r.script == "V2__Risky.sql")
+        .expect("V2 report present");
+    assert!(
+        matches!(
+            v2_report.overall_verdict,
+            SafetyVerdict::Caution | SafetyVerdict::Danger
+        ),
+        "ALTER TABLE on MySQL should be at least Caution, got {:?}",
+        v2_report.overall_verdict
+    );
+}
+
+#[tokio::test]
+async fn advise_surfaces_mysql_specific_rules() {
+    use waypoint_core::advisor::AdvisorySeverity;
+    let db = fresh_database("advise").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    // Three rule-trigger scenarios at once:
+    // - M002: table without a primary key
+    // - M003: non-utf8mb4 table charset
+    // - M004: non-InnoDB storage engine (MyISAM still buildable on 8.4)
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__Triggers.sql",
+            "CREATE TABLE no_pk (id INT) ENGINE=MyISAM DEFAULT CHARSET=latin1;",
+        )],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    let report = wp.advise().await.expect("advise");
+    let rules: std::collections::HashSet<&str> = report
+        .advisories
+        .iter()
+        .map(|a| a.rule_id.as_str())
+        .collect();
+    assert!(rules.contains("M002"), "M002 (no PK) should fire");
+    assert!(rules.contains("M003"), "M003 (non-utf8mb4) should fire");
+    assert!(rules.contains("M004"), "M004 (non-InnoDB) should fire");
+    // The history table is utf8mb4 + InnoDB + has PK so it shouldn't trigger.
+    let warnings: usize = report
+        .advisories
+        .iter()
+        .filter(|a| a.severity == AdvisorySeverity::Warning)
+        .count();
+    assert!(
+        warnings >= 2,
+        "expected at least 2 warnings, got {}",
+        warnings
+    );
+}
+
+#[tokio::test]
+async fn guards_require_blocks_when_table_missing() {
+    let db = fresh_database("guardreq").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    // V1 requires a table that doesn't exist — should fail with GuardFailed.
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__Add_email.sql",
+            "-- waypoint:require table_exists(\"users\")\n\
+             ALTER TABLE users ADD COLUMN email VARCHAR(255);",
+        )],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    let err = wp
+        .migrate(None)
+        .await
+        .expect_err("require guard should fail");
+    assert!(
+        err.to_string().contains("table_exists") || err.to_string().contains("require"),
+        "expected guard failure, got: {}",
+        err
+    );
+}
+
+#[tokio::test]
+async fn guards_ensure_passes_when_postcondition_met() {
+    let db = fresh_database("guardens").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__Add_users.sql",
+            "-- waypoint:ensure table_exists(\"users\")\n\
+             -- waypoint:ensure column_exists(\"users\", \"email\")\n\
+             CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(255));",
+        )],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    let report = wp.migrate(None).await.expect("ensure should pass");
+    assert_eq!(report.migrations_applied, 1);
+}
+
+#[tokio::test]
+async fn diff_detects_added_table_against_empty_target() {
+    use waypoint_core::commands::diff::DiffTarget;
+    let source = fresh_database("diffsrc").await;
+    let target = fresh_database("difftgt").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__T.sql",
+            "CREATE TABLE only_in_source (id INT PRIMARY KEY);",
+        )],
+    );
+    let config = config_for(source.name(), migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate source");
+
+    let report = wp
+        .diff(DiffTarget::Database(db_url(target.name())))
+        .await
+        .expect("diff");
+    assert!(report.has_changes);
+    // Source has `only_in_source` + `waypoint_schema_history`; target is empty.
+    // Diff goes source → target so it sees both as TableDropped (from source's
+    // perspective they need to be dropped to match target).
+    assert!(
+        report.diffs.iter().any(
+            |d| matches!(d, waypoint_core::schema::SchemaDiff::TableDropped(n)
+                if n == "only_in_source")
+        ),
+        "should see only_in_source as dropped vs empty target: {:?}",
+        report.diffs
+    );
+}
+
+#[tokio::test]
+async fn drift_detects_manual_schema_change() {
+    let db = fresh_database("drift").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[("V1__T.sql", "CREATE TABLE managed (id INT PRIMARY KEY);")],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    // Add a table outside the migration system.
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    conn.query_drop("CREATE TABLE drifted (id INT PRIMARY KEY)")
+        .await
+        .unwrap();
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    let report = wp.drift().await.expect("drift");
+    assert!(report.has_drift);
+    assert!(
+        report.drifts.iter().any(|d| d.object.contains("drifted")),
+        "drift should detect the manually-added table: {:?}",
+        report.drifts
+    );
+}
+
+#[tokio::test]
+async fn explain_classifies_ddl_and_dml() {
+    let db = fresh_database("explain").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    // V1 = DDL (not explainable), V2 = DML (explainable) referencing V1's table.
+    write_migrations(
+        &migrations,
+        &[
+            (
+                "V1__Make.sql",
+                "CREATE TABLE explain_t (id INT PRIMARY KEY, name VARCHAR(50));",
+            ),
+            (
+                "V2__Seed.sql",
+                "INSERT INTO explain_t (id, name) VALUES (1, 'a');",
+            ),
+        ],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    // V1 must be applied first so V2's INSERT has somewhere to EXPLAIN against.
+    wp.migrate(Some("1")).await.expect("apply V1");
+
+    let report = wp.explain().await.expect("explain");
+    let v2 = report
+        .migrations
+        .iter()
+        .find(|m| m.script == "V2__Seed.sql")
+        .expect("V2 explained");
+    // INSERT is not DDL.
+    assert!(v2.statements.iter().any(|s| !s.is_ddl));
+}

@@ -75,11 +75,21 @@ pub async fn execute_db(
     let target_snapshot = match target {
         DiffTarget::Database(ref url) => {
             let target_client = connect_for_url(url).await?;
-            // The target's "schema" may not be the same as the source's on
-            // MySQL — resolve the target's current database too.
-            let target_schema = target_client
-                .resolve_schema(&config.migrations.schema)
-                .await?;
+            // Schema resolution for --target-url differs by engine:
+            //   PG: schemas are namespaces *within* a database, so the
+            //       configured `schema` (e.g. "public") applies to both sides.
+            //   MySQL: "schema" === "database", and the target URL specifies a
+            //       different database. We introspect whatever the target
+            //       connection actually points at, not the source's configured
+            //       db name.
+            let target_schema = match target_client.dialect_kind() {
+                DialectKind::Mysql => target_client.current_database().await?,
+                DialectKind::Postgres => {
+                    target_client
+                        .resolve_schema(&config.migrations.schema)
+                        .await?
+                }
+            };
             schema::introspect_db(&target_client, &target_schema).await?
         }
     };
