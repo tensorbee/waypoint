@@ -159,6 +159,13 @@ pub struct SafetyConfig {
     pub large_table_threshold: i64,
     /// Row count threshold for classifying a table as Huge.
     pub huge_table_threshold: i64,
+    /// MySQL only: run `ANALYZE TABLE <name>` on each affected table before
+    /// reading `information_schema.tables.table_rows` for size classification.
+    /// Off by default because `ANALYZE TABLE` acquires a brief metadata lock
+    /// and rewrites stats. Enable when you need accurate size classification
+    /// at the cost of touching the table — typically during a CI safety check
+    /// rather than at production-migrate time.
+    pub refresh_stats_mysql: bool,
 }
 
 impl Default for SafetyConfig {
@@ -168,6 +175,7 @@ impl Default for SafetyConfig {
             block_on_danger: false,
             large_table_threshold: 1_000_000,
             huge_table_threshold: 100_000_000,
+            refresh_stats_mysql: false,
         }
     }
 }

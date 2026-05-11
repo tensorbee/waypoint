@@ -977,8 +977,14 @@ async fn safety_returns_verdicts_for_pending_migrations() {
                 "CREATE TABLE new_table (id INT PRIMARY KEY);",
             ),
             (
+                // ADD COLUMN NOT NULL with no default forces ALGORITHM=COPY
+                // even on MySQL 8.0.29+ — no value to populate existing
+                // rows with. We expect Caution/Danger regardless of server
+                // version. (Compare with ADD COLUMN ... NOT NULL DEFAULT '',
+                // which 8.0.29+ would now correctly classify as Safe via
+                // INSTANT — verified in unit tests in engines/mysql/safety.rs.)
                 "V2__Risky.sql",
-                "ALTER TABLE new_table ADD COLUMN risky VARCHAR(255) NOT NULL DEFAULT '';",
+                "ALTER TABLE new_table ADD COLUMN risky VARCHAR(255) NOT NULL;",
             ),
         ],
     );
@@ -991,9 +997,11 @@ async fn safety_returns_verdicts_for_pending_migrations() {
         2,
         "should analyze both pending migrations"
     );
-    // V1 is a CREATE TABLE — pessimistic mapping says LockLevel::None → Safe.
-    // V2 is an ALTER TABLE ADD COLUMN — pessimistic worst-case ACCESS EXCLUSIVE
-    // but the empty table is Small, so verdict is Caution.
+    // V1 is a CREATE TABLE — LockLevel::None → Safe.
+    // V2 is an ALTER TABLE ADD COLUMN NOT NULL (no default) — even on 8.0.29+
+    // this is NOT INSTANT-eligible (MySQL has no value to stamp into existing
+    // rows), so it stays at the worst-case ACCESS EXCLUSIVE lock and surfaces
+    // as Caution/Danger.
     let v2_report = report
         .reports
         .iter()
@@ -1004,8 +1012,44 @@ async fn safety_returns_verdicts_for_pending_migrations() {
             v2_report.overall_verdict,
             SafetyVerdict::Caution | SafetyVerdict::Danger
         ),
-        "ALTER TABLE on MySQL should be at least Caution, got {:?}",
+        "ALTER TABLE ADD COLUMN NOT NULL (no default) should be at least Caution, got {:?}",
         v2_report.overall_verdict
+    );
+}
+
+#[tokio::test]
+async fn safety_downgrades_instant_eligible_add_column_to_safe() {
+    use waypoint_core::safety::SafetyVerdict;
+    let db = fresh_database("safety_instant").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            ("V1__T.sql", "CREATE TABLE t (id INT PRIMARY KEY);"),
+            // ADD COLUMN nullable — INSTANT-eligible on 8.0.29+. On older
+            // MySQL or where version detection fails this stays Caution/Danger;
+            // we only assert the downgrade against a server new enough to
+            // support it, which the test container is (MySQL 8.4).
+            ("V2__Add_nullable.sql", "ALTER TABLE t ADD COLUMN bio TEXT;"),
+        ],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    let report = wp.safety().await.expect("safety");
+    let v2 = report
+        .reports
+        .iter()
+        .find(|r| r.script == "V2__Add_nullable.sql")
+        .expect("V2 report present");
+    assert_eq!(
+        v2.overall_verdict,
+        SafetyVerdict::Safe,
+        "ADD COLUMN nullable on MySQL 8.0.29+ should be INSTANT-eligible and \
+         downgraded to Safe, got {:?}",
+        v2.overall_verdict
     );
 }
 

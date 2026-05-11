@@ -96,20 +96,34 @@ clear message redirecting to `column_type("table", "col", "enum")`. If your
 migrations target both engines, gate enum-related guards behind
 `-- waypoint:env` or write them in terms of `column_type`.
 
-### 4. MySQL safety verdicts are intentionally pessimistic
+### 4. MySQL safety verdicts are version-aware (formerly pessimistic)
 
 MySQL 8.0 supports `ALGORITHM=INSTANT`, `INPLACE`, and `COPY` for most
-ALTER TABLE operations — but the engine chooses at execution time which to
-use, and the same DDL can fall back from INSTANT to INPLACE to COPY
-depending on table contents and history. Waypoint can't predict this
-statically, so the safety analyzer maps **ALTER TABLE → worst-case
-`AccessExclusiveLock`**. Verdicts on MySQL are conservative: an ADD COLUMN
-that would actually use INSTANT may still show CAUTION/DANGER.
+ALTER TABLE operations. The engine chooses at execution time which to use,
+and the same DDL can fall back from INSTANT to INPLACE to COPY depending
+on table contents and history.
 
-**Practical:** treat MySQL safety as a "review this if it touches a large
-table" prompt rather than a precise lock-prediction. For production-scale
-DDL, prefer `gh-ost` / `pt-online-schema-change` regardless of what Waypoint
-says.
+Waypoint detects the connected server's `@@version` once per safety pass
+and applies INSTANT-eligibility rules where statically determinable:
+
+| Operation | Lock level (≥ 8.0.29) | Lock level (< 8.0.29) |
+|---|---|---|
+| `ADD COLUMN` nullable | None (INSTANT) | AccessExclusive (worst case) |
+| `ADD COLUMN NOT NULL DEFAULT …` | None (INSTANT) | AccessExclusive |
+| `ADD COLUMN NOT NULL` (no default) | AccessExclusive | AccessExclusive |
+| `DROP COLUMN` | None (INSTANT) | AccessExclusive |
+| `ALTER COLUMN TYPE` | AccessExclusive | AccessExclusive |
+
+When version detection fails (rare — only on connection issues) the
+analyzer falls back to the conservative mapping, so verdicts can only get
+*more* permissive, never less.
+
+**Still pessimistic for:** `ALTER COLUMN TYPE` (always rewrites), and any
+INSTANT-eligible operation on a partitioned or `ROW_FORMAT=COMPRESSED`
+table (we don't introspect storage format, so we report Safe but MySQL
+may fall back to COPY). For production-scale schema rewrites at the
+billion-row level, prefer `gh-ost` / `pt-online-schema-change` regardless
+of what Waypoint says.
 
 ### 5. `current_user` format differs
 
@@ -130,8 +144,13 @@ magnitude on a busy table, and is sometimes `NULL` for empty tables.
 
 Waypoint uses these counts for safety size classification (`Small`,
 `Medium`, `Large`, `Huge`). A migration classified `Caution` on MySQL today
-might be `Danger` after the next stats refresh. For migrations where size
-classification matters, run `ANALYZE TABLE <name>` first.
+might be `Danger` after the next stats refresh.
+
+To get accurate classification on demand, set `[safety] refresh_stats_mysql
+= true`. Waypoint will then run `ANALYZE TABLE <name>` on each affected
+table before reading `table_rows`. This is off by default because
+`ANALYZE TABLE` acquires a brief metadata lock; turn it on for CI safety
+checks where you'd rather pay the lock than misclassify the migration.
 
 ### 7. Replication lag is configured differently
 
@@ -194,13 +213,14 @@ to lock level differs.
 
 ### Lock-level mapping
 
-| Operation | PG lock | MySQL approximate | Notes |
-|---|---|---|---|
-| `CREATE TABLE` | None (new object) | None | Identical |
-| `DROP TABLE` | AccessExclusiveLock | AccessExclusiveLock | Identical (effectively blocking on both) |
-| `ALTER TABLE ADD COLUMN` | AccessExclusiveLock | AccessExclusiveLock (worst case) | MySQL may upgrade to INSTANT (free) or INPLACE (brief MDL); worst-case is COPY (full rewrite) |
-| `ALTER TABLE DROP COLUMN` | AccessExclusiveLock | AccessExclusiveLock (worst case) | Same caveat |
-| `ALTER TABLE ALTER COLUMN TYPE` | AccessExclusiveLock | AccessExclusiveLock | Both engines effectively do a full table rewrite |
+| Operation | PG lock | MySQL (≥ 8.0.29) | MySQL (< 8.0.29) | Notes |
+|---|---|---|---|---|
+| `CREATE TABLE` | None (new object) | None | None | Identical |
+| `DROP TABLE` | AccessExclusiveLock | AccessExclusiveLock | AccessExclusiveLock | Identical (effectively blocking on both) |
+| `ADD COLUMN` (nullable, or NOT NULL with DEFAULT) | AccessExclusiveLock | **None (INSTANT)** | AccessExclusiveLock | MySQL 8.0.29+ stores the default in metadata, no row rewrite |
+| `ADD COLUMN NOT NULL` (no default) | AccessExclusiveLock | AccessExclusiveLock | AccessExclusiveLock | No value to populate existing rows — forces COPY |
+| `DROP COLUMN` | AccessExclusiveLock | **None (INSTANT)** | AccessExclusiveLock | INSTANT DROP COLUMN added in 8.0.29 |
+| `ALTER COLUMN TYPE` | AccessExclusiveLock | AccessExclusiveLock | AccessExclusiveLock | Both engines rewrite data; no INSTANT path |
 | `CREATE INDEX (default)` | ShareLock | ShareLock | PG: blocks writes. MySQL InnoDB: INPLACE, reads OK, brief metadata lock |
 | `CREATE INDEX CONCURRENTLY` | ShareUpdateExclusiveLock | — | No MySQL equivalent — closest is `gh-ost` or `pt-osc` |
 | `DROP INDEX` | AccessExclusiveLock | ShareLock | MySQL: INPLACE by default |

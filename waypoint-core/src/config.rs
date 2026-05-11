@@ -358,6 +358,7 @@ struct TomlSafetyConfig {
     block_on_danger: Option<bool>,
     large_table_threshold: Option<i64>,
     huge_table_threshold: Option<i64>,
+    refresh_stats_mysql: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -564,6 +565,7 @@ impl WaypointConfig {
             apply_option!(s.block_on_danger => self.safety.block_on_danger);
             apply_option!(s.large_table_threshold => self.safety.large_table_threshold);
             apply_option!(s.huge_table_threshold => self.safety.huge_table_threshold);
+            apply_option!(s.refresh_stats_mysql => self.safety.refresh_stats_mysql);
         }
 
         if let Some(a) = toml.advisor {
