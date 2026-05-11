@@ -4,10 +4,15 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
+
+#[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+#[cfg(feature = "postgres")]
 use crate::db;
+use crate::db::DbClient;
+use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
 use crate::history;
 use crate::migration::{scan_migrations, MigrationVersion, ResolvedMigration};
@@ -55,6 +60,7 @@ pub struct UndoDetail {
 /// On SQL execution failure, the transaction is rolled back and a best-effort
 /// failure record is inserted into the history table. Returns the execution
 /// time in milliseconds on success.
+#[cfg(feature = "postgres")]
 #[allow(clippy::too_many_arguments)]
 async fn execute_undo_sql(
     client: &Client,
@@ -137,7 +143,8 @@ async fn execute_undo_sql(
     }
 }
 
-/// Execute the undo command.
+/// Execute the undo command (PostgreSQL legacy entry).
+#[cfg(feature = "postgres")]
 pub async fn execute(
     client: &Client,
     config: &WaypointConfig,
@@ -171,6 +178,7 @@ pub async fn execute(
     result
 }
 
+#[cfg(feature = "postgres")]
 async fn run_undo(
     client: &Client,
     config: &WaypointConfig,
@@ -317,6 +325,221 @@ async fn run_undo(
             return Err(WaypointError::UndoMissing {
                 version: version.raw.clone(),
             });
+        }
+    }
+
+    Ok(report)
+}
+
+// ── Dialect-aware entry + MySQL path (Phase 1+: manual U-files only) ──────────
+//
+// MySQL undo deliberately supports manual U{version}__*.sql files only. Auto-
+// reversal generation requires schema introspection which is deferred (the
+// `reversal::get_reversal` path is PG-specific).
+
+/// Execute the undo command (dialect-aware entry).
+pub async fn execute_db(
+    client: &DbClient,
+    config: &WaypointConfig,
+    target: UndoTarget,
+) -> Result<UndoReport> {
+    match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => execute(client.as_postgres()?, config, target).await,
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => execute_mysql(client, config, target).await,
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
+        )),
+    }
+}
+
+#[cfg(feature = "mysql")]
+async fn execute_mysql(
+    client: &DbClient,
+    config: &WaypointConfig,
+    target: UndoTarget,
+) -> Result<UndoReport> {
+    let table = &config.migrations.table;
+
+    client.acquire_lock(table).await?;
+
+    let result = run_undo_mysql(client, config, target).await;
+
+    if let Err(e) = client.release_lock(table).await {
+        log::error!("Failed to release advisory lock: {}", e);
+    }
+
+    match &result {
+        Ok(report) => {
+            log::info!(
+                "Undo completed (mysql); migrations_undone={}, total_time_ms={}",
+                report.migrations_undone,
+                report.total_time_ms
+            );
+        }
+        Err(e) => {
+            log::error!("Undo failed (mysql): {}", e);
+        }
+    }
+
+    result
+}
+
+#[cfg(feature = "mysql")]
+async fn run_undo_mysql(
+    client: &DbClient,
+    config: &WaypointConfig,
+    target: UndoTarget,
+) -> Result<UndoReport> {
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
+    let schema = schema.as_str();
+    let table = &config.migrations.table;
+
+    history::create_history_table_db(client, schema, table).await?;
+
+    let resolved = scan_migrations(&config.migrations.locations)?;
+    let undo_by_version: HashMap<String, &ResolvedMigration> = resolved
+        .iter()
+        .filter(|m| m.is_undo())
+        .filter_map(|m| m.version().map(|v| (v.raw.clone(), m)))
+        .collect();
+
+    let applied = history::get_applied_migrations_db(client, schema, table).await?;
+    let effective = history::effective_applied_versions(&applied);
+
+    let mut applied_versions: Vec<MigrationVersion> = effective
+        .iter()
+        .filter_map(|v| MigrationVersion::parse(v).ok())
+        .collect();
+    applied_versions.sort();
+    applied_versions.reverse();
+
+    let versions_to_undo: Vec<MigrationVersion> = match target {
+        UndoTarget::Last => applied_versions.into_iter().take(1).collect(),
+        UndoTarget::Count(n) => applied_versions.into_iter().take(n).collect(),
+        UndoTarget::Version(ref target_ver) => applied_versions
+            .into_iter()
+            .filter(|v| v > target_ver)
+            .collect(),
+    };
+
+    let db_user = client
+        .current_user()
+        .await
+        .unwrap_or_else(|_| "unknown".into());
+    let db_name = client
+        .current_database()
+        .await
+        .unwrap_or_else(|_| "unknown".into());
+    let installed_by = config
+        .migrations
+        .installed_by
+        .as_deref()
+        .unwrap_or(&db_user)
+        .to_string();
+
+    let mut report = UndoReport {
+        migrations_undone: 0,
+        total_time_ms: 0,
+        details: Vec::new(),
+    };
+
+    for version in &versions_to_undo {
+        let undo_migration = match undo_by_version.get(&version.raw) {
+            Some(m) => *m,
+            None => {
+                // Phase 1 MySQL undo does not support auto-reversal — fail fast
+                // and ask the user for an explicit U file. When reversal-gen
+                // lands on MySQL (Phase 3) this branch becomes the fall-back.
+                return Err(WaypointError::UndoMissing {
+                    version: version.raw.clone(),
+                });
+            }
+        };
+
+        log::info!(
+            "Undoing migration (manual); migration={}, schema={}",
+            undo_migration.script,
+            schema
+        );
+
+        let placeholders = build_placeholders(
+            &config.placeholders,
+            schema,
+            &db_user,
+            &db_name,
+            &undo_migration.script,
+        );
+        let sql = replace_placeholders(&undo_migration.sql, &placeholders)?;
+
+        let start = std::time::Instant::now();
+        let exec_result = client.execute_raw(&sql).await;
+        let exec_time = start.elapsed().as_millis() as i32;
+
+        match exec_result {
+            Ok(_) => {
+                // Record success
+                history::insert_applied_migration_db(
+                    client,
+                    schema,
+                    table,
+                    Some(&version.raw),
+                    &undo_migration.description,
+                    "UNDO_SQL",
+                    &undo_migration.script,
+                    Some(undo_migration.checksum),
+                    &installed_by,
+                    exec_time,
+                    true,
+                )
+                .await?;
+
+                report.migrations_undone += 1;
+                report.total_time_ms += exec_time;
+                report.details.push(UndoDetail {
+                    version: version.raw.clone(),
+                    description: undo_migration.description.clone(),
+                    script: undo_migration.script.clone(),
+                    execution_time_ms: exec_time,
+                    auto_reversal: false,
+                });
+            }
+            Err(e) => {
+                // Best-effort failure record. MySQL DDL auto-commits so the
+                // schema may be in a partially-undone state; we report the
+                // failure with a clear message and let the operator decide.
+                if let Err(record_err) = history::insert_applied_migration_db(
+                    client,
+                    schema,
+                    table,
+                    Some(&version.raw),
+                    &undo_migration.description,
+                    "UNDO_SQL",
+                    &undo_migration.script,
+                    Some(undo_migration.checksum),
+                    &installed_by,
+                    exec_time,
+                    false,
+                )
+                .await
+                {
+                    log::warn!(
+                        "Failed to record undo failure; script={}, error={}",
+                        undo_migration.script,
+                        record_err
+                    );
+                }
+                return Err(WaypointError::UndoFailed {
+                    script: undo_migration.script.clone(),
+                    reason: e.to_string(),
+                });
+            }
         }
     }
 

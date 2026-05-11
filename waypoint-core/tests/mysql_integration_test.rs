@@ -519,3 +519,98 @@ async fn clean_refuses_when_disabled_unless_force() {
     let _ = wp.clean(true).await.expect("clean with allow");
     drop_database(&name).await;
 }
+
+#[tokio::test]
+async fn undo_with_manual_u_file_reverts_table() {
+    use waypoint_core::commands::undo::UndoTarget;
+    let name = fresh_database("undo").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            ("V1__Create.sql", "CREATE TABLE t (id INT PRIMARY KEY);"),
+            ("U1__Drop.sql", "DROP TABLE t;"),
+        ],
+    );
+    let config = config_for(&name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    // Confirm t exists
+    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let before: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 't'",
+            (name.as_str(),),
+        )
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 1);
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    // Undo last migration
+    let report = wp.undo(UndoTarget::Last).await.expect("undo");
+    assert_eq!(report.migrations_undone, 1);
+    assert_eq!(report.details[0].version, "1");
+    assert!(!report.details[0].auto_reversal); // manual U-file
+
+    // t should be gone
+    let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let after: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 't'",
+            (name.as_str(),),
+        )
+        .await
+        .unwrap();
+    assert!(after.is_empty());
+
+    // History should record an UNDO_SQL row
+    let history_rows: Vec<(String, Option<String>)> = conn
+        .exec(
+            "SELECT type, version FROM waypoint_schema_history \
+             ORDER BY installed_rank",
+            (),
+        )
+        .await
+        .unwrap();
+    assert_eq!(history_rows.len(), 2);
+    assert_eq!(history_rows[1].0, "UNDO_SQL");
+    assert_eq!(history_rows[1].1.as_deref(), Some("1"));
+    drop(conn);
+    pool.disconnect().await.ok();
+
+    drop_database(&name).await;
+}
+
+#[tokio::test]
+async fn undo_without_u_file_errors_with_undo_missing() {
+    use waypoint_core::commands::undo::UndoTarget;
+    let name = fresh_database("undomiss").await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    // V1 with no corresponding U1 file
+    write_migrations(
+        &migrations,
+        &[("V1__Create.sql", "CREATE TABLE t (id INT PRIMARY KEY);")],
+    );
+    let config = config_for(&name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    let err = wp.undo(UndoTarget::Last).await.expect_err("should fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("No undo migration found") || msg.contains("U1__"),
+        "expected UndoMissing-style error, got: {}",
+        msg
+    );
+
+    drop_database(&name).await;
+}

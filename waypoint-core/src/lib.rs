@@ -189,7 +189,7 @@ impl Waypoint {
 
     /// Undo applied migrations.
     pub async fn undo(&self, target: UndoTarget) -> Result<UndoReport> {
-        commands::undo::execute(self.client.as_postgres()?, &self.config, target).await
+        commands::undo::execute_db(&self.client, &self.config, target).await
     }
 
     /// Drop all objects in managed schemas.
