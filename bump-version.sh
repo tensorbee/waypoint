@@ -59,13 +59,36 @@ if [ "$DRY_RUN" = "--dry-run" ]; then
   exit 0
 fi
 
+# Rewrite the first `version = "..."` line of a Cargo.toml (the [package] one).
+#
+# Not sed: the `0,/re/` address form is a GNU extension that BSD/macOS sed
+# accepts and then silently ignores, which let a no-op bump reach `git tag`.
+update_package_version() {
+  local file="$1"
+  awk -v v="$VERSION" '
+    !done && /^version = "/ {
+      print "version = \"" v "\""
+      done = 1
+      next
+    }
+    { print }
+  ' "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+
+  local got
+  got=$(grep '^version' "$file" | head -1 | sed 's/version = "//;s/"//')
+  if [ "$got" != "$VERSION" ]; then
+    echo "Error: failed to set version in $file (still '$got')"
+    exit 1
+  fi
+}
+
 # --- Update waypoint-core/Cargo.toml ---
 echo "Updating waypoint-core/Cargo.toml..."
-sed -i '' -E "0,/^version = \".*\"/s/^version = \".*\"/version = \"$VERSION\"/" waypoint-core/Cargo.toml
+update_package_version waypoint-core/Cargo.toml
 
 # --- Update waypoint-cli/Cargo.toml (package version) ---
 echo "Updating waypoint-cli/Cargo.toml..."
-sed -i '' -E "0,/^version = \".*\"/s/^version = \".*\"/version = \"$VERSION\"/" waypoint-cli/Cargo.toml
+update_package_version waypoint-cli/Cargo.toml
 
 # --- Update waypoint-cli/Cargo.toml (waypoint-core dependency) ---
 sed -i '' -E "s/waypoint-core = \{ version = \"[^\"]*\"/waypoint-core = { version = \"$VERSION\"/" waypoint-cli/Cargo.toml
@@ -81,6 +104,9 @@ sed -i '' -E "s/^TAG=v[0-9]+\.[0-9]+\.[0-9]+$/TAG=v$VERSION/" README.md
 
 # Update library dependency version: waypoint-core = "0.X"
 sed -i '' -E "s/waypoint-core = \"[0-9]+\.[0-9]+\"/waypoint-core = \"$MAJOR_MINOR\"/" README.md
+
+# Update the feature-flag examples: waypoint-core = { version = "0.X", ... }
+sed -i '' -E "s/waypoint-core = \{ version = \"[0-9]+\.[0-9]+\"/waypoint-core = { version = \"$MAJOR_MINOR\"/" README.md
 
 # --- Update Cargo.lock ---
 echo "Running cargo check to update Cargo.lock..."
