@@ -840,7 +840,10 @@ async fn advisory_lock_is_actually_held_between_acquire_and_release() {
     // Independent connection — not from the Waypoint pool.
     let observer_pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
     let mut observer = observer_pool.get_conn().await.unwrap();
-    let lock_key = format!("waypoint_{}", table);
+    // Must mirror db::mysql_lock_key: MySQL GET_LOCK names are server-global,
+    // so the key is scoped by database. Without that scoping every test
+    // database on this server would contend for one lock.
+    let lock_key = format!("waypoint_{}_{}", name, table);
 
     let holder: Option<Option<u64>> = observer
         .exec_first("SELECT IS_USED_LOCK(?)", (lock_key.as_str(),))

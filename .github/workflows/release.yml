@@ -37,6 +37,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # rust-toolchain.toml pins the compiler, and cargo honours it over
+      # whatever the action just installed — so the target has to be added to
+      # the *pinned* toolchain as well, or cross-compiled targets fail to
+      # build with "can't find crate for `core`".
+      - name: Add target to the pinned toolchain
+        run: rustup target add ${{ matrix.target }}
+
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |

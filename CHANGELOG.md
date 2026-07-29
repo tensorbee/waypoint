@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] - 2026-07-29
+
+### Fixed
+
+- **MySQL advisory locks were scoped to the whole server, not the database.**
+  `GET_LOCK` names live in a server-global namespace, unlike PostgreSQL
+  advisory locks which are per-database. The key was derived from the history
+  table name alone, so every database on a shared MySQL server contended for
+  one lock — migrating `app_staging` blocked a concurrent migration of
+  `app_prod`. The key now includes the database name, and over-long keys fall
+  back to a CRC32 rather than being truncated (truncation could fold two
+  distinct `db.table` pairs onto one lock).
+
+### Changed
+
+- The release workflow installs cross-compilation targets on the pinned
+  toolchain. `rust-toolchain.toml`, added in 0.6.0, takes precedence over the
+  toolchain the CI action installs, so the macOS and Linux cross-targets were
+  built with a toolchain that lacked them. This is why v0.6.0 has no published
+  binaries or signature; v0.6.1 restores them.
+
 ## [0.6.0] - 2026-07-29
 
 ### Breaking

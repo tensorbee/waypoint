@@ -191,7 +191,7 @@ impl DbClient {
             #[cfg(feature = "mysql")]
             DbClient::Mysql(pool) => {
                 use mysql_async::prelude::*;
-                let key = mysql_lock_key(table_name);
+                let key = mysql_lock_key(&mysql_lock_scope(self).await, table_name);
                 let mut conn = pool.get_conn().await?;
                 let acquired: Option<i64> = conn
                     .exec_first("SELECT GET_LOCK(?, -1)", (key.clone(),))
@@ -224,7 +224,7 @@ impl DbClient {
             #[cfg(feature = "mysql")]
             DbClient::Mysql(pool) => {
                 use mysql_async::prelude::*;
-                let key = mysql_lock_key(table_name);
+                let key = mysql_lock_key(&mysql_lock_scope(self).await, table_name);
                 let mut conn = pool.get_conn().await?;
                 let acquired: Option<i64> = conn
                     .exec_first("SELECT GET_LOCK(?, ?)", (key.clone(), timeout_secs as i64))
@@ -255,7 +255,7 @@ impl DbClient {
             #[cfg(feature = "mysql")]
             DbClient::Mysql(pool) => {
                 use mysql_async::prelude::*;
-                let key = mysql_lock_key(table_name);
+                let key = mysql_lock_key(&mysql_lock_scope(self).await, table_name);
                 // Release on the *same* session that acquired it. A different
                 // connection's RELEASE_LOCK is a silent no-op (returns 0) and
                 // would leak the lock until the server reaps the session.
@@ -439,18 +439,46 @@ pub async fn connect_for_url(
     }
 }
 
-/// Compute the MySQL named-lock key for a given history table name.
+/// Compute the MySQL named-lock key for a history table in a given database.
 ///
-/// MySQL `GET_LOCK` keys are arbitrary strings (truncated to 64 chars in 8.0+).
-/// We prefix `waypoint_` to avoid clashes with application locks and keep the
-/// key stable across versions.
+/// # Scoping
+///
+/// MySQL `GET_LOCK` names live in a **server-global** namespace, unlike
+/// PostgreSQL advisory locks which are scoped to the current database. Keying
+/// on the table name alone therefore made every database on a shared MySQL
+/// server contend for one lock: migrating `app_staging` blocked a concurrent
+/// migration of `app_prod`, even though they share nothing. Including the
+/// database name restores per-database scoping and matches the PostgreSQL
+/// behaviour.
+///
+/// # Length
+///
+/// `GET_LOCK` names are capped at 64 characters on MySQL 8.0+. Plain
+/// truncation would let two distinct long `db.table` pairs collapse onto one
+/// key — silently over-serialising, or worse, letting a caller release a lock
+/// it does not hold. Over-long keys fall back to a CRC32 of the full name,
+/// which is stable across versions and platforms.
 #[cfg(feature = "mysql")]
-fn mysql_lock_key(table_name: &str) -> String {
-    let mut k = format!("waypoint_{}", table_name);
-    if k.len() > 64 {
-        k.truncate(64);
+fn mysql_lock_key(schema: &str, table_name: &str) -> String {
+    let full = format!("waypoint_{}_{}", schema, table_name);
+    if full.len() <= 64 {
+        full
+    } else {
+        format!("waypoint_{:08x}", crc32fast::hash(full.as_bytes()))
     }
-    k
+}
+
+/// The database name to scope a MySQL lock to.
+///
+/// Falls back to a fixed marker when the connection has no default database;
+/// a lock still has to be taken, and a shared key is safe (it only
+/// over-serialises), whereas skipping the lock would not be.
+#[cfg(feature = "mysql")]
+async fn mysql_lock_scope(client: &DbClient) -> String {
+    client
+        .current_database()
+        .await
+        .unwrap_or_else(|_| "_nodb".to_string())
 }
 
 /// Registry of pinned connections that currently hold a MySQL named lock.
@@ -1084,5 +1112,50 @@ mod tests {
             result,
             "postgresql://user:pass@localhost/db?keepalives=1&keepalives_idle=120"
         );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_lock_key_is_scoped_per_database() {
+        // GET_LOCK names are server-global, so the same history table in two
+        // databases must not collide — otherwise migrating one database blocks
+        // migrating the other.
+        let a = mysql_lock_key("app_prod", "waypoint_schema_history");
+        let b = mysql_lock_key("app_staging", "waypoint_schema_history");
+        assert_ne!(a, b);
+        assert_eq!(a, "waypoint_app_prod_waypoint_schema_history");
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_lock_key_respects_the_64_char_limit() {
+        let long_db = "d".repeat(60);
+        let long_tbl = "t".repeat(60);
+        let k = mysql_lock_key(&long_db, &long_tbl);
+        assert!(
+            k.len() <= 64,
+            "GET_LOCK names are capped at 64: {}",
+            k.len()
+        );
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_lock_key_does_not_collide_after_shortening() {
+        // Two distinct over-long names must not fold onto the same key —
+        // plain truncation would have made these identical.
+        let prefix = "x".repeat(60);
+        let a = mysql_lock_key(&prefix, "alpha");
+        let b = mysql_lock_key(&prefix, "beta");
+        assert!(a.len() <= 64 && b.len() <= 64);
+        assert_ne!(a, b, "distinct tables collapsed onto one lock key");
+    }
+
+    #[cfg(feature = "mysql")]
+    #[test]
+    fn mysql_lock_key_is_stable() {
+        // The key has to be reproducible across processes and releases, or a
+        // release_lock would not match its acquire_lock.
+        assert_eq!(mysql_lock_key("db", "tbl"), mysql_lock_key("db", "tbl"));
     }
 }
