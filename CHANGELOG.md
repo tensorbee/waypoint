@@ -5,6 +5,103 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-07-29
+
+### Breaking
+
+- **MySQL: `beforeMigrate` / `afterMigrate` now fire on every `migrate`
+  invocation**, including runs that apply nothing. Previously they only ran
+  when there was pending work. This matches the PostgreSQL path and Flyway —
+  they are run-lifecycle hooks, not work-lifecycle hooks. **A non-idempotent
+  `beforeMigrate` hook will now fail on a no-op migrate**; make such hooks
+  idempotent (`CREATE TABLE IF NOT EXISTS`, etc.), as the PostgreSQL side has
+  always required.
+- **`DatabaseConfig` gained an `engine` field.** Additive, and `Default` is
+  `Postgres`, so `..Default::default()` construction and all existing
+  behaviour are unchanged — but an exhaustive struct literal will need
+  updating.
+- **Minimum supported Rust version is now 1.88** and both crates moved to
+  edition 2024.
+- `V1__a.sql` alongside `V1.0__b.sql` is now rejected as a duplicate version.
+  The two always compared equal for ordering; allowing both applied two
+  migrations that every comparison treated as one.
+- An out-of-order migration on MySQL now raises `OutOfOrder` instead of being
+  silently skipped. Set `out_of_order = true` if the old behaviour was load-
+  bearing.
+
+### Fixed
+
+- **`simulate` on MySQL applied migrations to the live database.** It set
+  `USE <temp_db>` on one pooled connection and then replayed migrations
+  through a *different* pooled connection whose default database was still the
+  source, so a command documented as a dry run mutated the real schema.
+- **The MySQL migration lock provided no mutual exclusion.** `GET_LOCK` is
+  session-scoped and the connection pool resets connections on return, which
+  releases such locks — so the lock was dropped the moment it was taken.
+  Concurrent `waypoint migrate` runs against MySQL could interleave.
+- **A failed MySQL migration left no record in the schema history table.**
+  MySQL DDL auto-commits per statement, so a mid-file failure leaves a
+  partially-migrated schema; the `success = false` row is the only trace of
+  it, and is what `info` shows and `repair` clears.
+- **Batch mode stored the whole-batch reversal against every version**, so
+  undoing any single migration reverted the entire batch.
+- **`self-update` verified nothing** beyond an HTTPS fetch and a `--version`
+  smoke test, and fell back to `curl … | sh` automatically on any failure.
+- MySQL migration files ending in a trailing comment (`…; -- done`) failed
+  with `ER_EMPTY_QUERY`.
+- Multi-database runs silently discarded the top-level `[safety]`,
+  `[preflight]`, `[guards]`, `[reversals]`, `[advisor]`, `[snapshots]`,
+  `[lint]` and `[simulation]` sections, and per-database entries ignored the
+  `[database]` transport settings.
+- `--database <name>` broke `migrate` and `info` in multi-database mode: every
+  other database was reported as "not connected" and the command failed.
+- `MigrationVersion` violated the `Ord`/`Eq` contract (`1` and `1.0` compared
+  `Equal` but not `==`).
+- `repair` rewrote `UNDO_SQL` rows' checksums to the forward migration's.
+- Batch-transaction compatibility checks matched keywords inside comments, so
+  a `-- VACUUM later` note could reject a valid migration.
+- JDBC-style URLs did not percent-encode credentials lifted from the query
+  string, producing a malformed URL for passwords containing `@` or `/`.
+- A `waypoint-cli` build with only the `mysql` feature did not compile.
+- MySQL TLS could never have worked in a `mysql`-only build: rustls was linked
+  with no crypto provider.
+- The crate's own Quick Start doctest had stopped compiling.
+- `restore` no longer accepts a snapshot id that escapes the snapshot
+  directory.
+
+### Added
+
+- **Release signature verification on `self-update`.** `SHA256SUMS` is
+  verified against its Sigstore signature with `cosign` (bundle form, falling
+  back to the detached `.sig`/`.pem` that releases up to v0.5.0 publish),
+  pinned to this repository's workflow identity and GitHub's OIDC issuer; the
+  tarball is then checked against that manifest. A failed signature always
+  aborts. A missing `cosign` downgrades to SHA-256-only with a warning, or
+  aborts under the new `--require-signature`. `--json` reports which level
+  applied.
+- `[database] engine = "postgres" | "mysql"` (env `WAYPOINT_DATABASE_ENGINE`),
+  consulted when no `url` is set, so a host/port/user/database config can
+  reach MySQL.
+- `[guards] enabled` now works; it was previously read from nothing.
+- `migrations.dependency_ordering` now works: apply order follows
+  `-- waypoint:depends` topologically. This brought the dependency graph into
+  use for the first time and fixed a latent false-cycle bug in it.
+- `migrations.show_progress`, `snapshots.auto_snapshot_on_migrate` and
+  `advisor.run_after_migrate` are now honoured; all three were previously
+  parsed and ignored.
+
+### Changed
+
+- Dependencies updated to current majors (`mysql_async` 0.37, `webpki-roots`
+  1.0, `colored` 3, `tokio-postgres-rustls` 0.14, `toml` 1.1).
+- `aws-lc-sys` — a cmake-built C and assembly crate — is no longer in the
+  dependency graph, and `deny.toml` now bans it along with `openssl-sys`.
+  Four unused dependencies were removed.
+- The unused PostgreSQL-only `execute(&Client, …)` entry points on `advisor`,
+  `baseline`, `clean`, `diff`, `repair`, `safety` and `migrate` are
+  deprecated; use the `execute_db(&DbClient, …)` equivalents. They will be
+  removed in 1.0.
+
 ## [0.5.0] - 2026-07-29
 
 ### Fixed
