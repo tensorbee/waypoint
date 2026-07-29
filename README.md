@@ -117,9 +117,8 @@ The installer verifies the downloaded archive against the release
 
 ### Verifying a release
 
-Every release publishes `SHA256SUMS` covering all platform archives, plus a
-keyless [cosign](https://github.com/sigstore/cosign) signature
-(`SHA256SUMS.sig`) and its certificate (`SHA256SUMS.pem`). CI consumers can
+Every release publishes `SHA256SUMS` covering all platform archives, signed
+with keyless [cosign](https://github.com/sigstore/cosign). CI consumers can
 verify a download without maintaining their own digest:
 
 ```bash
@@ -128,19 +127,21 @@ BASE="https://github.com/tensorbee/waypoint/releases/download/${TAG}"
 
 curl -sSfLO "${BASE}/waypoint-${TAG}-linux-amd64.tar.gz"
 curl -sSfLO "${BASE}/SHA256SUMS"
-curl -sSfLO "${BASE}/SHA256SUMS.sig"
-curl -sSfLO "${BASE}/SHA256SUMS.pem"
+curl -sSfLO "${BASE}/SHA256SUMS.cosign.bundle"
 
 # 1. Confirm the checksums file really came from the release workflow
 cosign verify-blob SHA256SUMS \
-  --signature SHA256SUMS.sig \
-  --certificate SHA256SUMS.pem \
+  --bundle SHA256SUMS.cosign.bundle \
   --certificate-identity-regexp '^https://github\.com/tensorbee/waypoint/\.github/workflows/release\.yml@' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 
 # 2. Confirm the archive matches
 sha256sum --ignore-missing -c SHA256SUMS
 ```
+
+The detached `SHA256SUMS.sig` + `SHA256SUMS.pem` pair is also published for
+older cosign versions, which take `--signature` / `--certificate` instead of
+`--bundle`. Releases up to and including v0.5.0 ship only that pair.
 
 ### Self-update
 
