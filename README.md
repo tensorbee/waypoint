@@ -109,7 +109,7 @@ curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh |
 Pin a specific version:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | WAYPOINT_VERSION=v0.4.0 sh
+curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | WAYPOINT_VERSION=v0.5.0 sh
 ```
 
 The installer verifies the downloaded archive against the release
@@ -123,7 +123,7 @@ keyless [cosign](https://github.com/sigstore/cosign) signature
 verify a download without maintaining their own digest:
 
 ```bash
-TAG=v0.4.1
+TAG=v0.5.0
 BASE="https://github.com/tensorbee/waypoint/releases/download/${TAG}"
 
 curl -sSfLO "${BASE}/waypoint-${TAG}-linux-amd64.tar.gz"
@@ -166,13 +166,13 @@ cargo install --path waypoint-cli
 ```toml
 [dependencies]
 # PostgreSQL only (default)
-waypoint-core = "0.4"
+waypoint-core = "0.5"
 
 # Or MySQL 8.0+ only
-# waypoint-core = { version = "0.3", default-features = false, features = ["mysql"] }
+# waypoint-core = { version = "0.5", default-features = false, features = ["mysql"] }
 
 # Or both engines
-# waypoint-core = { version = "0.3", features = ["mysql"] }
+# waypoint-core = { version = "0.5", features = ["mysql"] }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
