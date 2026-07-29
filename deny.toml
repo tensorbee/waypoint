@@ -1,9 +1,69 @@
+# cargo-deny policy. Run with: cargo deny --all-features check
+#
+# Four checks are enforced: known vulnerabilities, license compatibility,
+# duplicate/banned crates, and where crates may be fetched from.
+
+[graph]
+# Check the platforms we actually ship binaries for. Restricting the graph
+# keeps platform-only transitive crates out of the license and duplicate
+# reports, where they would be noise.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+all-features = true
+
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
+version = 2
+yanked = "deny"
+ignore = []
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Unicode-DFS-2016"]
+version = 2
+# Permissive licenses only. Anything copyleft has to be an explicit, reviewed
+# exception rather than something that slips in through a transitive bump.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    # webpki-roots ships the Mozilla CA trust store, which is *data* rather
+    # than code, so it carries a data licence. CDLA-Permissive-2.0 imposes no
+    # conditions on use or redistribution and no copyleft.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+exceptions = []
 
 [bans]
 multiple-versions = "warn"
+wildcards = "deny"
+# Crates that must never enter the graph.
+deny = [
+    # We deliberately use the `ring` rustls provider. aws-lc-sys builds C and
+    # assembly through cmake at compile time, which is a build-host attack
+    # surface we do not want. If this fires, some dependency has re-enabled
+    # rustls' default feature set (its default provider is aws_lc_rs) — add
+    # `default-features = false` there rather than relaxing this rule.
+    { name = "aws-lc-sys" },
+    { name = "aws-lc-rs" },
+    # OpenSSL linkage: we are rustls-only, so a native-tls path creeping in
+    # through a transitive default feature should be caught here.
+    { name = "openssl-sys" },
+    # Superseded time handling with a known unsoundness history.
+    { name = "time", version = "<0.3" },
+]
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

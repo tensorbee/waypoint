@@ -1,0 +1,6 @@
+# Pinned so local builds, CI, and release artifacts all use one compiler.
+# Bump deliberately; `rust-version` in each Cargo.toml is the *minimum*
+# supported version and should move independently (and rarely).
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]

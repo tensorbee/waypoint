@@ -1,7 +1,9 @@
 [package]
 name = "waypoint-core"
 version = "0.5.0"
-edition = "2021"
+edition = "2024"
+# Edition 2024 requires 1.85; let-chains used in this crate require 1.88.
+rust-version = "1.88"
 description = "Lightweight, Flyway-compatible SQL migration library for PostgreSQL and MySQL"
 license = "MIT"
 repository = "https://github.com/tensorbee/waypoint"
@@ -16,27 +18,30 @@ tokio = { version = "1", features = ["rt", "macros", "time"] }
 fastrand = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 crc32fast = "1"
 thiserror = "2"
 log = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
 regex-lite = "0.1"
-async-trait = "0.1"
 
 # PostgreSQL backend (default)
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"], optional = true }
-tokio-postgres-rustls = { version = "0.12", optional = true }
-rustls = { version = "0.23", features = ["ring"], optional = true }
-rustls-pki-types = { version = "1", optional = true }
-webpki-roots = { version = "0.26", optional = true }
+tokio-postgres-rustls = { version = "0.14", default-features = false, features = ["ring"], optional = true }
+# `default-features = false` matters: rustls' default feature set selects the
+# `aws_lc_rs` provider, which drags in aws-lc-sys — a C + assembly crate built
+# through cmake at compile time. We use ring, so opt out of the default set and
+# name the features explicitly. Every other rustls dependent in the graph
+# already sets default-features = false, so this is the only lever needed.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+webpki-roots = { version = "1", optional = true }
 
 # MySQL backend (opt-in)
-mysql_async = { version = "0.34", default-features = false, features = ["minimal-rust", "rustls-tls", "chrono"], optional = true }
+mysql_async = { version = "0.37", default-features = false, features = ["minimal-rust", "rustls-tls", "ring", "tls12", "chrono"], optional = true }
 
 [features]
 default = ["postgres"]
-postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:rustls-pki-types", "dep:webpki-roots"]
+postgres = ["dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:rustls", "dep:webpki-roots"]
 mysql = ["dep:mysql_async"]
 
 [dev-dependencies]
