@@ -16,15 +16,38 @@ pub mod postgres;
 pub mod mysql;
 
 /// Identifier of which dialect a connection or piece of code targets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum DialectKind {
     /// PostgreSQL 12+
+    #[default]
     Postgres,
     /// MySQL 8.0+
     Mysql,
 }
 
+impl std::fmt::Display for DialectKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for DialectKind {
+    type Err = crate::error::WaypointError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "postgres" | "postgresql" | "pg" => Ok(DialectKind::Postgres),
+            "mysql" | "mariadb" => Ok(DialectKind::Mysql),
+            other => Err(crate::error::WaypointError::ConfigError(format!(
+                "Invalid database engine '{}'. Use 'postgres' or 'mysql'.",
+                other
+            ))),
+        }
+    }
+}
+
 impl DialectKind {
+    /// Canonical lowercase name (`"postgres"` / `"mysql"`).
     pub fn name(&self) -> &'static str {
         match self {
             DialectKind::Postgres => "postgres",

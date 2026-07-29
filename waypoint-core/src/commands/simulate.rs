@@ -7,9 +7,11 @@ use serde::Serialize;
 use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
+use crate::db::DbClient;
 #[cfg(feature = "postgres")]
 use crate::db::quote_ident;
-use crate::db::DbClient;
+#[cfg(feature = "mysql")]
+use crate::db::quote_ident_mysql as qi;
 use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
 use crate::history;
@@ -64,6 +66,15 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Simulat
     );
 
     let result = run_simulation(client, config, &temp_schema).await;
+
+    // Always restore search_path. `run_simulation` points it at the temp
+    // schema and can bail out with `?` before restoring it itself; leaving the
+    // shared client pointed at a schema we are about to drop would break every
+    // later command on this connection.
+    let restore_path = format!("SET search_path TO {}", quote_ident(schema_name));
+    if let Err(e) = client.batch_execute(&restore_path).await {
+        log::warn!("Failed to restore search_path: {}", e);
+    }
 
     // Always clean up the temp schema (retry once on failure)
     let drop_sql = format!(
@@ -154,10 +165,10 @@ async fn run_simulation(
         if migration.is_undo() {
             continue;
         }
-        if let Some(version) = migration.version() {
-            if effective.contains(&version.raw) {
-                continue; // Already applied
-            }
+        if let Some(version) = migration.version()
+            && effective.contains(&version.raw)
+        {
+            continue; // Already applied
         }
 
         let placeholders = build_placeholders(
@@ -191,11 +202,8 @@ async fn run_simulation(
         }
     }
 
-    // Restore search_path
-    let restore_path = format!("SET search_path TO {}", quote_ident(schema_name));
-    if let Err(e) = client.batch_execute(&restore_path).await {
-        log::warn!("Failed to restore search_path: {}", e);
-    }
+    // search_path is restored by the caller (`execute`) so that it happens on
+    // every exit path, including the `?` returns above.
 
     Ok(SimulationReport {
         passed: errors.is_empty(),
@@ -245,7 +253,7 @@ async fn execute_mysql(client: &DbClient, config: &WaypointConfig) -> Result<Sim
 
     // Always drop the temp database (retry once on failure).
     let mut conn = pool.get_conn().await?;
-    let drop_sql = format!("DROP DATABASE IF EXISTS `{}`", temp_db);
+    let drop_sql = format!("DROP DATABASE IF EXISTS {}", qi(&temp_db));
     if let Err(e) = conn.query_drop(&drop_sql).await {
         log::warn!(
             "First attempt to drop simulation database {} failed, retrying: {}",
@@ -276,7 +284,7 @@ async fn run_simulation_mysql(
     let mut conn = pool.get_conn().await?;
 
     // Create the throwaway database.
-    let create_sql = format!("CREATE DATABASE `{}`", temp_db);
+    let create_sql = format!("CREATE DATABASE {}", qi(temp_db));
     conn.query_drop(&create_sql)
         .await
         .map_err(|e| WaypointError::SimulationFailed {
@@ -297,12 +305,12 @@ async fn run_simulation_mysql(
         )
         .await?;
 
-    conn.query_drop(format!("USE `{}`", temp_db)).await?;
+    conn.query_drop(format!("USE {}", qi(temp_db))).await?;
 
     let mut warnings: Vec<String> = Vec::new();
 
     for table_name in &tables {
-        let show_stmt = format!("SHOW CREATE TABLE `{}`.`{}`", source_db, table_name);
+        let show_stmt = format!("SHOW CREATE TABLE {}.{}", qi(source_db), qi(table_name));
         if let Ok(Some((_, create_sql))) = conn.query_first::<(String, String), _>(&show_stmt).await
         {
             // The DDL is "CREATE TABLE `name` (...)"; since USE has set our
@@ -332,7 +340,7 @@ async fn run_simulation_mysql(
         )
         .await?;
     for view_name in &views {
-        let show_stmt = format!("SHOW CREATE VIEW `{}`.`{}`", source_db, view_name);
+        let show_stmt = format!("SHOW CREATE VIEW {}.{}", qi(source_db), qi(view_name));
         if let Ok(Some(row)) = conn.query_first::<mysql_async::Row, _>(&show_stmt).await {
             let mut row = row;
             if let Some(create_sql) = row.take::<String, _>(1) {
@@ -367,10 +375,6 @@ async fn run_simulation_mysql(
         .current_user()
         .await
         .unwrap_or_else(|_| "unknown".into());
-    let db_name = client
-        .current_database()
-        .await
-        .unwrap_or_else(|_| "unknown".into());
 
     let mut errors = Vec::new();
     let mut simulated = 0;
@@ -379,17 +383,21 @@ async fn run_simulation_mysql(
         if migration.is_undo() {
             continue;
         }
-        if let Some(version) = migration.version() {
-            if effective.contains(&version.raw) {
-                continue;
-            }
+        if let Some(version) = migration.version()
+            && effective.contains(&version.raw)
+        {
+            continue;
         }
 
+        // `waypoint:database` resolves to the *simulation* database, not the
+        // live one: on MySQL a database qualifier is the only namespace there
+        // is, so a migration that writes `${waypoint:database}`.`t` must stay
+        // inside the sandbox.
         let placeholders = build_placeholders(
             &config.placeholders,
             temp_db,
             &db_user,
-            &db_name,
+            temp_db,
             &migration.script,
         );
         let sql = match replace_placeholders(&migration.sql, &placeholders) {
@@ -403,13 +411,23 @@ async fn run_simulation_mysql(
             }
         };
 
-        // Execute via execute_raw which handles MySQL per-statement protocol.
-        // We've USE'd into temp_db so unqualified table refs land there.
-        match client.execute_raw(&sql).await {
-            Ok(_) => simulated += 1,
-            Err(e) => errors.push(SimulationError {
+        // Replay on `conn` — the same connection we issued `USE temp_db` on.
+        // This MUST NOT go through `DbClient::execute_raw`, which checks out a
+        // fresh pooled connection whose default database is still the *source*
+        // database; doing so would apply the migration to the live schema.
+        // `split_mysql_statements` handles the per-statement protocol.
+        let mut failed = None;
+        for stmt in crate::sql_parser::split_mysql_statements(&sql) {
+            if let Err(e) = conn.query_drop(&stmt).await {
+                failed = Some(e.to_string());
+                break;
+            }
+        }
+        match failed {
+            None => simulated += 1,
+            Some(error) => errors.push(SimulationError {
                 script: migration.script.clone(),
-                error: e.to_string(),
+                error,
             }),
         }
     }

@@ -55,14 +55,15 @@ pub enum WaypointError {
     #[error("Migration parse error: {0}")]
     MigrationParseError(String),
 
-    /// **Reserved / unused.** No code path currently constructs this variant —
-    /// checksum mismatches surface as `ValidationFailed(String)` from the
-    /// `validate` command (which aggregates one or more mismatches into a
-    /// single human-readable string). Kept for back-compat with external
-    /// matchers; scheduled for removal in 0.4.0.
+    /// **Reserved / unused.** No code path constructs this variant — checksum
+    /// mismatches surface as `ValidationFailed(String)` from the `validate`
+    /// command (which aggregates one or more mismatches into a single
+    /// human-readable string). Kept because removing an enum variant is a
+    /// breaking change; it goes in the 1.0 cleanup along with the other
+    /// deprecated surface.
     #[deprecated(
         since = "0.3.4",
-        note = "Never produced — checksum mismatches surface as ValidationFailed. Will be removed in 0.4.0."
+        note = "Never produced — checksum mismatches surface as ValidationFailed. Will be removed in 1.0."
     )]
     #[error("Checksum mismatch for migration {script}: expected {expected}, found {found}")]
     ChecksumMismatch {
@@ -98,7 +99,9 @@ pub enum WaypointError {
     IoError(#[from] std::io::Error),
 
     /// A migration version is lower than the highest applied version and out-of-order is disabled.
-    #[error("Out-of-order migration not allowed: version {version} is below the highest applied version {highest}. Enable out_of_order to allow this.")]
+    #[error(
+        "Out-of-order migration not allowed: version {version} is below the highest applied version {highest}. Enable out_of_order to allow this."
+    )]
     OutOfOrder { version: String, highest: String },
 
     /// A `${key}` placeholder in migration SQL has no corresponding value defined.
@@ -129,13 +132,14 @@ pub enum WaypointError {
     #[error("Lint found {error_count} error(s): {details}")]
     LintFailed { error_count: usize, details: String },
 
-    /// **Reserved / unused.** No code path currently constructs this variant —
-    /// the `diff` command surfaces failures as `ConfigError(String)` or
-    /// `DatabaseError`. Kept for back-compat with external matchers; scheduled
-    /// for removal in 0.4.0.
+    /// **Reserved / unused.** No code path constructs this variant — the
+    /// `diff` command surfaces failures as `ConfigError(String)` or
+    /// `DatabaseError`. Kept because removing an enum variant is a breaking
+    /// change; it goes in the 1.0 cleanup along with the other deprecated
+    /// surface.
     #[deprecated(
         since = "0.3.4",
-        note = "Never produced — diff failures surface as ConfigError or DatabaseError. Will be removed in 0.4.0."
+        note = "Never produced — diff failures surface as ConfigError or DatabaseError. Will be removed in 1.0."
     )]
     #[error("Diff failed: {reason}")]
     DiffFailed { reason: String },
@@ -205,7 +209,9 @@ pub enum WaypointError {
     SimulationFailed { reason: String },
 
     /// A migration contains statements that cannot run inside a transaction (e.g. CONCURRENTLY).
-    #[error("Migration {script} contains non-transactional statement: {statement}. Remove --transaction or rewrite the migration.")]
+    #[error(
+        "Migration {script} contains non-transactional statement: {statement}. Remove --transaction or rewrite the migration."
+    )]
     NonTransactionalStatement { script: String, statement: String },
 
     /// The database connection was lost during an operation.

@@ -16,6 +16,10 @@ use crate::history;
 /// 2. Create history table
 /// 3. Insert a single baseline row
 #[cfg(feature = "postgres")]
+#[deprecated(
+    since = "0.6.0",
+    note = "Unused PostgreSQL-only entry point superseded by `execute_db`, which handles both engines. Will be removed in 1.0."
+)]
 pub async fn execute(
     client: &Client,
     config: &WaypointConfig,

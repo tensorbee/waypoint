@@ -11,7 +11,7 @@ use crate::config::WaypointConfig;
 use crate::db::DbClient;
 use crate::error::{Result, WaypointError};
 use crate::history::{self, AppliedMigration};
-use crate::migration::{scan_migrations, ResolvedMigration};
+use crate::migration::{ResolvedMigration, scan_migrations};
 
 /// Report returned after a validate operation.
 #[derive(Debug, Serialize)]
@@ -97,24 +97,23 @@ fn check(applied: Vec<AppliedMigration>, resolved: Vec<ResolvedMigration>) -> Va
             continue;
         }
 
-        if am.version.is_some() {
-            if let Some(ref version) = am.version {
-                if let Some(resolved) = resolved_by_version.get(version) {
-                    if let Some(expected_checksum) = am.checksum {
-                        if resolved.checksum != expected_checksum {
-                            issues.push(format!(
-                                "Checksum mismatch for version {}: applied={}, resolved={}. \
+        if let Some(ref version) = am.version {
+            match resolved_by_version.get(version) {
+                Some(resolved) => {
+                    if let Some(expected_checksum) = am.checksum
+                        && resolved.checksum != expected_checksum
+                    {
+                        issues.push(format!(
+                            "Checksum mismatch for version {}: applied={}, resolved={}. \
                                  Migration file '{}' has been modified after it was applied.",
-                                version, expected_checksum, resolved.checksum, resolved.script
-                            ));
-                        }
+                            version, expected_checksum, resolved.checksum, resolved.script
+                        ));
                     }
-                } else {
-                    warnings.push(format!(
-                        "Applied migration version {} (script: {}) not found on disk.",
-                        version, am.script
-                    ));
                 }
+                None => warnings.push(format!(
+                    "Applied migration version {} (script: {}) not found on disk.",
+                    version, am.script
+                )),
             }
         } else if !resolved_by_script.contains_key(&am.script) {
             warnings.push(format!(

@@ -18,7 +18,19 @@ static UNDO_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^U([\d._]+)__(.+
 static REPEATABLE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^R__(.+)$").unwrap());
 
 /// A parsed migration version, supporting dotted numeric segments (e.g., "1.2.3").
-#[derive(Debug, Clone, Eq, PartialEq)]
+///
+/// # Equality
+///
+/// Two versions are equal when their numeric segments are equal after trailing
+/// zeros are dropped: `1`, `1.0` and `1.0.0` are all the same version. The
+/// `raw` string is *not* part of the identity.
+///
+/// This has to match [`Ord`], which compares zero-padded segment-wise. A
+/// derived `PartialEq` would compare `raw` too, so `1` and `1.0` would report
+/// `Ordering::Equal` from `cmp` while `==` said `false` — a violation of the
+/// `Ord`/`Eq` contract that silently corrupts `BTreeMap`, `binary_search` and
+/// `dedup`.
+#[derive(Debug, Clone)]
 pub struct MigrationVersion {
     /// Parsed numeric segments of the version (e.g., `[1, 2, 3]` for `"1.2.3"`).
     pub segments: Vec<u64>,
@@ -27,6 +39,20 @@ pub struct MigrationVersion {
 }
 
 impl MigrationVersion {
+    /// The segments with trailing zeros removed — the canonical identity used
+    /// by [`PartialEq`], [`Ord`] and [`std::hash::Hash`].
+    ///
+    /// `1.0.0` normalizes to `[1]`, `1.2.0` to `[1, 2]`, and `0` / `0.0` to the
+    /// empty slice (all-zero versions are equal to each other).
+    pub fn normalized(&self) -> &[u64] {
+        let end = self
+            .segments
+            .iter()
+            .rposition(|&s| s != 0)
+            .map_or(0, |i| i + 1);
+        &self.segments[..end]
+    }
+
     /// Parse a version string like `"1.2.3"` or `"1_2"` into segments.
     pub fn parse(raw: &str) -> Result<Self> {
         if raw.is_empty() {
@@ -55,22 +81,28 @@ impl MigrationVersion {
 
 impl Ord for MigrationVersion {
     fn cmp(&self, other: &Self) -> Ordering {
-        let max_len = self.segments.len().max(other.segments.len());
-        for i in 0..max_len {
-            let a = self.segments.get(i).copied().unwrap_or(0);
-            let b = other.segments.get(i).copied().unwrap_or(0);
-            match a.cmp(&b) {
-                Ordering::Equal => continue,
-                ord => return ord,
-            }
-        }
-        Ordering::Equal
+        // Zero-pad the shorter side so `1.2` and `1.2.0` compare equal.
+        self.normalized().cmp(other.normalized())
     }
 }
 
 impl PartialOrd for MigrationVersion {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for MigrationVersion {
+    fn eq(&self, other: &Self) -> bool {
+        self.normalized() == other.normalized()
+    }
+}
+
+impl Eq for MigrationVersion {}
+
+impl std::hash::Hash for MigrationVersion {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.normalized().hash(state);
     }
 }
 
@@ -295,16 +327,21 @@ pub fn scan_migrations(locations: &[std::path::PathBuf]) -> Result<Vec<ResolvedM
         }
     });
 
-    // Detect duplicate versions
-    let mut seen_versions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Detect duplicate versions. Keyed on the *normalized* segments, not the
+    // raw string, so `V1__a.sql` and `V1.0__b.sql` are caught — they order as
+    // the same version, so allowing both would apply two migrations that every
+    // ordering comparison treats as one.
+    let mut seen_versions: std::collections::HashMap<(bool, Vec<u64>), &str> =
+        std::collections::HashMap::new();
     for m in &migrations {
         if let Some(v) = m.version() {
-            let prefix = if m.is_versioned() { "V" } else { "U" };
-            let key = format!("{}{}", prefix, v.raw);
-            if !seen_versions.insert(key) {
+            let key = (m.is_versioned(), v.normalized().to_vec());
+            if let Some(previous) = seen_versions.insert(key, m.script.as_str()) {
                 return Err(WaypointError::ValidationFailed(format!(
-                    "Duplicate migration version '{}' found in file '{}'. Each version must be unique.",
-                    v.raw, m.script
+                    "Duplicate migration version '{}' found in files '{}' and '{}'. \
+                     Each version must be unique (note that '1', '1.0' and '1.0.0' \
+                     are the same version).",
+                    v.raw, previous, m.script
                 )));
             }
         }
@@ -342,6 +379,53 @@ mod tests {
         assert!(v1_9 < v1_10); // Numeric, not string comparison
         assert!(v1_2 < v1_9);
         assert_eq!(v1_2.cmp(&v1_2_0), Ordering::Equal); // Trailing zeros are equal
+    }
+
+    #[test]
+    fn test_version_eq_matches_ord() {
+        // The Ord/Eq contract: cmp == Equal must imply ==.
+        let cases = [("1", "1.0"), ("1.2", "1.2.0"), ("1", "1.0.0"), ("0", "0.0")];
+        for (a, b) in cases {
+            let va = MigrationVersion::parse(a).unwrap();
+            let vb = MigrationVersion::parse(b).unwrap();
+            assert_eq!(va.cmp(&vb), Ordering::Equal, "{a} vs {b}");
+            assert_eq!(va, vb, "{a} vs {b} should be equal");
+        }
+
+        let v1 = MigrationVersion::parse("1").unwrap();
+        let v2 = MigrationVersion::parse("2").unwrap();
+        assert_ne!(v1, v2);
+        assert_ne!(v1.cmp(&v2), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_version_hash_matches_eq() {
+        use std::collections::HashSet;
+        let mut set = HashSet::new();
+        set.insert(MigrationVersion::parse("1.0").unwrap());
+        // Equal values must hash equal, so this is a duplicate insert.
+        assert!(!set.insert(MigrationVersion::parse("1").unwrap()));
+        assert!(set.insert(MigrationVersion::parse("1.1").unwrap()));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_version_normalized() {
+        assert_eq!(MigrationVersion::parse("1.0.0").unwrap().normalized(), &[1]);
+        assert_eq!(
+            MigrationVersion::parse("1.2.0").unwrap().normalized(),
+            &[1, 2]
+        );
+        assert!(
+            MigrationVersion::parse("0.0")
+                .unwrap()
+                .normalized()
+                .is_empty()
+        );
+        assert_eq!(
+            MigrationVersion::parse("1.0.3").unwrap().normalized(),
+            &[1, 0, 3]
+        );
     }
 
     #[test]

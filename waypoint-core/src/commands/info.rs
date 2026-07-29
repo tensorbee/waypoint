@@ -12,7 +12,7 @@ use crate::config::WaypointConfig;
 use crate::db::DbClient;
 use crate::error::Result;
 use crate::history::{self, AppliedMigration};
-use crate::migration::{scan_migrations, MigrationKind, MigrationVersion, ResolvedMigration};
+use crate::migration::{MigrationKind, MigrationVersion, ResolvedMigration, scan_migrations};
 
 /// The state of a migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

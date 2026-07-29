@@ -8,7 +8,7 @@ use tokio_postgres::Client;
 use crate::config::WaypointConfig;
 use crate::db::DbClient;
 use crate::dialect::DialectKind;
-use crate::error::{Result, WaypointError};
+use crate::error::Result;
 use crate::schema::{self, SchemaDiff};
 
 /// Target to compare the current schema against.
@@ -30,6 +30,10 @@ pub struct DiffReport {
 
 /// Execute the diff command (PostgreSQL legacy entry).
 #[cfg(feature = "postgres")]
+#[deprecated(
+    since = "0.6.0",
+    note = "Unused PostgreSQL-only entry point superseded by `execute_db`, which handles both engines. Will be removed in 1.0."
+)]
 pub async fn execute(
     client: &Client,
     config: &WaypointConfig,
@@ -74,7 +78,10 @@ pub async fn execute_db(
 
     let target_snapshot = match target {
         DiffTarget::Database(ref url) => {
-            let target_client = connect_for_url(url).await?;
+            // The --target-url connection reuses the caller's [database]
+            // transport settings (SSL mode, timeouts, keepalive) rather than
+            // silently connecting with hardcoded defaults.
+            let target_client = crate::db::connect_for_url(url, config).await?;
             // Schema resolution for --target-url differs by engine:
             //   PG: schemas are namespaces *within* a database, so the
             //       configured `schema` (e.g. "public") applies to both sides.
@@ -103,29 +110,4 @@ pub async fn execute_db(
         generated_sql,
         has_changes,
     })
-}
-
-async fn connect_for_url(url: &str) -> Result<DbClient> {
-    let kind = DialectKind::from_url(url).unwrap_or(DialectKind::Postgres);
-    match kind {
-        #[cfg(feature = "postgres")]
-        DialectKind::Postgres => {
-            let c = crate::db::connect(url).await?;
-            Ok(DbClient::with_postgres(c))
-        }
-        #[cfg(not(feature = "postgres"))]
-        DialectKind::Postgres => Err(WaypointError::ConfigError(
-            "PostgreSQL support is not compiled in".into(),
-        )),
-        #[cfg(feature = "mysql")]
-        DialectKind::Mysql => {
-            let pool = mysql_async::Pool::from_url(url)
-                .map_err(|e| WaypointError::ConfigError(format!("Invalid MySQL URL: {}", e)))?;
-            Ok(DbClient::with_mysql(pool))
-        }
-        #[cfg(not(feature = "mysql"))]
-        DialectKind::Mysql => Err(WaypointError::ConfigError(
-            "MySQL support is not compiled in".into(),
-        )),
-    }
 }

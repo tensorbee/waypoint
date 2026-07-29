@@ -32,14 +32,41 @@ pub struct NamedDatabaseConfig {
 }
 
 impl NamedDatabaseConfig {
-    /// Convert to a standalone WaypointConfig for running commands.
+    /// Convert to a standalone `WaypointConfig` for running commands.
+    ///
+    /// Everything not declared per-database falls back to built-in defaults.
+    /// Prefer [`Self::to_waypoint_config_inheriting`], which carries the
+    /// top-level `[safety]`, `[preflight]`, `[guards]`, `[reversals]`,
+    /// `[advisor]`, `[snapshots]`, `[lint]` and `[simulation]` sections over
+    /// instead of silently dropping them.
     pub fn to_waypoint_config(&self) -> WaypointConfig {
+        self.to_waypoint_config_inheriting(&WaypointConfig::default())
+    }
+
+    /// Convert to a standalone `WaypointConfig`, inheriting the global
+    /// sections from `parent`.
+    ///
+    /// A `[[databases]]` entry only carries connection, migration, hook and
+    /// placeholder settings. Every other section is process-wide policy — a
+    /// `[safety] block_on_danger = true` must not stop applying just because
+    /// the run happens to be multi-database.
+    pub fn to_waypoint_config_inheriting(&self, parent: &WaypointConfig) -> WaypointConfig {
         WaypointConfig {
             database: self.database.clone(),
             migrations: self.migrations.clone(),
             hooks: self.hooks.clone(),
             placeholders: self.placeholders.clone(),
-            ..WaypointConfig::default()
+            // Inherited global policy.
+            lint: parent.lint.clone(),
+            snapshots: parent.snapshots.clone(),
+            preflight: parent.preflight.clone(),
+            guards: parent.guards.clone(),
+            reversals: parent.reversals.clone(),
+            safety: parent.safety.clone(),
+            advisor: parent.advisor.clone(),
+            simulation: parent.simulation.clone(),
+            // Never inherited: a nested multi-database list would recurse.
+            multi_database: None,
         }
     }
 }
@@ -138,37 +165,50 @@ impl MultiWaypoint {
     /// Connect to all databases (or a filtered subset). The engine for each
     /// database is auto-detected from the URL scheme — mixed PG/MySQL configs
     /// are fully supported here.
+    ///
+    /// Uses built-in defaults for the global config sections. Prefer
+    /// [`Self::connect_inheriting`] so that top-level `[database]` transport
+    /// settings apply.
     pub async fn connect(
         databases: &[NamedDatabaseConfig],
         filter: Option<&str>,
     ) -> Result<HashMap<String, DbClient>> {
+        Self::connect_inheriting(databases, filter, &WaypointConfig::default()).await
+    }
+
+    /// Like [`Self::connect`], but inheriting global sections from `parent`.
+    pub async fn connect_inheriting(
+        databases: &[NamedDatabaseConfig],
+        filter: Option<&str>,
+        parent: &WaypointConfig,
+    ) -> Result<HashMap<String, DbClient>> {
         let mut clients = HashMap::new();
 
         for db in databases {
-            if let Some(name_filter) = filter {
-                if db.name != name_filter {
-                    continue;
-                }
+            if let Some(name_filter) = filter
+                && db.name != name_filter
+            {
+                continue;
             }
 
-            let config = db.to_waypoint_config();
+            let config = db.to_waypoint_config_inheriting(parent);
             let conn_string = config.connection_string()?;
-            let client = connect_one(&conn_string, &config).await?;
+            let client = crate::db::connect_for_url(&conn_string, &config).await?;
             clients.insert(db.name.clone(), client);
         }
 
-        if let Some(name_filter) = filter {
-            if !clients.contains_key(name_filter) {
-                let available = databases
-                    .iter()
-                    .map(|d| d.name.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(WaypointError::DatabaseNotFound {
-                    name: name_filter.to_string(),
-                    available,
-                });
-            }
+        if let Some(name_filter) = filter
+            && !clients.contains_key(name_filter)
+        {
+            let available = databases
+                .iter()
+                .map(|d| d.name.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(WaypointError::DatabaseNotFound {
+                name: name_filter.to_string(),
+                available,
+            });
         }
 
         Ok(clients)
@@ -188,6 +228,10 @@ impl MultiWaypoint {
 
     /// Run migrate on all databases in dependency order with the `force`
     /// flag for overriding DANGER safety verdicts on PostgreSQL.
+    ///
+    /// Uses built-in defaults for the global config sections. Prefer
+    /// [`Self::migrate_inheriting`] so that top-level `[safety]`,
+    /// `[preflight]`, `[guards]` and `[reversals]` policy applies.
     pub async fn migrate_with_options(
         databases: &[NamedDatabaseConfig],
         clients: &HashMap<String, DbClient>,
@@ -195,6 +239,30 @@ impl MultiWaypoint {
         target_version: Option<&str>,
         fail_fast: bool,
         force: bool,
+    ) -> Result<MultiResult> {
+        Self::migrate_inheriting(
+            databases,
+            clients,
+            order,
+            target_version,
+            fail_fast,
+            force,
+            &WaypointConfig::default(),
+        )
+        .await
+    }
+
+    /// Like [`Self::migrate_with_options`], but inheriting global config
+    /// sections from `parent`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn migrate_inheriting(
+        databases: &[NamedDatabaseConfig],
+        clients: &HashMap<String, DbClient>,
+        order: &[String],
+        target_version: Option<&str>,
+        fail_fast: bool,
+        force: bool,
+        parent: &WaypointConfig,
     ) -> Result<MultiResult> {
         let mut results = Vec::new();
 
@@ -204,7 +272,7 @@ impl MultiWaypoint {
 
             match (db, client) {
                 (Some(db), Some(client)) => {
-                    let config = db.to_waypoint_config();
+                    let config = db.to_waypoint_config_inheriting(parent);
                     let outcome = dispatch_migrate(client, &config, target_version, force).await;
                     match outcome {
                         Ok(report) => {
@@ -255,6 +323,16 @@ impl MultiWaypoint {
         clients: &HashMap<String, DbClient>,
         order: &[String],
     ) -> Result<HashMap<String, Vec<crate::commands::info::MigrationInfo>>> {
+        Self::info_inheriting(databases, clients, order, &WaypointConfig::default()).await
+    }
+
+    /// Like [`Self::info`], but inheriting global config sections from `parent`.
+    pub async fn info_inheriting(
+        databases: &[NamedDatabaseConfig],
+        clients: &HashMap<String, DbClient>,
+        order: &[String],
+        parent: &WaypointConfig,
+    ) -> Result<HashMap<String, Vec<crate::commands::info::MigrationInfo>>> {
         let mut all_info = HashMap::new();
 
         for name in order {
@@ -262,50 +340,13 @@ impl MultiWaypoint {
             let client = clients.get(name);
 
             if let (Some(db), Some(client)) = (db, client) {
-                let config = db.to_waypoint_config();
+                let config = db.to_waypoint_config_inheriting(parent);
                 let info = crate::commands::info::execute_db(client, &config).await?;
                 all_info.insert(name.clone(), info);
             }
         }
 
         Ok(all_info)
-    }
-}
-
-/// Connect to one named database, auto-detecting the engine from the URL.
-async fn connect_one(
-    conn_string: &str,
-    #[cfg_attr(not(feature = "postgres"), allow(unused_variables))] config: &WaypointConfig,
-) -> Result<DbClient> {
-    let kind = DialectKind::from_url(conn_string).unwrap_or(DialectKind::Postgres);
-    match kind {
-        #[cfg(feature = "postgres")]
-        DialectKind::Postgres => {
-            let client = crate::db::connect_with_full_config(
-                conn_string,
-                &config.database.ssl_mode,
-                config.database.connect_retries,
-                config.database.connect_timeout_secs,
-                config.database.statement_timeout_secs,
-                config.database.keepalive_secs,
-            )
-            .await?;
-            Ok(DbClient::with_postgres(client))
-        }
-        #[cfg(not(feature = "postgres"))]
-        DialectKind::Postgres => Err(WaypointError::ConfigError(
-            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
-        )),
-        #[cfg(feature = "mysql")]
-        DialectKind::Mysql => {
-            let pool = mysql_async::Pool::from_url(conn_string)
-                .map_err(|e| WaypointError::ConfigError(format!("Invalid MySQL URL: {}", e)))?;
-            Ok(DbClient::with_mysql(pool))
-        }
-        #[cfg(not(feature = "mysql"))]
-        DialectKind::Mysql => Err(WaypointError::ConfigError(
-            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
-        )),
     }
 }
 

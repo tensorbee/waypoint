@@ -648,12 +648,13 @@ fn parse_add_columns(stmt: &str) -> Option<(String, Vec<AddColumnClause>)> {
             i += 1;
             continue;
         }
-        if depth == 0 && is_kw(t, "ADD") {
-            if let Some((clause, next)) = parse_one_add_column(stmt, &toks, i + 1) {
-                clauses.push(clause);
-                i = next;
-                continue;
-            }
+        if depth == 0
+            && is_kw(t, "ADD")
+            && let Some((clause, next)) = parse_one_add_column(stmt, &toks, i + 1)
+        {
+            clauses.push(clause);
+            i = next;
+            continue;
         }
         i += 1;
     }
@@ -1242,18 +1243,33 @@ pub fn split_mysql_statements(sql: &str) -> Vec<String> {
         }
         // Statement terminator
         if c == b';' {
-            out.push(sql[start..i].to_string());
+            push_mysql_statement(&mut out, &sql[start..i]);
             i += 1;
             start = i;
             continue;
         }
         i += 1;
     }
-    let tail = sql[start..].trim();
-    if !tail.is_empty() {
-        out.push(tail.to_string());
-    }
+    push_mysql_statement(&mut out, &sql[start..]);
     out
+}
+
+/// Trim a candidate statement and push it only if it carries something the
+/// server can execute.
+///
+/// MySQL rejects an empty or comment-only query with `ER_EMPTY_QUERY (1065)`,
+/// so a file ending in a trailing comment (`... ; -- done`) or containing a
+/// stray `;;` must not produce a statement here. We check for executable
+/// content by blanking comments and seeing whether anything remains.
+fn push_mysql_statement(out: &mut Vec<String>, candidate: &str) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    if strip_comments(trimmed).trim().is_empty() {
+        return;
+    }
+    out.push(trimmed.to_string());
 }
 
 #[cfg(test)]
@@ -1793,5 +1809,49 @@ mod tests {
         let stmts = split_mysql_statements(sql);
         assert_eq!(stmts.len(), 1);
         assert!(stmts[0].contains("CREATE TABLE a"));
+    }
+
+    #[test]
+    fn test_split_mysql_drops_trailing_comment_only_statement() {
+        // A file ending in a comment after the last `;` must not yield a
+        // statement — MySQL answers ER_EMPTY_QUERY (1065).
+        let sql = "CREATE TABLE t (id INT);\n-- done\n";
+        assert_eq!(
+            split_mysql_statements(sql),
+            vec!["CREATE TABLE t (id INT)".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_split_mysql_drops_empty_statements() {
+        let sql = "SELECT 1;; SELECT 2;";
+        assert_eq!(
+            split_mysql_statements(sql),
+            vec!["SELECT 1".to_string(), "SELECT 2".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_split_mysql_trims_every_statement() {
+        let sql = "SELECT 1;\n  SELECT 2  ;\n";
+        assert_eq!(
+            split_mysql_statements(sql),
+            vec!["SELECT 1".to_string(), "SELECT 2".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_split_mysql_drops_block_comment_only_statement() {
+        let sql = "SELECT 1; /* just a note */ ;";
+        assert_eq!(split_mysql_statements(sql), vec!["SELECT 1".to_string()]);
+    }
+
+    #[test]
+    fn test_split_mysql_keeps_statement_with_leading_comment() {
+        let sql = "-- set up\nCREATE TABLE t (id INT);";
+        assert_eq!(
+            split_mysql_statements(sql),
+            vec!["-- set up\nCREATE TABLE t (id INT)".to_string()]
+        );
     }
 }

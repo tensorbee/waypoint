@@ -13,7 +13,7 @@ use crate::db;
 use crate::db::DbClient;
 use crate::error::Result;
 use crate::history::{self, AppliedMigration};
-use crate::migration::{scan_migrations, ResolvedMigration};
+use crate::migration::{ResolvedMigration, scan_migrations};
 
 /// Report returned after a repair operation.
 #[derive(Debug, Serialize)]
@@ -28,6 +28,10 @@ pub struct RepairReport {
 
 /// Execute the repair command (PostgreSQL legacy entry).
 #[cfg(feature = "postgres")]
+#[deprecated(
+    since = "0.6.0",
+    note = "Unused PostgreSQL-only entry point superseded by `execute_db`, which handles both engines. Will be removed in 1.0."
+)]
 pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<RepairReport> {
     let schema = &config.migrations.schema;
     let table = &config.migrations.table;
@@ -169,38 +173,43 @@ fn compute_repair(
     let mut updates = Vec::new();
 
     for am in applied {
-        if !am.success || am.migration_type == "BASELINE" {
+        // Skip rows that have no migration file to compare against. UNDO_SQL
+        // rows carry the U-file's checksum, not the V-file's, so matching them
+        // against `resolved_by_version` (which holds only V files) would
+        // rewrite the undo row's checksum to the forward migration's.
+        // `validate` skips the same two types — the pair must agree.
+        if !am.success || am.migration_type == "BASELINE" || am.migration_type == "UNDO_SQL" {
             continue;
         }
 
         if let Some(ref version) = am.version {
-            if let Some(resolved) = resolved_by_version.get(version) {
-                if am.checksum != Some(resolved.checksum) {
-                    details.push(format!(
-                        "Updated checksum for version {} ({} -> {})",
-                        version,
-                        am.checksum.unwrap_or(0),
-                        resolved.checksum
-                    ));
-                    updates.push(RepairChecksum::Versioned {
-                        version: version.clone(),
-                        new: resolved.checksum,
-                    });
-                }
-            }
-        } else if let Some(resolved) = resolved_by_script.get(&am.script) {
-            if am.checksum != Some(resolved.checksum) {
+            if let Some(resolved) = resolved_by_version.get(version)
+                && am.checksum != Some(resolved.checksum)
+            {
                 details.push(format!(
-                    "Updated checksum for repeatable '{}' ({} -> {})",
-                    am.script,
+                    "Updated checksum for version {} ({} -> {})",
+                    version,
                     am.checksum.unwrap_or(0),
                     resolved.checksum
                 ));
-                updates.push(RepairChecksum::Repeatable {
-                    script: am.script.clone(),
+                updates.push(RepairChecksum::Versioned {
+                    version: version.clone(),
                     new: resolved.checksum,
                 });
             }
+        } else if let Some(resolved) = resolved_by_script.get(&am.script)
+            && am.checksum != Some(resolved.checksum)
+        {
+            details.push(format!(
+                "Updated checksum for repeatable '{}' ({} -> {})",
+                am.script,
+                am.checksum.unwrap_or(0),
+                resolved.checksum
+            ));
+            updates.push(RepairChecksum::Repeatable {
+                script: am.script.clone(),
+                new: resolved.checksum,
+            });
         }
     }
     (details, updates)

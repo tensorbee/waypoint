@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use serde::Serialize;
 
 use crate::error::Result;
-use crate::migration::{scan_migrations, MigrationKind, MigrationVersion};
-use crate::sql_parser::{extract_ddl_operations, DdlOperation};
+use crate::migration::{MigrationKind, MigrationVersion, scan_migrations};
+use crate::sql_parser::{DdlOperation, extract_ddl_operations};
 
 /// Supported output formats for the changelog.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -75,19 +75,17 @@ pub fn execute(
         }
 
         // Apply version range filter
-        if let Some(ref fv) = from_version {
-            if let Some(mv) = migration.version() {
-                if mv < fv {
-                    continue;
-                }
-            }
+        if let Some(ref fv) = from_version
+            && let Some(mv) = migration.version()
+            && mv < fv
+        {
+            continue;
         }
-        if let Some(ref tv) = to_version {
-            if let Some(mv) = migration.version() {
-                if mv > tv {
-                    continue;
-                }
-            }
+        if let Some(ref tv) = to_version
+            && let Some(mv) = migration.version()
+            && mv > tv
+        {
+            continue;
         }
 
         let changes = extract_ddl_operations(&migration.sql);

@@ -6,9 +6,11 @@ use tokio_postgres::Client;
 use crate::config::WaypointConfig;
 #[cfg(feature = "postgres")]
 use crate::db;
+use crate::db::DbClient;
 #[cfg(feature = "postgres")]
 use crate::db::quote_ident;
-use crate::db::DbClient;
+#[cfg(feature = "mysql")]
+use crate::db::quote_ident_mysql as qi;
 use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
 
@@ -17,6 +19,10 @@ use crate::error::{Result, WaypointError};
 /// Drop all tables, views, functions, sequences, types in managed schema(s).
 /// Requires clean_enabled=true or allow_clean=true.
 #[cfg(feature = "postgres")]
+#[deprecated(
+    since = "0.6.0",
+    note = "Unused PostgreSQL-only entry point superseded by `execute_db`, which handles both engines. Will be removed in 1.0."
+)]
 pub async fn execute(
     client: &Client,
     config: &WaypointConfig,
@@ -240,7 +246,7 @@ async fn execute_inner_mysql(client: &DbClient, config: &WaypointConfig) -> Resu
         )
         .await?;
     for name in views {
-        let sql = format!("DROP VIEW IF EXISTS `{}`.`{}`", schema, name);
+        let sql = format!("DROP VIEW IF EXISTS {}.{}", qi(&schema), qi(&name));
         conn.query_drop(&sql).await?;
         dropped.push(format!("View: {}.{}", schema, name));
     }
@@ -254,7 +260,7 @@ async fn execute_inner_mysql(client: &DbClient, config: &WaypointConfig) -> Resu
         )
         .await?;
     for name in tables {
-        let sql = format!("DROP TABLE IF EXISTS `{}`.`{}`", schema, name);
+        let sql = format!("DROP TABLE IF EXISTS {}.{}", qi(&schema), qi(&name));
         conn.query_drop(&sql).await?;
         dropped.push(format!("Table: {}.{}", schema, name));
     }
@@ -273,7 +279,7 @@ async fn execute_inner_mysql(client: &DbClient, config: &WaypointConfig) -> Resu
         } else {
             "FUNCTION"
         };
-        let sql = format!("DROP {} IF EXISTS `{}`.`{}`", kw, schema, name);
+        let sql = format!("DROP {} IF EXISTS {}.{}", kw, qi(&schema), qi(&name));
         conn.query_drop(&sql).await?;
         dropped.push(format!("{}: {}.{}", kw.to_ascii_lowercase(), schema, name));
     }
@@ -286,7 +292,7 @@ async fn execute_inner_mysql(client: &DbClient, config: &WaypointConfig) -> Resu
         )
         .await?;
     for name in events {
-        let sql = format!("DROP EVENT IF EXISTS `{}`.`{}`", schema, name);
+        let sql = format!("DROP EVENT IF EXISTS {}.{}", qi(&schema), qi(&name));
         conn.query_drop(&sql).await?;
         dropped.push(format!("Event: {}.{}", schema, name));
     }

@@ -379,10 +379,34 @@ async fn check_read_only_mysql(client: &DbClient) -> PreflightCheck {
     }
 }
 
+/// Extract the MySQL pool for a check, or produce a Warn result.
+///
+/// The MySQL checks return a `PreflightCheck` rather than a `Result`, so there
+/// is nowhere to propagate a wrong-engine error to. Callers only reach these
+/// through `run_preflight_db`'s `DialectKind::Mysql` arm, so the `Err` branch
+/// is unreachable in practice — but a preflight *health check* is the last
+/// place that should abort the process, so it degrades to a warning instead of
+/// `.expect()`-ing.
+#[cfg(feature = "mysql")]
+macro_rules! mysql_pool_or_warn {
+    ($client:expr, $name:expr) => {
+        match $client.as_mysql() {
+            Ok(pool) => pool,
+            Err(e) => {
+                return PreflightCheck {
+                    name: $name.into(),
+                    status: CheckStatus::Warn,
+                    detail: format!("Could not check: {}", e),
+                };
+            }
+        }
+    };
+}
+
 #[cfg(feature = "mysql")]
 async fn check_active_connections_mysql(client: &DbClient) -> PreflightCheck {
     use mysql_async::prelude::*;
-    let pool = client.as_mysql().expect("mysql pool");
+    let pool = mysql_pool_or_warn!(client, "Active Connections");
     let mut conn = match pool.get_conn().await {
         Ok(c) => c,
         Err(e) => {
@@ -434,7 +458,7 @@ async fn check_long_running_queries_mysql(
     threshold_secs: i64,
 ) -> PreflightCheck {
     use mysql_async::prelude::*;
-    let pool = client.as_mysql().expect("mysql pool");
+    let pool = mysql_pool_or_warn!(client, "Long-Running Queries");
     let mut conn = match pool.get_conn().await {
         Ok(c) => c,
         Err(e) => {
@@ -477,7 +501,7 @@ async fn check_long_running_queries_mysql(
 #[cfg(feature = "mysql")]
 async fn check_replication_lag_mysql(client: &DbClient, max_lag_secs: i64) -> PreflightCheck {
     use mysql_async::prelude::*;
-    let pool = client.as_mysql().expect("mysql pool");
+    let pool = mysql_pool_or_warn!(client, "Replication Lag");
     let mut conn = match pool.get_conn().await {
         Ok(c) => c,
         Err(_) => {
@@ -529,7 +553,7 @@ async fn check_replication_lag_mysql(client: &DbClient, max_lag_secs: i64) -> Pr
 #[cfg(feature = "mysql")]
 async fn check_database_size_mysql(client: &DbClient) -> PreflightCheck {
     use mysql_async::prelude::*;
-    let pool = client.as_mysql().expect("mysql pool");
+    let pool = mysql_pool_or_warn!(client, "Database Size");
     let mut conn = match pool.get_conn().await {
         Ok(c) => c,
         Err(e) => {
@@ -584,7 +608,7 @@ async fn check_database_size_mysql(client: &DbClient) -> PreflightCheck {
 #[cfg(feature = "mysql")]
 async fn check_lock_contention_mysql(client: &DbClient) -> PreflightCheck {
     use mysql_async::prelude::*;
-    let pool = client.as_mysql().expect("mysql pool");
+    let pool = mysql_pool_or_warn!(client, "Lock Contention");
     let mut conn = match pool.get_conn().await {
         Ok(c) => c,
         Err(e) => {

@@ -7,11 +7,11 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-use crate::directive::{parse_lint_ignores, LintIgnoreScope};
+use crate::directive::{LintIgnoreScope, parse_lint_ignores};
 use crate::error::Result;
 use crate::migration::scan_migrations;
 use crate::sql_parser::{
-    extract_ddl_operations_located, line_number_at, strip_comments, DdlOperation, LocatedDdl,
+    DdlOperation, LocatedDdl, extract_ddl_operations_located, line_number_at, strip_comments,
 };
 
 /// Severity level for a lint issue.
@@ -336,7 +336,9 @@ pub fn execute(locations: &[PathBuf], disabled_rules: &[String]) -> Result<LintR
                     .is_some_and(|w| w.eq_ignore_ascii_case("BEGIN"))
             });
             if ddl_count > 1 && !has_begin {
-                // This is a warning because waypoint wraps in a transaction by default
+                // Reported as an Error: waypoint does wrap each migration in a
+                // transaction, but relying on that means the file is not
+                // safely runnable by hand or by another tool.
                 pending.push(PendingIssue {
                     issue: LintIssue {
                         rule_id: "E002".to_string(),

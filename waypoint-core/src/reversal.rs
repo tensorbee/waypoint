@@ -9,9 +9,9 @@ use serde::Serialize;
 #[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
+use crate::db::DbClient;
 #[cfg(feature = "postgres")]
 use crate::db::quote_ident;
-use crate::db::DbClient;
 use crate::dialect::DialectKind;
 use crate::error::Result;
 use crate::schema::{self, SchemaDiff, SchemaSnapshot};

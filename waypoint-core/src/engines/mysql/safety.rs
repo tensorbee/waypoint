@@ -9,10 +9,11 @@
 use mysql_async::prelude::*;
 
 use crate::db::DbClient;
+use crate::db::quote_ident_mysql as qi;
 use crate::error::Result;
 use crate::safety::{
-    affected_table, classify_row_count, compute_verdict, is_data_loss, LockLevel, SafetyConfig,
-    SafetyReport, SafetyVerdict, StatementAnalysis, TableSize,
+    LockLevel, SafetyConfig, SafetyReport, SafetyVerdict, StatementAnalysis, TableSize,
+    affected_table, classify_row_count, compute_verdict, is_data_loss,
 };
 use crate::sql_parser::DdlOperation;
 
@@ -212,7 +213,7 @@ pub async fn classify_table_size_with_refresh(
         // a freshly-created table (CREATE in this migration, ALTER in the
         // next statement) doesn't blow up the whole safety pass.
         let _ = conn
-            .query_drop(format!("ANALYZE TABLE `{}`.`{}`", schema, table))
+            .query_drop(format!("ANALYZE TABLE {}.{}", qi(schema), qi(table)))
             .await;
     }
     let rows: Option<Option<i64>> = conn

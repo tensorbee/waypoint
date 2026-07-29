@@ -26,6 +26,18 @@ pub fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
+/// Quote a SQL identifier the MySQL way: backticks, with embedded backticks
+/// doubled.
+///
+/// The MySQL command paths build DDL from names read out of
+/// `information_schema`. Those are server-provided rather than user-supplied,
+/// but an identifier containing a backtick would still produce broken SQL, and
+/// quoting uniformly means no call site has to reason about which names are
+/// "safe". Mirrors [`quote_ident`], which does the same for PostgreSQL.
+pub fn quote_ident_mysql(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
 /// Validate that a SQL identifier contains only safe characters.
 ///
 /// Returns an error for names with characters outside `[a-zA-Z0-9_]`.
@@ -185,7 +197,10 @@ impl DbClient {
                     .exec_first("SELECT GET_LOCK(?, -1)", (key.clone(),))
                     .await?;
                 match acquired {
-                    Some(1) => Ok(()),
+                    Some(1) => {
+                        park_lock_conn(pool, &key, conn);
+                        Ok(())
+                    }
                     _ => Err(WaypointError::LockError(format!(
                         "Failed to acquire MySQL named lock {}",
                         key
@@ -215,7 +230,10 @@ impl DbClient {
                     .exec_first("SELECT GET_LOCK(?, ?)", (key.clone(), timeout_secs as i64))
                     .await?;
                 match acquired {
-                    Some(1) => Ok(()),
+                    Some(1) => {
+                        park_lock_conn(pool, &key, conn);
+                        Ok(())
+                    }
                     Some(0) => Err(WaypointError::LockError(format!(
                         "Timed out waiting for MySQL named lock {} after {}s",
                         key, timeout_secs
@@ -238,9 +256,38 @@ impl DbClient {
             DbClient::Mysql(pool) => {
                 use mysql_async::prelude::*;
                 let key = mysql_lock_key(table_name);
-                let mut conn = pool.get_conn().await?;
-                conn.exec_drop("SELECT RELEASE_LOCK(?)", (key,)).await?;
-                Ok(())
+                // Release on the *same* session that acquired it. A different
+                // connection's RELEASE_LOCK is a silent no-op (returns 0) and
+                // would leak the lock until the server reaps the session.
+                let mut conn = match unpark_lock_conn(pool, &key) {
+                    Some(conn) => conn,
+                    None => {
+                        return Err(WaypointError::LockError(format!(
+                            "No pinned connection holds MySQL named lock {} — \
+                             release_lock called without a matching acquire_lock",
+                            key
+                        )));
+                    }
+                };
+                let released = conn
+                    .exec_first::<Option<i64>, _, _>("SELECT RELEASE_LOCK(?)", (key.clone(),))
+                    .await;
+                // Return the connection to the pool either way; dropping it
+                // here also drops the lock, so a failed RELEASE_LOCK is not
+                // fatal — the session reset on return clears it.
+                drop(conn);
+                match released {
+                    Ok(Some(Some(1))) => Ok(()),
+                    Ok(_) => {
+                        log::warn!(
+                            "RELEASE_LOCK({}) did not report success; the lock is released \
+                             regardless because the holding session was returned to the pool",
+                            key
+                        );
+                        Ok(())
+                    }
+                    Err(e) => Err(WaypointError::MysqlError(e)),
+                }
             }
         }
     }
@@ -345,6 +392,53 @@ impl DbClient {
     }
 }
 
+/// Connect to whichever backend the URL scheme indicates.
+///
+/// The single place that maps a connection string to a [`DbClient`]. Engine is
+/// taken from the URL scheme (`postgres://` / `postgresql://` → PostgreSQL,
+/// `mysql://` → MySQL); anything else — notably libpq `key=value` strings —
+/// falls back to `config.database.engine`, which defaults to PostgreSQL.
+///
+/// PostgreSQL connections pick up the full `[database]` transport config
+/// (SSL mode, retries, timeouts, keepalive).
+pub async fn connect_for_url(
+    conn_string: &str,
+    #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
+    config: &crate::config::WaypointConfig,
+) -> Result<DbClient> {
+    let kind = DialectKind::from_url(conn_string).unwrap_or(config.database.engine);
+    match kind {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => {
+            let client = connect_with_full_config(
+                conn_string,
+                &config.database.ssl_mode,
+                config.database.connect_retries,
+                config.database.connect_timeout_secs,
+                config.database.statement_timeout_secs,
+                config.database.keepalive_secs,
+            )
+            .await?;
+            Ok(DbClient::with_postgres(client))
+        }
+        #[cfg(not(feature = "postgres"))]
+        DialectKind::Postgres => Err(WaypointError::ConfigError(
+            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
+        )),
+        #[cfg(feature = "mysql")]
+        DialectKind::Mysql => {
+            let pool = mysql_async::Pool::from_url(conn_string).map_err(|e| {
+                WaypointError::ConfigError(format!("Invalid MySQL connection URL: {}", e))
+            })?;
+            Ok(DbClient::with_mysql(pool))
+        }
+        #[cfg(not(feature = "mysql"))]
+        DialectKind::Mysql => Err(WaypointError::ConfigError(
+            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
+        )),
+    }
+}
+
 /// Compute the MySQL named-lock key for a given history table name.
 ///
 /// MySQL `GET_LOCK` keys are arbitrary strings (truncated to 64 chars in 8.0+).
@@ -357,6 +451,76 @@ fn mysql_lock_key(table_name: &str) -> String {
         k.truncate(64);
     }
     k
+}
+
+/// Registry of pinned connections that currently hold a MySQL named lock.
+///
+/// `GET_LOCK` is **session**-scoped, and `mysql_async`'s pool defaults to
+/// `reset_connection = true`, which issues `COM_RESET_CONNECTION` when a
+/// `Conn` is returned to the pool. `COM_RESET_CONNECTION` explicitly releases
+/// locks acquired with `GET_LOCK()`. So acquiring the lock on a borrowed
+/// connection and dropping it back into the pool releases the lock
+/// immediately — the migration lock would provide no exclusion at all.
+///
+/// We therefore keep the acquiring `Conn` checked *out* of the pool for the
+/// whole lock lifetime, parked here, and release the lock on that same
+/// connection. A second acquire in the same process cannot get this
+/// connection back (it is not in the pool), so it takes a fresh session and
+/// blocks on `GET_LOCK` exactly as a separate process would.
+///
+/// Keyed by server identity + lock name so that a mixed-engine or
+/// multi-database run targeting two MySQL servers with the same history-table
+/// name keeps its locks distinct.
+#[cfg(feature = "mysql")]
+type MysqlLockRegistry = std::collections::HashMap<(usize, String), mysql_async::Conn>;
+
+#[cfg(feature = "mysql")]
+static MYSQL_LOCK_CONNS: std::sync::LazyLock<std::sync::Mutex<MysqlLockRegistry>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Identity of the pool a lock was taken on, for registry keying.
+///
+/// The address of the `Pool` inside its owning [`DbClient`] scopes the entry to
+/// that specific client instance, which is what we want: two `DbClient`s
+/// pointing at different MySQL servers must not share a registry slot even
+/// when they use the same history-table name.
+///
+/// `acquire_lock` / `release_lock` are always called through the same
+/// `&DbClient` borrow (acquire, do work, release), so the value provably
+/// cannot move in between and the address is stable across the pair. If a
+/// caller were to move the owning `DbClient` while holding a lock, the parked
+/// connection would be orphaned and the lock would persist until the server
+/// reaps the session — degraded, but never silently unlocked.
+#[cfg(feature = "mysql")]
+fn mysql_pool_ident(pool: &mysql_async::Pool) -> usize {
+    pool as *const mysql_async::Pool as usize
+}
+
+/// Park the lock-holding connection in the registry.
+#[cfg(feature = "mysql")]
+fn park_lock_conn(pool: &mysql_async::Pool, key: &str, conn: mysql_async::Conn) {
+    let registry_key = (mysql_pool_ident(pool), key.to_string());
+    match MYSQL_LOCK_CONNS.lock() {
+        Ok(mut guard) => {
+            guard.insert(registry_key, conn);
+        }
+        Err(poisoned) => {
+            // A panic elsewhere poisoned the registry. Recover rather than
+            // propagate: losing the parked connection would leak the lock
+            // until the server times the session out.
+            poisoned.into_inner().insert(registry_key, conn);
+        }
+    }
+}
+
+/// Reclaim the lock-holding connection from the registry, if present.
+#[cfg(feature = "mysql")]
+fn unpark_lock_conn(pool: &mysql_async::Pool, key: &str) -> Option<mysql_async::Conn> {
+    let registry_key = (mysql_pool_ident(pool), key.to_string());
+    match MYSQL_LOCK_CONNS.lock() {
+        Ok(mut guard) => guard.remove(&registry_key),
+        Err(poisoned) => poisoned.into_inner().remove(&registry_key),
+    }
 }
 
 // ── PostgreSQL-specific connection helpers (legacy entry points) ──────────────

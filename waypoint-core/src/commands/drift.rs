@@ -12,6 +12,8 @@ use crate::config::WaypointConfig;
 #[cfg(feature = "postgres")]
 use crate::db;
 use crate::db::DbClient;
+#[cfg(feature = "mysql")]
+use crate::db::quote_ident_mysql as qi;
 use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
 use crate::history;
@@ -275,14 +277,14 @@ async fn execute_mysql(client: &DbClient, config: &WaypointConfig) -> Result<Dri
 
     // Create the throwaway database.
     let mut conn = pool.get_conn().await?;
-    conn.query_drop(format!("CREATE DATABASE `{}`", temp_db))
+    conn.query_drop(format!("CREATE DATABASE {}", qi(&temp_db)))
         .await?;
 
     let result = run_drift_check_mysql(client, config, &schema_name, table, &temp_db).await;
 
     // Always drop the temp DB.
     if let Err(e) = conn
-        .query_drop(format!("DROP DATABASE IF EXISTS `{}`", temp_db))
+        .query_drop(format!("DROP DATABASE IF EXISTS {}", qi(&temp_db)))
         .await
     {
         log::warn!(
@@ -328,7 +330,9 @@ async fn run_drift_check_mysql(
     // single conn for the whole replay so a single `USE temp_db` persists.
     use mysql_async::prelude::*;
     let mut replay_conn = pool.get_conn().await?;
-    replay_conn.query_drop(format!("USE `{}`", temp_db)).await?;
+    replay_conn
+        .query_drop(format!("USE {}", qi(temp_db)))
+        .await?;
     for migration in resolved.iter().filter(|m| m.is_versioned()) {
         let version = migration.version().expect("filtered to versioned");
         if !effective.contains(&version.raw) {

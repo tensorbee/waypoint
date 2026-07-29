@@ -7,11 +7,12 @@
 //! # Quick Start
 //!
 //! ```rust,no_run
-//! use waypoint_core::config::WaypointConfig;
+//! use waypoint_core::config::{CliOverrides, WaypointConfig};
 //! use waypoint_core::Waypoint;
 //!
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = WaypointConfig::load(None, None)?;
+//! // `None` reads ./waypoint.toml; pass Some(path) for a different file.
+//! let config = WaypointConfig::load(None, &CliOverrides::default())?;
 //! let wp = Waypoint::new(config).await?;
 //! let report = wp.migrate(None).await?;
 //! println!("Applied {} migrations", report.migrations_applied);
@@ -109,7 +110,7 @@ impl Waypoint {
     /// If `connect_retries` is configured, retries with exponential backoff.
     pub async fn new(config: WaypointConfig) -> Result<Self> {
         let conn_string = config.connection_string()?;
-        let client = connect_for_url(&conn_string, &config).await?;
+        let client = db::connect_for_url(&conn_string, &config).await?;
         Ok(Self { config, client })
     }
 
@@ -295,43 +296,5 @@ impl Waypoint {
     /// Simulate pending migrations in a throwaway schema.
     pub async fn simulate(&self) -> Result<SimulationReport> {
         commands::simulate::execute_db(&self.client, &self.config).await
-    }
-}
-
-/// Connect to whichever backend the URL scheme indicates.
-async fn connect_for_url(
-    conn_string: &str,
-    #[cfg_attr(not(feature = "postgres"), allow(unused_variables))] config: &WaypointConfig,
-) -> Result<DbClient> {
-    let kind = DialectKind::from_url(conn_string).unwrap_or(DialectKind::Postgres);
-    match kind {
-        #[cfg(feature = "postgres")]
-        DialectKind::Postgres => {
-            let client = db::connect_with_full_config(
-                conn_string,
-                &config.database.ssl_mode,
-                config.database.connect_retries,
-                config.database.connect_timeout_secs,
-                config.database.statement_timeout_secs,
-                config.database.keepalive_secs,
-            )
-            .await?;
-            Ok(DbClient::with_postgres(client))
-        }
-        #[cfg(not(feature = "postgres"))]
-        DialectKind::Postgres => Err(error::WaypointError::ConfigError(
-            "PostgreSQL support is not compiled in (enable the `postgres` feature)".into(),
-        )),
-        #[cfg(feature = "mysql")]
-        DialectKind::Mysql => {
-            let pool = mysql_async::Pool::from_url(conn_string).map_err(|e| {
-                error::WaypointError::ConfigError(format!("Invalid MySQL connection URL: {}", e))
-            })?;
-            Ok(DbClient::with_mysql(pool))
-        }
-        #[cfg(not(feature = "mysql"))]
-        DialectKind::Mysql => Err(error::WaypointError::ConfigError(
-            "MySQL support is not compiled in (enable the `mysql` feature)".into(),
-        )),
     }
 }

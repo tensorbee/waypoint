@@ -59,6 +59,10 @@ fn filename_from_path(file_path: &str) -> String {
 
 /// Analyze all pending migration files for safety (PostgreSQL legacy entry).
 #[cfg(feature = "postgres")]
+#[deprecated(
+    since = "0.6.0",
+    note = "Unused PostgreSQL-only entry point superseded by `execute_db`, which handles both engines. Will be removed in 1.0."
+)]
 pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<SafetyCommandReport> {
     use crate::history;
     use crate::migration::scan_migrations;
@@ -78,10 +82,10 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<SafetyC
         if migration.is_undo() {
             continue;
         }
-        if let Some(version) = migration.version() {
-            if effective.contains(&version.raw) {
-                continue;
-            }
+        if let Some(version) = migration.version()
+            && effective.contains(&version.raw)
+        {
+            continue;
         }
 
         let report = safety::analyze_migration(
@@ -125,10 +129,10 @@ pub async fn execute_db(client: &DbClient, config: &WaypointConfig) -> Result<Sa
         if migration.is_undo() {
             continue;
         }
-        if let Some(version) = migration.version() {
-            if effective.contains(&version.raw) {
-                continue;
-            }
+        if let Some(version) = migration.version()
+            && effective.contains(&version.raw)
+        {
+            continue;
         }
 
         let report = safety::analyze_migration_db(

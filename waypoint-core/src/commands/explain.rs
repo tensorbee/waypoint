@@ -369,12 +369,11 @@ fn extract_plan_info_text(plan_text: &str) -> (Option<f64>, Option<f64>, Vec<Str
             let rest = &trimmed[cost_start + 5..];
             if let Some(dot_dot) = rest.find("..") {
                 let after_dots = &rest[dot_dot + 2..];
-                if let Some(space_pos) = after_dots.find(' ') {
-                    if let Ok(cost) = after_dots[..space_pos].parse::<f64>() {
-                        if total_cost.is_none() {
-                            total_cost = Some(cost);
-                        }
-                    }
+                if let Some(space_pos) = after_dots.find(' ')
+                    && let Ok(cost) = after_dots[..space_pos].parse::<f64>()
+                    && total_cost.is_none()
+                {
+                    total_cost = Some(cost);
                 }
             }
         }
@@ -383,31 +382,30 @@ fn extract_plan_info_text(plan_text: &str) -> (Option<f64>, Option<f64>, Vec<Str
             let end = rest
                 .find(|c: char| !c.is_ascii_digit())
                 .unwrap_or(rest.len());
-            if let Ok(rows) = rest[..end].parse::<f64>() {
-                if total_rows.is_none() {
-                    total_rows = Some(rows);
-                }
+            if let Ok(rows) = rest[..end].parse::<f64>()
+                && total_rows.is_none()
+            {
+                total_rows = Some(rows);
             }
         }
 
         // Detect sequential scans
-        if trimmed.contains("Seq Scan") {
-            if let Some(rows) = total_rows {
-                if rows > 10000.0 {
-                    // Try to extract table name
-                    let table = trimmed
-                        .find("on ")
-                        .map(|i| {
-                            let after = &trimmed[i + 3..];
-                            after.split_whitespace().next().unwrap_or("unknown")
-                        })
-                        .unwrap_or("unknown");
-                    warnings.push(format!(
-                        "Sequential Scan on '{}' (~{:.0} rows) — consider adding an index",
-                        table, rows
-                    ));
-                }
-            }
+        if trimmed.contains("Seq Scan")
+            && let Some(rows) = total_rows
+            && rows > 10000.0
+        {
+            // Try to extract table name
+            let table = trimmed
+                .find("on ")
+                .map(|i| {
+                    let after = &trimmed[i + 3..];
+                    after.split_whitespace().next().unwrap_or("unknown")
+                })
+                .unwrap_or("unknown");
+            warnings.push(format!(
+                "Sequential Scan on '{}' (~{:.0} rows) — consider adding an index",
+                table, rows
+            ));
         }
     }
 

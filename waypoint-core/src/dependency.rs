@@ -8,6 +8,31 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::error::{Result, WaypointError};
 use crate::migration::ResolvedMigration;
 
+/// Whether `from` depends on `target`, directly or through other versions.
+///
+/// Plain DFS over the `depends-on` edges; migration counts are small enough
+/// that the repeated traversal during graph construction is not worth caching.
+fn depends_transitively(
+    edges: &HashMap<String, HashSet<String>>,
+    from: &str,
+    target: &str,
+) -> bool {
+    let mut stack = vec![from];
+    let mut seen: HashSet<&str> = HashSet::new();
+    while let Some(node) = stack.pop() {
+        if node == target {
+            return true;
+        }
+        if !seen.insert(node) {
+            continue;
+        }
+        if let Some(deps) = edges.get(node) {
+            stack.extend(deps.iter().map(|s| s.as_str()));
+        }
+    }
+    false
+}
+
 /// A directed acyclic graph of migration dependencies.
 pub struct DependencyGraph {
     /// version -> set of versions it depends on
@@ -61,19 +86,44 @@ impl DependencyGraph {
             }
         }
 
-        // Add implicit chain dependencies (each version depends on previous)
+        // Add implicit chain dependencies (each version depends on previous).
+        //
+        // An implicit edge must never contradict an explicit one. If `previous`
+        // already depends — directly or transitively — on `current`, then
+        // adding `current -> previous` closes a cycle, and the graph would be
+        // rejected even though the migrations are perfectly orderable. That
+        // happens whenever a lower version declares `depends` on a higher one:
+        //
+        //   V2 `-- waypoint:depends 3`   explicit: 2 -> 3
+        //   V3 has no directives         implicit: 3 -> 2   ← false cycle
+        //
+        // Skipping the implicit edge in that case leaves the explicit
+        // dependency to do the ordering, which is what the author asked for.
         if implicit_chain {
             for i in 1..all_versions.len() {
-                let current = &all_versions[i];
-                let previous = &all_versions[i - 1];
-                // Only add implicit dependency if no explicit dependencies are set
-                if edges.get(current).is_none_or(|deps| deps.is_empty()) {
-                    edges.get_mut(current).unwrap().insert(previous.clone());
-                    reverse_edges
-                        .get_mut(previous)
-                        .unwrap()
-                        .insert(current.clone());
+                let current = all_versions[i].clone();
+                let previous = all_versions[i - 1].clone();
+
+                let has_explicit_deps = edges.get(&current).is_some_and(|deps| !deps.is_empty());
+                if has_explicit_deps {
+                    continue;
                 }
+                if depends_transitively(&edges, &previous, &current) {
+                    log::debug!(
+                        "Skipping implicit dependency {} -> {}: {} already depends on {}",
+                        current,
+                        previous,
+                        previous,
+                        current
+                    );
+                    continue;
+                }
+
+                edges
+                    .entry(current.clone())
+                    .or_default()
+                    .insert(previous.clone());
+                reverse_edges.entry(previous).or_default().insert(current);
             }
         }
 

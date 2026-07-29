@@ -4,10 +4,10 @@
 //! provides the engine-specific bodies for the MySQL backend.
 
 use chrono::{DateTime, NaiveDateTime, Utc};
-use mysql_async::prelude::*;
 use mysql_async::Pool;
+use mysql_async::prelude::*;
 
-use crate::dialect::{mysql::MysqlDialect, DatabaseDialect};
+use crate::dialect::{DatabaseDialect, mysql::MysqlDialect};
 use crate::error::{Result, WaypointError};
 use crate::history::AppliedMigration;
 

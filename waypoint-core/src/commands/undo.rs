@@ -15,17 +15,22 @@ use crate::db::DbClient;
 use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
 use crate::history;
-use crate::migration::{scan_migrations, MigrationVersion, ResolvedMigration};
+use crate::migration::{MigrationVersion, ResolvedMigration, scan_migrations};
 use crate::placeholder::{build_placeholders, replace_placeholders};
 
 /// How many / which versions to undo.
+///
+/// `Last` and `Count` walk the currently-applied versions in descending
+/// *version* order, which is not necessarily installation order — with
+/// `out_of_order` enabled a lower version can be installed later. Undo is
+/// defined on version order so that it is the inverse of migrate.
 #[derive(Debug, Clone)]
 pub enum UndoTarget {
-    /// Undo the single most recently applied migration.
+    /// Undo the highest currently-applied version.
     Last,
     /// Undo all migrations above this version (the target version itself stays applied).
     Version(MigrationVersion),
-    /// Undo the last N applied migrations in reverse order.
+    /// Undo the N highest currently-applied versions, highest first.
     Count(usize),
 }
 
@@ -331,11 +336,11 @@ async fn run_undo(
     Ok(report)
 }
 
-// ── Dialect-aware entry + MySQL path (Phase 1+: manual U-files only) ──────────
+// ── Dialect-aware entry + MySQL path ─────────────────────────────────────────
 //
-// MySQL undo deliberately supports manual U{version}__*.sql files only. Auto-
-// reversal generation requires schema introspection which is deferred (the
-// `reversal::get_reversal` path is PG-specific).
+// Both engines resolve an undo the same way: a manual `U{version}__*.sql` file
+// takes precedence, falling back to the auto-generated reversal SQL stored in
+// the history table when `[reversals] enabled` is set.
 
 /// Execute the undo command (dialect-aware entry).
 pub async fn execute_db(

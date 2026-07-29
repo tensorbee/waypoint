@@ -11,14 +11,15 @@ use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 
 use crate::commands::migrate::{
-    should_run_in_environment, GuardAction, MigrateDetail, MigrateReport,
+    GuardAction, MigrateDetail, MigrateReport, PendingCriteria, classify_ensure, classify_require,
+    guard_parse_error, select_pending,
 };
 use crate::config::WaypointConfig;
 use crate::db;
 use crate::error::{Result, WaypointError};
 use crate::history;
 use crate::hooks::{self, HookType, ResolvedHook};
-use crate::migration::{scan_migrations, MigrationVersion, ResolvedMigration};
+use crate::migration::{MigrationVersion, ResolvedMigration, scan_migrations};
 use crate::placeholder::{build_placeholders, replace_placeholders};
 
 /// Common state prepared by `prepare_migrate()` for both run modes.
@@ -59,13 +60,13 @@ async fn prepare_migrate<'a>(
 
     history::create_history_table(client, schema, table).await?;
 
-    if config.migrations.validate_on_migrate {
-        if let Err(e) = crate::commands::validate::execute(client, config).await {
-            match &e {
-                WaypointError::ValidationFailed(_) => return Err(e),
-                _ => {
-                    log::debug!("Validation skipped: {}", e);
-                }
+    if config.migrations.validate_on_migrate
+        && let Err(e) = crate::commands::validate::execute(client, config).await
+    {
+        match &e {
+            WaypointError::ValidationFailed(_) => return Err(e),
+            _ => {
+                log::debug!("Validation skipped: {}", e);
             }
         }
     }
@@ -145,126 +146,58 @@ async fn prepare_migrate<'a>(
     })
 }
 
-/// Filter resolved migrations down to pending versioned ones, applying
-/// baseline/target/out-of-order checks.
-fn filter_pending_versioned<'a>(
-    versioned: &[&'a ResolvedMigration],
-    setup: &MigrateSetup<'_>,
-    config: &WaypointConfig,
-) -> Result<Vec<&'a ResolvedMigration>> {
-    let mut pending = Vec::new();
-    for migration in versioned {
-        let version = migration.version().unwrap();
-
-        if setup.effective_versions.contains(&version.raw) {
-            continue;
+impl MigrateSetup<'_> {
+    /// Selection criteria for [`select_pending`], derived from this setup.
+    fn criteria<'s>(&'s self, config: &'s WaypointConfig) -> PendingCriteria<'s> {
+        PendingCriteria {
+            effective_versions: &self.effective_versions,
+            baseline_version: self.baseline_version.as_ref(),
+            target: self.target.as_ref(),
+            highest_applied: self.highest_applied.as_ref(),
+            applied_scripts: &self.applied_scripts,
+            current_env: self.current_env,
+            out_of_order: config.migrations.out_of_order,
+            dependency_ordering: config.migrations.dependency_ordering,
         }
-
-        if let Some(ref bv) = setup.baseline_version {
-            if version <= bv {
-                log::debug!("Skipping {} (below baseline)", migration.script);
-                continue;
-            }
-        }
-
-        if let Some(ref tv) = setup.target {
-            if version > tv {
-                log::debug!("Skipping {} (above target {})", migration.script, tv);
-                break;
-            }
-        }
-
-        if !config.migrations.out_of_order {
-            if let Some(ref highest) = setup.highest_applied {
-                if version < highest {
-                    return Err(WaypointError::OutOfOrder {
-                        version: version.raw.clone(),
-                        highest: highest.raw.clone(),
-                    });
-                }
-            }
-        }
-
-        pending.push(*migration);
     }
-    Ok(pending)
-}
-
-/// Filter resolved migrations down to pending repeatable ones (checksum changed or new).
-fn filter_pending_repeatables<'a>(
-    repeatables: &[&'a ResolvedMigration],
-    setup: &MigrateSetup<'_>,
-) -> Vec<&'a ResolvedMigration> {
-    let mut pending = Vec::new();
-    for migration in repeatables {
-        if let Some(&applied_checksum) = setup.applied_scripts.get(&migration.script) {
-            if applied_checksum == Some(migration.checksum) {
-                continue;
-            }
-        }
-        pending.push(*migration);
-    }
-    pending
 }
 
 /// Evaluate all `-- waypoint:require` guard preconditions for a migration.
+///
+/// Policy handling lives in [`crate::commands::migrate::classify_require`] so
+/// that PostgreSQL and MySQL report guard failures identically; only the
+/// evaluation call differs between the two.
 async fn evaluate_require_guards(
     client: &Client,
     schema: &str,
     migration: &ResolvedMigration,
     config: &WaypointConfig,
 ) -> Result<GuardAction> {
-    if migration.directives.require.is_empty() {
+    if !config.guards.enabled || migration.directives.require.is_empty() {
         return Ok(GuardAction::Continue);
     }
 
     for expr_str in &migration.directives.require {
-        match crate::guard::parse(expr_str) {
-            Ok(expr) => match crate::guard::evaluate(client, schema, &expr).await {
-                Ok(true) => {}
-                Ok(false) => match config.guards.on_require_fail {
-                    crate::guard::OnRequireFail::Skip => {
-                        log::info!(
-                            "Guard require failed, skipping migration; script={}, expr={}",
-                            migration.script,
-                            expr_str
-                        );
-                        return Ok(GuardAction::Skip);
-                    }
-                    crate::guard::OnRequireFail::Warn => log::warn!(
-                        "Guard require failed (continuing); script={}, expr={}",
-                        migration.script,
-                        expr_str
-                    ),
-                    crate::guard::OnRequireFail::Error => {
-                        return Ok(GuardAction::Error(WaypointError::GuardFailed {
-                            kind: "require".to_string(),
-                            script: migration.script.clone(),
-                            expression: expr_str.clone(),
-                        }));
-                    }
-                },
-                Err(e) => {
-                    log::warn!(
-                        "Guard evaluation error; script={}, expr={}, error={}",
-                        migration.script,
-                        expr_str,
-                        e
-                    );
-                    return Ok(GuardAction::Error(WaypointError::GuardFailed {
-                        kind: "require".to_string(),
-                        script: migration.script.clone(),
-                        expression: format!("{} (evaluation error: {})", expr_str, e),
-                    }));
-                }
-            },
+        let expr = match crate::guard::parse(expr_str) {
+            Ok(expr) => expr,
             Err(e) => {
-                return Ok(GuardAction::Error(WaypointError::GuardFailed {
-                    kind: "require".to_string(),
-                    script: migration.script.clone(),
-                    expression: format!("{} (parse error: {})", expr_str, e),
-                }));
+                return Ok(GuardAction::Error(guard_parse_error(
+                    "require",
+                    &migration.script,
+                    expr_str,
+                    &e,
+                )));
             }
+        };
+        let outcome = crate::guard::evaluate(client, schema, &expr).await;
+        match classify_require(
+            outcome,
+            expr_str,
+            &migration.script,
+            &config.guards.on_require_fail,
+        ) {
+            GuardAction::Continue => {}
+            other => return Ok(other),
         }
     }
     Ok(GuardAction::Continue)
@@ -275,39 +208,25 @@ async fn evaluate_ensure_guards(
     client: &Client,
     schema: &str,
     migration: &ResolvedMigration,
+    config: &WaypointConfig,
 ) -> Result<()> {
+    if !config.guards.enabled {
+        return Ok(());
+    }
     for expr_str in &migration.directives.ensure {
-        match crate::guard::parse(expr_str) {
-            Ok(expr) => match crate::guard::evaluate(client, schema, &expr).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(WaypointError::GuardFailed {
-                        kind: "ensure".to_string(),
-                        script: migration.script.clone(),
-                        expression: expr_str.clone(),
-                    });
-                }
-                Err(e) => {
-                    return Err(WaypointError::GuardFailed {
-                        kind: "ensure".to_string(),
-                        script: migration.script.clone(),
-                        expression: format!("{} (evaluation error: {})", expr_str, e),
-                    });
-                }
-            },
-            Err(e) => {
-                return Err(WaypointError::GuardFailed {
-                    kind: "ensure".to_string(),
-                    script: migration.script.clone(),
-                    expression: format!("{} (parse error: {})", expr_str, e),
-                });
-            }
-        }
+        let expr = crate::guard::parse(expr_str)
+            .map_err(|e| guard_parse_error("ensure", &migration.script, expr_str, &e))?;
+        let outcome = crate::guard::evaluate(client, schema, &expr).await;
+        classify_ensure(outcome, expr_str, &migration.script)?;
     }
     Ok(())
 }
 
 /// Execute the migrate command.
+#[deprecated(
+    since = "0.6.0",
+    note = "Superseded by `execute_with_options`, which additionally takes the `force` flag. Will be removed in 1.0."
+)]
 pub async fn execute(
     client: &Client,
     config: &WaypointConfig,
@@ -386,17 +305,14 @@ async fn run_migrate(
     report.hooks_executed += count;
     report.hooks_time_ms += ms;
 
-    let versioned: Vec<&ResolvedMigration> = setup
-        .resolved
-        .iter()
-        .filter(|m| m.is_versioned())
-        .filter(|m| should_run_in_environment(&m.directives, setup.current_env))
-        .collect();
+    let pending = select_pending(&setup.resolved, &setup.criteria(config))?;
 
-    let pending_versioned = filter_pending_versioned(&versioned, &setup, config)?;
-
-    for migration in &pending_versioned {
-        let version = migration.version().unwrap();
+    for migration in &pending.versioned {
+        // `select_pending` only yields versioned migrations here.
+        let version = match migration.version() {
+            Some(v) => v,
+            None => continue,
+        };
 
         let each_placeholders = build_placeholders(
             &config.placeholders,
@@ -448,7 +364,7 @@ async fn run_migrate(
             None
         };
 
-        let has_ensure_guards = !migration.directives.ensure.is_empty();
+        let has_ensure_guards = config.guards.enabled && !migration.directives.ensure.is_empty();
         let exec_time = apply_migration(
             client,
             config,
@@ -463,7 +379,8 @@ async fn run_migrate(
         .await?;
 
         if has_ensure_guards {
-            if let Err(guard_err) = evaluate_ensure_guards(client, schema, migration).await {
+            if let Err(guard_err) = evaluate_ensure_guards(client, schema, migration, config).await
+            {
                 if let Err(rollback_err) = client.batch_execute("ROLLBACK").await {
                     log::error!(
                         "Failed to rollback after ensure guard failure: {}",
@@ -475,45 +392,44 @@ async fn run_migrate(
             client.batch_execute("COMMIT").await?;
         }
 
-        if let Some(ref before) = before_snapshot {
-            if let Some(ver) = migration.version() {
-                match crate::reversal::generate_reversal(
-                    client,
-                    schema,
-                    before,
-                    config.reversals.warn_data_loss,
-                )
-                .await
-                {
-                    Ok(result) => {
-                        if let Some(ref reversal_sql) = result.reversal_sql {
-                            if let Err(e) = crate::reversal::store_reversal(
-                                client,
-                                schema,
-                                table,
-                                &ver.raw,
-                                reversal_sql,
-                            )
-                            .await
-                            {
-                                log::warn!(
-                                    "Failed to store reversal SQL; version={}, error={}",
-                                    ver.raw,
-                                    e
-                                );
-                            }
-                        }
-                        for warning in &result.warnings {
-                            log::warn!("Reversal warning for {}: {}", migration.script, warning);
-                        }
-                    }
-                    Err(e) => {
+        if let Some(ref before) = before_snapshot
+            && let Some(ver) = migration.version()
+        {
+            match crate::reversal::generate_reversal(
+                client,
+                schema,
+                before,
+                config.reversals.warn_data_loss,
+            )
+            .await
+            {
+                Ok(result) => {
+                    if let Some(ref reversal_sql) = result.reversal_sql
+                        && let Err(e) = crate::reversal::store_reversal(
+                            client,
+                            schema,
+                            table,
+                            &ver.raw,
+                            reversal_sql,
+                        )
+                        .await
+                    {
                         log::warn!(
-                            "Failed to generate reversal; script={}, error={}",
-                            migration.script,
+                            "Failed to store reversal SQL; version={}, error={}",
+                            ver.raw,
                             e
                         );
                     }
+                    for warning in &result.warnings {
+                        log::warn!("Reversal warning for {}: {}", migration.script, warning);
+                    }
+                }
+                Err(e) => {
+                    log::warn!(
+                        "Failed to generate reversal; script={}, error={}",
+                        migration.script,
+                        e
+                    );
                 }
             }
         }
@@ -538,22 +454,21 @@ async fn run_migrate(
         });
     }
 
-    let repeatables: Vec<&ResolvedMigration> = setup
-        .resolved
-        .iter()
-        .filter(|m| !m.is_versioned() && !m.is_undo())
-        .filter(|m| should_run_in_environment(&m.directives, setup.current_env))
-        .collect();
-
-    for migration in &repeatables {
-        if let Some(&applied_checksum) = setup.applied_scripts.get(&migration.script) {
-            if applied_checksum == Some(migration.checksum) {
-                continue;
-            }
+    for migration in &pending.repeatables {
+        if setup.applied_scripts.contains_key(&migration.script) {
             log::info!(
                 "Re-applying changed repeatable migration; migration={}",
                 migration.script
             );
+        }
+
+        // Repeatable migrations honour `require` guards too — the same
+        // precondition semantics as versioned ones. (`ensure` guards need the
+        // hold-transaction path, which repeatables do not use.)
+        match evaluate_require_guards(client, schema, migration, config).await? {
+            GuardAction::Continue => {}
+            GuardAction::Skip => continue,
+            GuardAction::Error(e) => return Err(e),
         }
 
         let each_placeholders = build_placeholders(
@@ -644,7 +559,13 @@ mod batch_regexes {
 }
 
 /// Check that a migration's SQL does not contain statements that cannot run inside a transaction.
-fn validate_batch_compatible(script: &str, sql: &str) -> Result<()> {
+///
+/// Analysis runs against a comment-blanked copy, matching how `lint` works: a
+/// `-- remember to VACUUM later` note must not make batch mode reject the file.
+/// `strip_comments` preserves byte offsets, so the regexes below still line up
+/// with the original source.
+fn validate_batch_compatible(script: &str, raw_sql: &str) -> Result<()> {
+    let sql = &crate::sql_parser::strip_comments(raw_sql);
     let upper = sql.to_uppercase();
 
     if upper.contains("CONCURRENTLY") {
@@ -715,24 +636,9 @@ async fn run_batch_migrate(
 
     let setup = prepare_migrate(client, config, target_version).await?;
 
-    let current_env = setup.current_env;
-
-    let versioned: Vec<&ResolvedMigration> = setup
-        .resolved
-        .iter()
-        .filter(|m| m.is_versioned())
-        .filter(|m| should_run_in_environment(&m.directives, current_env))
-        .collect();
-
-    let mut pending_versioned = filter_pending_versioned(&versioned, &setup, config)?;
-
-    let repeatables: Vec<&ResolvedMigration> = setup
-        .resolved
-        .iter()
-        .filter(|m| !m.is_versioned() && !m.is_undo())
-        .filter(|m| should_run_in_environment(&m.directives, current_env))
-        .collect();
-    let pending_repeatables = filter_pending_repeatables(&repeatables, &setup);
+    let pending = select_pending(&setup.resolved, &setup.criteria(config))?;
+    let mut pending_versioned = pending.versioned;
+    let pending_repeatables = pending.repeatables;
 
     let placeholders_map = build_placeholders(
         &config.placeholders,
@@ -989,51 +895,61 @@ async fn run_batch_migrate(
             client.batch_execute("COMMIT").await?;
             report.total_time_ms = batch_start.elapsed().as_millis() as i32;
 
-            if let Some(ref before) = before_snapshot {
-                for migration in &pending_versioned {
-                    if let Some(ver) = migration.version() {
-                        match crate::reversal::generate_reversal(
-                            client,
-                            schema,
-                            before,
-                            config.reversals.warn_data_loss,
-                        )
-                        .await
+            // The batch ran as one transaction, so there is exactly one
+            // reversal: the diff from the pre-batch snapshot to the final
+            // state. Generate it once and store it against the *highest*
+            // applied version only.
+            //
+            // Storing it against every version (as an earlier revision did)
+            // would make `undo` of any single migration revert the whole
+            // batch, and re-running `generate_reversal` per migration re-ran a
+            // full schema introspection for an identical result.
+            //
+            // Undoing a batch is therefore all-or-nothing, mirroring how it
+            // was applied: undoing the highest version reverts the batch, and
+            // the lower versions carry no reversal of their own.
+            if let Some(ref before) = before_snapshot
+                && let Some(highest) = pending_versioned
+                    .iter()
+                    .filter_map(|m| m.version())
+                    .max()
+                    .map(|v| v.raw.clone())
+            {
+                match crate::reversal::generate_reversal(
+                    client,
+                    schema,
+                    before,
+                    config.reversals.warn_data_loss,
+                )
+                .await
+                {
+                    Ok(result) => {
+                        if let Some(ref reversal_sql) = result.reversal_sql
+                            && let Err(e) = crate::reversal::store_reversal(
+                                client,
+                                schema,
+                                table,
+                                &highest,
+                                reversal_sql,
+                            )
+                            .await
                         {
-                            Ok(result) => {
-                                if let Some(ref reversal_sql) = result.reversal_sql {
-                                    if let Err(e) = crate::reversal::store_reversal(
-                                        client,
-                                        schema,
-                                        table,
-                                        &ver.raw,
-                                        reversal_sql,
-                                    )
-                                    .await
-                                    {
-                                        log::warn!(
-                                            "Failed to store reversal SQL; version={}, error={}",
-                                            ver.raw,
-                                            e
-                                        );
-                                    }
-                                }
-                                for warning in &result.warnings {
-                                    log::warn!(
-                                        "Reversal warning for {}: {}",
-                                        migration.script,
-                                        warning
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                log::warn!(
-                                    "Failed to generate reversal; script={}, error={}",
-                                    migration.script,
-                                    e
-                                );
-                            }
+                            log::warn!(
+                                "Failed to store batch reversal SQL; version={}, error={}",
+                                highest,
+                                e
+                            );
                         }
+                        for warning in &result.warnings {
+                            log::warn!("Batch reversal warning ({}): {}", highest, warning);
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to generate batch reversal; version={}, error={}",
+                            highest,
+                            e
+                        );
                     }
                 }
             }
@@ -1232,5 +1148,21 @@ mod tests {
             "CREATE TABLE users (id SERIAL PRIMARY KEY); CREATE INDEX idx_users ON users (id);";
         let result = validate_batch_compatible("V1__Init.sql", sql);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_batch_compatible_ignores_keywords_in_comments() {
+        // Keywords inside comments must not trip the non-transactional check.
+        let sql = "-- remember to VACUUM this table afterwards\n\
+                   /* also consider CREATE INDEX CONCURRENTLY next release */\n\
+                   CREATE TABLE users (id SERIAL PRIMARY KEY);";
+        let result = validate_batch_compatible("V1__Init.sql", sql);
+        assert!(result.is_ok(), "unexpected error: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_batch_compatible_still_catches_real_statement_after_comment() {
+        let sql = "-- this migration builds an index\nCREATE INDEX CONCURRENTLY i ON t (c);";
+        assert!(validate_batch_compatible("V2__Idx.sql", sql).is_err());
     }
 }

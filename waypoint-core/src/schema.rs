@@ -16,7 +16,7 @@ use serde::Serialize;
 #[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
-use crate::db::{quote_ident, DbClient};
+use crate::db::{DbClient, quote_ident};
 use crate::dialect::DialectKind;
 use crate::error::Result;
 #[cfg(any(not(feature = "postgres"), not(feature = "mysql")))]

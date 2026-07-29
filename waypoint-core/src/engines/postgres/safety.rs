@@ -5,8 +5,8 @@ use tokio_postgres::Client;
 
 use crate::error::{Result, WaypointError};
 use crate::safety::{
-    affected_table, classify_row_count, compute_verdict, is_data_loss, LockLevel, SafetyConfig,
-    SafetyReport, SafetyVerdict, StatementAnalysis, TableSize,
+    LockLevel, SafetyConfig, SafetyReport, SafetyVerdict, StatementAnalysis, TableSize,
+    affected_table, classify_row_count, compute_verdict, is_data_loss,
 };
 use crate::sql_parser::DdlOperation;
 

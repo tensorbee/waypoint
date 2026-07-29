@@ -139,6 +139,12 @@ pub struct DatabaseConfig {
     pub statement_timeout_secs: u32,
     /// TCP keepalive interval in seconds (0 disables, default 120).
     pub keepalive_secs: u32,
+    /// Which engine the host/port/user/database fields describe.
+    ///
+    /// Only consulted when `url` is unset. With a `url`, the engine is derived
+    /// from its scheme (`postgres://` / `mysql://`). Defaults to PostgreSQL,
+    /// which is what the field-based form always produced historically.
+    pub engine: crate::dialect::DialectKind,
 }
 
 impl Default for DatabaseConfig {
@@ -155,6 +161,7 @@ impl Default for DatabaseConfig {
             connect_timeout_secs: 30,
             statement_timeout_secs: 0,
             keepalive_secs: 120,
+            engine: crate::dialect::DialectKind::Postgres,
         }
     }
 }
@@ -173,6 +180,7 @@ impl fmt::Debug for DatabaseConfig {
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("statement_timeout_secs", &self.statement_timeout_secs)
             .field("keepalive_secs", &self.keepalive_secs)
+            .field("engine", &self.engine)
             .finish()
     }
 }
@@ -284,6 +292,7 @@ struct TomlDatabaseConfig {
     connect_timeout: Option<u32>,
     statement_timeout: Option<u32>,
     keepalive: Option<u32>,
+    engine: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -343,6 +352,7 @@ struct TomlHooksConfig {
 
 #[derive(Deserialize, Default)]
 struct TomlGuardsConfig {
+    enabled: Option<bool>,
     on_require_fail: Option<String>,
 }
 
@@ -426,7 +436,11 @@ impl WaypointConfig {
                 if let Ok(meta) = std::fs::metadata(toml_path) {
                     let mode = meta.permissions().mode();
                     if mode & 0o077 != 0 {
-                        log::warn!("Config file has overly permissive permissions. Consider chmod 600.; path={}, mode={:o}", toml_path, mode);
+                        log::warn!(
+                            "Config file has overly permissive permissions. Consider chmod 600.; path={}, mode={:o}",
+                            toml_path,
+                            mode
+                        );
                     }
                 }
             }
@@ -485,6 +499,15 @@ impl WaypointConfig {
             apply_option!(db.connect_timeout => self.database.connect_timeout_secs);
             apply_option!(db.statement_timeout => self.database.statement_timeout_secs);
             apply_option!(db.keepalive => self.database.keepalive_secs);
+            if let Some(v) = db.engine {
+                match v.parse() {
+                    Ok(kind) => self.database.engine = kind,
+                    Err(_) => log::warn!(
+                        "Invalid engine '{}' in config, using default 'postgres'. Valid values: postgres, mysql",
+                        v
+                    ),
+                }
+            }
         }
 
         if let Some(m) = toml.migrations {
@@ -544,6 +567,7 @@ impl WaypointConfig {
         }
 
         if let Some(g) = toml.guards {
+            apply_option!(g.enabled => self.guards.enabled);
             if let Some(v) = g.on_require_fail {
                 match v.parse() {
                     Ok(policy) => self.guards.on_require_fail = policy,
@@ -581,7 +605,21 @@ impl WaypointConfig {
             let mut named_dbs = Vec::new();
             for db in databases {
                 let name = db.name.unwrap_or_default();
-                let mut db_config = DatabaseConfig::default();
+                // Inherit the top-level `[database]` tuning (ssl_mode,
+                // timeouts, keepalive, retries) — those are transport policy
+                // that should apply to every target — while clearing the
+                // connection *identity* fields, which each entry supplies via
+                // its own `url`. `[database]` is applied above, so `self` is
+                // already populated at this point.
+                let mut db_config = DatabaseConfig {
+                    url: None,
+                    host: None,
+                    port: None,
+                    user: None,
+                    password: None,
+                    database: None,
+                    ..self.database.clone()
+                };
                 apply_option_some!(db.url => db_config.url);
                 // Check for per-database env var
                 let env_url_key = format!("WAYPOINT_DB_{}_URL", name.to_uppercase());
@@ -646,10 +684,10 @@ impl WaypointConfig {
         if let Ok(v) = std::env::var("WAYPOINT_DATABASE_HOST") {
             self.database.host = Some(v);
         }
-        if let Ok(v) = std::env::var("WAYPOINT_DATABASE_PORT") {
-            if let Ok(port) = v.parse::<u16>() {
-                self.database.port = Some(port);
-            }
+        if let Ok(v) = std::env::var("WAYPOINT_DATABASE_PORT")
+            && let Ok(port) = v.parse::<u16>()
+        {
+            self.database.port = Some(port);
         }
         if let Ok(v) = std::env::var("WAYPOINT_DATABASE_USER") {
             self.database.user = Some(v);
@@ -660,25 +698,25 @@ impl WaypointConfig {
         if let Ok(v) = std::env::var("WAYPOINT_DATABASE_NAME") {
             self.database.database = Some(v);
         }
-        if let Ok(v) = std::env::var("WAYPOINT_CONNECT_RETRIES") {
-            if let Ok(n) = v.parse::<u32>() {
-                self.database.connect_retries = n;
-            }
+        if let Ok(v) = std::env::var("WAYPOINT_CONNECT_RETRIES")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.database.connect_retries = n;
         }
-        if let Ok(v) = std::env::var("WAYPOINT_SSL_MODE") {
-            if let Ok(mode) = v.parse() {
-                self.database.ssl_mode = mode;
-            }
+        if let Ok(v) = std::env::var("WAYPOINT_SSL_MODE")
+            && let Ok(mode) = v.parse()
+        {
+            self.database.ssl_mode = mode;
         }
-        if let Ok(v) = std::env::var("WAYPOINT_CONNECT_TIMEOUT") {
-            if let Ok(n) = v.parse::<u32>() {
-                self.database.connect_timeout_secs = n;
-            }
+        if let Ok(v) = std::env::var("WAYPOINT_CONNECT_TIMEOUT")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.database.connect_timeout_secs = n;
         }
-        if let Ok(v) = std::env::var("WAYPOINT_STATEMENT_TIMEOUT") {
-            if let Ok(n) = v.parse::<u32>() {
-                self.database.statement_timeout_secs = n;
-            }
+        if let Ok(v) = std::env::var("WAYPOINT_STATEMENT_TIMEOUT")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.database.statement_timeout_secs = n;
         }
         if let Ok(v) = std::env::var("WAYPOINT_MIGRATIONS_LOCATIONS") {
             self.migrations.locations =
@@ -691,10 +729,19 @@ impl WaypointConfig {
             self.migrations.schema = v;
         }
 
-        if let Ok(v) = std::env::var("WAYPOINT_KEEPALIVE") {
-            if let Ok(n) = v.parse::<u32>() {
-                self.database.keepalive_secs = n;
+        if let Ok(v) = std::env::var("WAYPOINT_DATABASE_ENGINE") {
+            match v.parse() {
+                Ok(kind) => self.database.engine = kind,
+                Err(_) => log::warn!(
+                    "Invalid WAYPOINT_DATABASE_ENGINE '{}', using default 'postgres'",
+                    v
+                ),
             }
+        }
+        if let Ok(v) = std::env::var("WAYPOINT_KEEPALIVE")
+            && let Ok(n) = v.parse::<u32>()
+        {
+            self.database.keepalive_secs = n;
         }
         if let Ok(v) = std::env::var("WAYPOINT_BATCH_TRANSACTION") {
             self.migrations.batch_transaction = v == "1" || v.eq_ignore_ascii_case("true");
@@ -736,16 +783,28 @@ impl WaypointConfig {
     }
 
     /// Build a connection string from the config.
-    /// Prefers `url` if set; otherwise builds from individual fields.
-    /// Handles JDBC-style URLs by stripping the `jdbc:` prefix and
-    /// extracting `user` and `password` query parameters.
+    ///
+    /// Prefers `url` if set; otherwise builds from the individual `host` /
+    /// `port` / `user` / `password` / `database` fields, in the shape the
+    /// configured [`DatabaseConfig::engine`] expects:
+    ///
+    /// - PostgreSQL → libpq key=value (`host=… port=… user=… dbname=…`)
+    /// - MySQL → a `mysql://` URL, so that engine auto-detection still works
+    ///
+    /// Handles JDBC-style URLs by stripping the `jdbc:` prefix and extracting
+    /// `user` and `password` query parameters.
     pub fn connection_string(&self) -> Result<String> {
         if let Some(ref url) = self.database.url {
             return Ok(normalize_jdbc_url(url));
         }
 
+        let engine = self.database.engine;
         let host = self.database.host.as_deref().unwrap_or("localhost");
-        let port = self.database.port.unwrap_or(5432);
+        let default_port = match engine {
+            crate::dialect::DialectKind::Postgres => 5432,
+            crate::dialect::DialectKind::Mysql => 3306,
+        };
+        let port = self.database.port.unwrap_or(default_port);
         let user =
             self.database.user.as_deref().ok_or_else(|| {
                 WaypointError::ConfigError("Database user is required".to_string())
@@ -755,19 +814,55 @@ impl WaypointConfig {
                 WaypointError::ConfigError("Database name is required".to_string())
             })?;
 
-        let mut url = format!(
-            "host={} port={} user={} dbname={}",
-            host, port, user, database
-        );
-
-        if let Some(ref password) = self.database.password {
-            // Quote password to handle special characters (spaces, quotes, etc.)
-            let escaped = password.replace('\\', "\\\\").replace('\'', "\\'");
-            url.push_str(&format!(" password='{}'", escaped));
+        match engine {
+            crate::dialect::DialectKind::Mysql => {
+                // A URL, not key=value: `DialectKind::from_url` has to be able
+                // to route this to the MySQL backend. Credentials are
+                // percent-encoded so specials in the password stay inside the
+                // userinfo section.
+                let auth = match self.database.password {
+                    Some(ref password) => format!(
+                        "{}:{}",
+                        percent_encode_userinfo(user),
+                        percent_encode_userinfo(password)
+                    ),
+                    None => percent_encode_userinfo(user),
+                };
+                Ok(format!("mysql://{}@{}:{}/{}", auth, host, port, database))
+            }
+            crate::dialect::DialectKind::Postgres => {
+                let mut url = format!(
+                    "host={} port={} user={} dbname={}",
+                    host, port, user, database
+                );
+                if let Some(ref password) = self.database.password {
+                    // Quote password to handle special characters (spaces, quotes, etc.)
+                    let escaped = password.replace('\\', "\\\\").replace('\'', "\\'");
+                    url.push_str(&format!(" password='{}'", escaped));
+                }
+                Ok(url)
+            }
         }
-
-        Ok(url)
     }
+}
+
+/// Percent-encode a URL userinfo component (username or password).
+///
+/// Everything outside the RFC 3986 unreserved set is escaped, so a password
+/// containing `@`, `:`, `/`, `?` or `#` cannot break out of the userinfo
+/// section and corrupt the authority. Hand-rolled rather than pulling in a
+/// dependency for ~15 lines.
+fn percent_encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
 }
 
 /// Normalize a JDBC-style URL to a standard PostgreSQL connection string.
@@ -776,6 +871,10 @@ impl WaypointConfig {
 ///   - `jdbc:postgresql://host:port/db?user=x&password=y`  →  `postgresql://x:y@host:port/db`
 ///   - `postgresql://...` passed through as-is
 ///   - `postgres://...` passed through as-is
+///
+/// Credentials lifted out of the query string are percent-encoded on the way
+/// into the authority; otherwise a password like `p@ss` would produce
+/// `postgres://user:p@ss@host/db`, which does not parse as intended.
 fn normalize_jdbc_url(url: &str) -> String {
     // Strip jdbc: prefix
     let url = url.strip_prefix("jdbc:").unwrap_or(url);
@@ -797,31 +896,34 @@ fn normalize_jdbc_url(url: &str) -> String {
         }
 
         // If we extracted user/password, rebuild the URL with credentials in the authority
-        if user.is_some() || password.is_some() {
-            if let Some(rest) = base
+        if (user.is_some() || password.is_some())
+            && let Some(rest) = base
                 .strip_prefix("postgresql://")
                 .or_else(|| base.strip_prefix("postgres://"))
-            {
-                let scheme = if base.starts_with("postgresql://") {
-                    "postgresql"
-                } else {
-                    "postgres"
-                };
+        {
+            let scheme = if base.starts_with("postgresql://") {
+                "postgresql"
+            } else {
+                "postgres"
+            };
 
-                let auth = match (user, password) {
-                    (Some(u), Some(p)) => format!("{}:{}@", u, p),
-                    (Some(u), None) => format!("{}@", u),
-                    (None, Some(p)) => format!(":{p}@"),
-                    (None, None) => String::new(),
-                };
+            let auth = match (user, password) {
+                (Some(u), Some(p)) => format!(
+                    "{}:{}@",
+                    percent_encode_userinfo(&u),
+                    percent_encode_userinfo(&p)
+                ),
+                (Some(u), None) => format!("{}@", percent_encode_userinfo(&u)),
+                (None, Some(p)) => format!(":{}@", percent_encode_userinfo(&p)),
+                (None, None) => String::new(),
+            };
 
-                let mut result = format!("{}://{}{}", scheme, auth, rest);
-                if !other_params.is_empty() {
-                    result.push('?');
-                    result.push_str(&other_params.join("&"));
-                }
-                return result;
+            let mut result = format!("{}://{}{}", scheme, auth, rest);
+            if !other_params.is_empty() {
+                result.push('?');
+                result.push_str(&other_params.join("&"));
             }
+            return result;
         }
 
         // No user/password in query, return with jdbc: stripped
@@ -1045,5 +1147,84 @@ app_name = "myapp"
         };
         let conn = config.connection_string().unwrap();
         assert!(conn.contains("password='p@ss\\'w ord'"));
+    }
+
+    #[test]
+    fn test_connection_string_mysql_from_fields() {
+        let config = WaypointConfig {
+            database: DatabaseConfig {
+                engine: crate::dialect::DialectKind::Mysql,
+                host: Some("db.internal".to_string()),
+                user: Some("app".to_string()),
+                password: Some("s3cr3t".to_string()),
+                database: Some("shop".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Defaults to the MySQL port and emits a URL the engine detector routes.
+        assert_eq!(
+            config.connection_string().unwrap(),
+            "mysql://app:s3cr3t@db.internal:3306/shop"
+        );
+        assert_eq!(
+            crate::dialect::DialectKind::from_url(&config.connection_string().unwrap()),
+            Some(crate::dialect::DialectKind::Mysql)
+        );
+    }
+
+    #[test]
+    fn test_connection_string_mysql_percent_encodes_password() {
+        let config = WaypointConfig {
+            database: DatabaseConfig {
+                engine: crate::dialect::DialectKind::Mysql,
+                host: Some("h".to_string()),
+                port: Some(13306),
+                user: Some("u".to_string()),
+                password: Some("p@ss/word".to_string()),
+                database: Some("d".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            config.connection_string().unwrap(),
+            "mysql://u:p%40ss%2Fword@h:13306/d"
+        );
+    }
+
+    #[test]
+    fn test_normalize_jdbc_url_percent_encodes_credentials() {
+        // An unencoded `@` in the password would break the authority.
+        let url = "jdbc:postgresql://myhost:5432/mydb?user=adm%69n&password=p@ss";
+        assert_eq!(
+            normalize_jdbc_url(url),
+            "postgresql://adm%2569n:p%40ss@myhost:5432/mydb"
+        );
+    }
+
+    #[test]
+    fn test_engine_defaults_to_postgres() {
+        let config = WaypointConfig::default();
+        assert_eq!(
+            config.database.engine,
+            crate::dialect::DialectKind::Postgres
+        );
+    }
+
+    #[test]
+    fn test_toml_engine_key() {
+        let toml_str = r#"
+[database]
+engine = "mysql"
+host = "localhost"
+user = "root"
+database = "app"
+"#;
+        let toml_config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut config = WaypointConfig::default();
+        config.apply_toml(toml_config);
+        assert_eq!(config.database.engine, crate::dialect::DialectKind::Mysql);
+        assert!(config.connection_string().unwrap().starts_with("mysql://"));
     }
 }

@@ -12,6 +12,8 @@ use tokio_postgres::Client;
 
 use crate::config::WaypointConfig;
 use crate::db::DbClient;
+#[cfg(feature = "mysql")]
+use crate::db::quote_ident_mysql as qi;
 use crate::dialect::DialectKind;
 use crate::error::{Result, WaypointError};
 #[cfg(feature = "postgres")]
@@ -141,6 +143,35 @@ pub async fn execute_snapshot(
     })
 }
 
+/// Resolve a snapshot id to its `.sql` path, rejecting anything that could
+/// escape the snapshot directory.
+///
+/// `snapshot_id` reaches here straight from a CLI flag or a library caller,
+/// and the resulting file is read and then executed as SQL. `Path::join` with
+/// `../..` walks out of the directory, and with an absolute path discards the
+/// base entirely — so an unchecked id turns `restore` into "execute arbitrary
+/// file as SQL". Generated ids are `%Y%m%d_%H%M%S`, so restricting to
+/// `[A-Za-z0-9._-]` (no separators, no `..`) costs nothing.
+fn snapshot_sql_path(snapshot_config: &SnapshotConfig, snapshot_id: &str) -> Result<PathBuf> {
+    let valid = !snapshot_id.is_empty()
+        && snapshot_id != ".."
+        && snapshot_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+    if !valid {
+        return Err(WaypointError::SnapshotError {
+            reason: format!(
+                "Invalid snapshot id '{}'. Snapshot ids may contain only letters, \
+                 digits, '_', '-' and '.'.",
+                snapshot_id
+            ),
+        });
+    }
+    Ok(snapshot_config
+        .directory
+        .join(format!("{}.sql", snapshot_id)))
+}
+
 /// Restore a schema from a snapshot (PostgreSQL legacy entry).
 #[cfg(feature = "postgres")]
 pub async fn execute_restore(
@@ -150,9 +181,7 @@ pub async fn execute_restore(
     snapshot_id: &str,
 ) -> Result<RestoreReport> {
     let schema_name = &config.migrations.schema;
-    let sql_path = snapshot_config
-        .directory
-        .join(format!("{}.sql", snapshot_id));
+    let sql_path = snapshot_sql_path(snapshot_config, snapshot_id)?;
 
     if !sql_path.exists() {
         return Err(WaypointError::SnapshotError {
@@ -356,7 +385,7 @@ async fn execute_snapshot_mysql(
     ));
 
     for table_name in &tables {
-        let stmt = format!("SHOW CREATE TABLE `{}`.`{}`", schema_name, table_name);
+        let stmt = format!("SHOW CREATE TABLE {}.{}", qi(&schema_name), qi(table_name));
         let row: Option<(String, String)> = conn.query_first(&stmt).await?;
         if let Some((_, create_sql)) = row {
             ddl.push_str(&format!("-- Table: {}\n", table_name));
@@ -366,7 +395,7 @@ async fn execute_snapshot_mysql(
     }
 
     for view_name in &views {
-        let stmt = format!("SHOW CREATE VIEW `{}`.`{}`", schema_name, view_name);
+        let stmt = format!("SHOW CREATE VIEW {}.{}", qi(&schema_name), qi(view_name));
         // SHOW CREATE VIEW returns (View, Create View, character_set_client, collation_connection)
         let row: Option<(String, String, String, String)> = conn.query_first(&stmt).await?;
         if let Some((_, create_sql, _, _)) = row {
@@ -445,9 +474,7 @@ async fn execute_restore_mysql(
     use mysql_async::prelude::*;
     let pool = client.as_mysql()?;
     let schema_name = client.resolve_schema(&config.migrations.schema).await?;
-    let sql_path = snapshot_config
-        .directory
-        .join(format!("{}.sql", snapshot_id));
+    let sql_path = snapshot_sql_path(snapshot_config, snapshot_id)?;
 
     if !sql_path.exists() {
         return Err(WaypointError::SnapshotError {
@@ -465,7 +492,7 @@ async fn execute_restore_mysql(
     // Make sure we're operating against the right database. Pool URL has it,
     // but USE makes the session unambiguous and protects against connection
     // state quirks across checkout.
-    let use_stmt = format!("USE `{}`", schema_name);
+    let use_stmt = format!("USE {}", qi(&schema_name));
     conn.query_drop(&use_stmt).await?;
 
     // Wipe the database in the same destructive way PG's restore wipes the
@@ -479,7 +506,7 @@ async fn execute_restore_mysql(
         )
         .await?;
     for v in &views {
-        let s = format!("DROP VIEW IF EXISTS `{}`.`{}`", schema_name, v);
+        let s = format!("DROP VIEW IF EXISTS {}.{}", qi(&schema_name), qi(v));
         conn.query_drop(&s).await?;
     }
     let tables: Vec<String> = conn
@@ -490,7 +517,7 @@ async fn execute_restore_mysql(
         )
         .await?;
     for t in &tables {
-        let s = format!("DROP TABLE IF EXISTS `{}`.`{}`", schema_name, t);
+        let s = format!("DROP TABLE IF EXISTS {}.{}", qi(&schema_name), qi(t));
         conn.query_drop(&s).await?;
     }
     // Keep FOREIGN_KEY_CHECKS=0 across the apply phase too: MySQL validates
@@ -505,15 +532,12 @@ async fn execute_restore_mysql(
     // each terminated with `;`. We use a MySQL-aware splitter that respects
     // backtick-quoted identifiers and string literals.
     let mut objects_restored = 0;
+    // `split_mysql_statements` already trims each statement and drops the ones
+    // with no executable content (empty, or comments only), which MySQL would
+    // otherwise reject with ER_EMPTY_QUERY. A chunk that carries leading
+    // comments *plus* real DDL is kept intact and executes fine.
     for stmt in crate::sql_parser::split_mysql_statements(&sql) {
-        let trimmed = stmt.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        // MySQL accepts leading `--` comments before a statement, so we don't
-        // pre-filter comment-only chunks (the chunk may carry real DDL after
-        // the comments). If the chunk is truly comments-only it executes as
-        // a no-op.
+        let trimmed = stmt.as_str();
         match conn.query_drop(trimmed).await {
             Ok(()) => objects_restored += 1,
             Err(e) => {
@@ -653,5 +677,44 @@ mod tests_mysql_definer {
         let input =
             "CREATE TABLE `users` (\n  `id` int NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB";
         assert_eq!(strip_mysql_definer(input), input);
+    }
+}
+
+#[cfg(test)]
+mod path_safety_tests {
+    use super::*;
+
+    fn cfg() -> SnapshotConfig {
+        SnapshotConfig {
+            directory: PathBuf::from("/var/snapshots"),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn accepts_generated_ids() {
+        let p = snapshot_sql_path(&cfg(), "20260729_101500").unwrap();
+        assert_eq!(p, PathBuf::from("/var/snapshots/20260729_101500.sql"));
+    }
+
+    #[test]
+    fn rejects_parent_traversal() {
+        for bad in ["..", "../etc/passwd", "a/../../b", "sub/dir"] {
+            assert!(
+                snapshot_sql_path(&cfg(), bad).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_absolute_path() {
+        // Path::join with an absolute path discards the base directory.
+        assert!(snapshot_sql_path(&cfg(), "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_id() {
+        assert!(snapshot_sql_path(&cfg(), "").is_err());
     }
 }

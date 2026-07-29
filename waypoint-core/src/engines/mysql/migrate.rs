@@ -12,68 +12,52 @@
 use std::collections::HashMap;
 
 use crate::commands::migrate::{
-    should_run_in_environment, GuardAction, MigrateDetail, MigrateReport,
+    GuardAction, MigrateDetail, MigrateReport, PendingCriteria, classify_ensure, classify_require,
+    guard_parse_error, select_pending,
 };
 use crate::config::WaypointConfig;
 use crate::db::DbClient;
 use crate::error::{Result, WaypointError};
 use crate::history;
 use crate::hooks::{self, HookType, ResolvedHook};
-use crate::migration::{scan_migrations, MigrationVersion, ResolvedMigration};
+use crate::migration::{MigrationVersion, ResolvedMigration, scan_migrations};
 use crate::placeholder::{build_placeholders, replace_placeholders};
 
-/// Dialect-aware `require` guard evaluator. Mirrors the PG version but uses
-/// `guard::evaluate_db` so the underlying SQL is dispatched per engine.
+/// Dialect-aware `require` guard evaluator.
+///
+/// Shares its policy handling with the PostgreSQL path via
+/// [`crate::commands::migrate::classify_require`]; only `guard::evaluate_db`
+/// (which dispatches the underlying SQL per engine) differs.
 async fn evaluate_require_guards_db(
     client: &DbClient,
     schema: &str,
     migration: &ResolvedMigration,
     config: &WaypointConfig,
 ) -> Result<GuardAction> {
-    if migration.directives.require.is_empty() {
+    if !config.guards.enabled || migration.directives.require.is_empty() {
         return Ok(GuardAction::Continue);
     }
     for expr_str in &migration.directives.require {
-        match crate::guard::parse(expr_str) {
-            Ok(expr) => match crate::guard::evaluate_db(client, schema, &expr).await {
-                Ok(true) => {}
-                Ok(false) => match config.guards.on_require_fail {
-                    crate::guard::OnRequireFail::Skip => {
-                        log::info!(
-                            "Guard require failed, skipping migration; script={}, expr={}",
-                            migration.script,
-                            expr_str
-                        );
-                        return Ok(GuardAction::Skip);
-                    }
-                    crate::guard::OnRequireFail::Warn => log::warn!(
-                        "Guard require failed (continuing); script={}, expr={}",
-                        migration.script,
-                        expr_str
-                    ),
-                    crate::guard::OnRequireFail::Error => {
-                        return Ok(GuardAction::Error(WaypointError::GuardFailed {
-                            kind: "require".to_string(),
-                            script: migration.script.clone(),
-                            expression: expr_str.clone(),
-                        }));
-                    }
-                },
-                Err(e) => {
-                    return Ok(GuardAction::Error(WaypointError::GuardFailed {
-                        kind: "require".to_string(),
-                        script: migration.script.clone(),
-                        expression: format!("{} (evaluation error: {})", expr_str, e),
-                    }));
-                }
-            },
+        let expr = match crate::guard::parse(expr_str) {
+            Ok(expr) => expr,
             Err(e) => {
-                return Ok(GuardAction::Error(WaypointError::GuardFailed {
-                    kind: "require".to_string(),
-                    script: migration.script.clone(),
-                    expression: format!("{} (parse error: {})", expr_str, e),
-                }));
+                return Ok(GuardAction::Error(guard_parse_error(
+                    "require",
+                    &migration.script,
+                    expr_str,
+                    &e,
+                )));
             }
+        };
+        let outcome = crate::guard::evaluate_db(client, schema, &expr).await;
+        match classify_require(
+            outcome,
+            expr_str,
+            &migration.script,
+            &config.guards.on_require_fail,
+        ) {
+            GuardAction::Continue => {}
+            other => return Ok(other),
         }
     }
     Ok(GuardAction::Continue)
@@ -84,39 +68,25 @@ async fn evaluate_ensure_guards_db(
     client: &DbClient,
     schema: &str,
     migration: &ResolvedMigration,
+    config: &WaypointConfig,
 ) -> Result<()> {
+    if !config.guards.enabled {
+        return Ok(());
+    }
     for expr_str in &migration.directives.ensure {
-        match crate::guard::parse(expr_str) {
-            Ok(expr) => match crate::guard::evaluate_db(client, schema, &expr).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    return Err(WaypointError::GuardFailed {
-                        kind: "ensure".to_string(),
-                        script: migration.script.clone(),
-                        expression: expr_str.clone(),
-                    });
-                }
-                Err(e) => {
-                    return Err(WaypointError::GuardFailed {
-                        kind: "ensure".to_string(),
-                        script: migration.script.clone(),
-                        expression: format!("{} (evaluation error: {})", expr_str, e),
-                    });
-                }
-            },
-            Err(e) => {
-                return Err(WaypointError::GuardFailed {
-                    kind: "ensure".to_string(),
-                    script: migration.script.clone(),
-                    expression: format!("{} (parse error: {})", expr_str, e),
-                });
-            }
-        }
+        let expr = crate::guard::parse(expr_str)
+            .map_err(|e| guard_parse_error("ensure", &migration.script, expr_str, &e))?;
+        let outcome = crate::guard::evaluate_db(client, schema, &expr).await;
+        classify_ensure(outcome, expr_str, &migration.script)?;
     }
     Ok(())
 }
 
 /// Execute the migrate command (MySQL).
+#[deprecated(
+    since = "0.6.0",
+    note = "Superseded by `execute_with_options`, which additionally takes the `force` flag. Will be removed in 1.0."
+)]
 pub async fn execute(
     client: &DbClient,
     config: &WaypointConfig,
@@ -176,12 +146,12 @@ async fn run_migrate(
 
     history::create_history_table_db(client, &schema, table).await?;
 
-    if config.migrations.validate_on_migrate {
-        if let Err(e) = crate::commands::validate::execute_db(client, config).await {
-            match &e {
-                WaypointError::ValidationFailed(_) => return Err(e),
-                _ => log::debug!("Validation skipped: {}", e),
-            }
+    if config.migrations.validate_on_migrate
+        && let Err(e) = crate::commands::validate::execute_db(client, config).await
+    {
+        match &e {
+            WaypointError::ValidationFailed(_) => return Err(e),
+            _ => log::debug!("Validation skipped: {}", e),
         }
     }
 
@@ -241,61 +211,20 @@ async fn run_migrate(
         .collect();
     let current_env = config.migrations.environment.as_deref();
 
-    let pending_versioned: Vec<&ResolvedMigration> = resolved
-        .iter()
-        .filter(|m| {
-            if m.is_undo() {
-                return false;
-            }
-            let v = match m.version() {
-                Some(v) => v,
-                None => return false,
-            };
-            if !m.is_versioned() {
-                return false;
-            }
-            if effective_versions.contains(&v.raw) {
-                return false;
-            }
-            if let Some(ref bl) = baseline_version {
-                if v <= bl {
-                    return false;
-                }
-            }
-            if let Some(ref t) = target {
-                if v > t {
-                    return false;
-                }
-            }
-            if !config.migrations.out_of_order {
-                if let Some(ref hi) = highest_applied {
-                    if v < hi {
-                        return false;
-                    }
-                }
-            }
-            if !should_run_in_environment(&m.directives, current_env) {
-                return false;
-            }
-            true
-        })
-        .collect();
-
-    let pending_repeatables: Vec<&ResolvedMigration> = resolved
-        .iter()
-        .filter(|m| {
-            if m.version().is_some() || m.is_undo() {
-                return false;
-            }
-            if !should_run_in_environment(&m.directives, current_env) {
-                return false;
-            }
-            match applied_scripts.get(&m.script) {
-                None => true,
-                Some(prev) => prev != &Some(m.checksum),
-            }
-        })
-        .collect();
+    let pending = select_pending(
+        &resolved,
+        &PendingCriteria {
+            effective_versions: &effective_versions,
+            baseline_version: baseline_version.as_ref(),
+            target: target.as_ref(),
+            highest_applied: highest_applied.as_ref(),
+            applied_scripts: &applied_scripts,
+            current_env,
+            out_of_order: config.migrations.out_of_order,
+            dependency_ordering: config.migrations.dependency_ordering,
+        },
+    )?;
+    let pending_repeatables = pending.repeatables;
 
     let mut report = MigrateReport {
         migrations_applied: 0,
@@ -305,32 +234,26 @@ async fn run_migrate(
         hooks_time_ms: 0,
     };
 
-    // `pending_versioned` isn't used again after this — move it in and sort
-    // in place rather than cloning the Vec<&ResolvedMigration>.
-    let mut sorted_versioned = pending_versioned;
-    sorted_versioned.sort_by(|a, b| a.version().unwrap().cmp(b.version().unwrap()));
+    // `beforeMigrate` / `afterMigrate` fire on every run, matching the
+    // PostgreSQL path and Flyway, so that hooks which prepare or tear down
+    // session state observe a consistent lifecycle even on a no-op run.
+    let placeholders = build_placeholders(
+        &config.placeholders,
+        &schema,
+        &db_user,
+        &db_name,
+        "beforeMigrate",
+    );
+    fire_hooks(
+        client,
+        &all_hooks,
+        &HookType::BeforeMigrate,
+        &placeholders,
+        &mut report,
+    )
+    .await?;
 
-    let has_pending = !sorted_versioned.is_empty() || !pending_repeatables.is_empty();
-
-    if has_pending {
-        let placeholders = build_placeholders(
-            &config.placeholders,
-            &schema,
-            &db_user,
-            &db_name,
-            "beforeMigrate",
-        );
-        fire_hooks(
-            client,
-            &all_hooks,
-            &HookType::BeforeMigrate,
-            &placeholders,
-            &mut report,
-        )
-        .await?;
-    }
-
-    for m in sorted_versioned {
+    for m in pending.versioned {
         let placeholders =
             build_placeholders(&config.placeholders, &schema, &db_user, &db_name, &m.script);
 
@@ -369,7 +292,7 @@ async fn run_migrate(
         // auto-committed, so an ensure-failure does NOT roll back the
         // migration — it surfaces as a hard error and leaves the schema in
         // the post-migration state. This is the documented MySQL caveat.
-        evaluate_ensure_guards_db(client, &schema, m).await?;
+        evaluate_ensure_guards_db(client, &schema, m, config).await?;
 
         if let (Some(before), Some(ver)) = (before_snapshot.as_ref(), m.version()) {
             match crate::reversal::generate_reversal_db(
@@ -447,7 +370,7 @@ async fn run_migrate(
             execution_time_ms: elapsed,
         });
 
-        evaluate_ensure_guards_db(client, &schema, m).await?;
+        evaluate_ensure_guards_db(client, &schema, m, config).await?;
 
         fire_hooks(
             client,
@@ -459,23 +382,21 @@ async fn run_migrate(
         .await?;
     }
 
-    if has_pending {
-        let placeholders = build_placeholders(
-            &config.placeholders,
-            &schema,
-            &db_user,
-            &db_name,
-            "afterMigrate",
-        );
-        fire_hooks(
-            client,
-            &all_hooks,
-            &HookType::AfterMigrate,
-            &placeholders,
-            &mut report,
-        )
-        .await?;
-    }
+    let placeholders = build_placeholders(
+        &config.placeholders,
+        &schema,
+        &db_user,
+        &db_name,
+        "afterMigrate",
+    );
+    fire_hooks(
+        client,
+        &all_hooks,
+        &HookType::AfterMigrate,
+        &placeholders,
+        &mut report,
+    )
+    .await?;
 
     Ok(report)
 }
@@ -504,26 +425,57 @@ async fn apply_one(
 ) -> Result<i32> {
     let sql = replace_placeholders(&m.sql, placeholders)?;
     log::info!("Applying migration; script={}", m.script);
-    let elapsed = client
-        .execute_raw(&sql)
-        .await
-        .map_err(|e| WaypointError::MigrationFailed {
-            script: m.script.clone(),
-            reason: e.to_string(),
-        })?;
 
-    let migration_type = if m.version().is_some() {
-        "SQL"
-    } else {
-        "SQL_REPEATABLE"
+    let version = m.version().map(|v| v.raw.as_str());
+    let migration_type = m.migration_type().to_string();
+
+    let outcome = client.execute_raw(&sql).await;
+
+    // Record the outcome either way. MySQL DDL auto-commits statement by
+    // statement, so a mid-file failure leaves the schema partially migrated —
+    // a `success = false` row is the only trace of that, and it is what
+    // `info` surfaces as FAILED and `repair` clears. Mirrors the PostgreSQL
+    // apply path and the MySQL undo path.
+    let elapsed = match outcome {
+        Ok(elapsed) => elapsed,
+        Err(e) => {
+            let reason = e.to_string();
+            if let Err(record_err) = history::insert_applied_migration_db(
+                client,
+                schema,
+                table,
+                version,
+                &m.description,
+                &migration_type,
+                &m.script,
+                Some(m.checksum),
+                installed_by,
+                0,
+                false,
+            )
+            .await
+            {
+                log::warn!(
+                    "Failed to record migration failure in history table; script={}, error={}",
+                    m.script,
+                    record_err
+                );
+            }
+            log::error!("Migration failed; script={}, reason={}", m.script, reason);
+            return Err(WaypointError::MigrationFailed {
+                script: m.script.clone(),
+                reason,
+            });
+        }
     };
+
     history::insert_applied_migration_db(
         client,
         schema,
         table,
-        m.version().map(|v| v.raw.as_str()),
+        version,
         &m.description,
-        migration_type,
+        &migration_type,
         &m.script,
         Some(m.checksum),
         installed_by,

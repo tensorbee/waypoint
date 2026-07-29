@@ -12,6 +12,10 @@ use crate::error::Result;
 
 /// Execute the advise command (PostgreSQL legacy entry).
 #[cfg(feature = "postgres")]
+#[deprecated(
+    since = "0.6.0",
+    note = "Unused PostgreSQL-only entry point superseded by `execute_db`, which handles both engines. Will be removed in 1.0."
+)]
 pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<AdvisorReport> {
     advisor::analyze(client, &config.migrations.schema, &config.advisor).await
 }
