@@ -16,9 +16,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mysql_async::prelude::*;
+use waypoint_core::Waypoint;
 use waypoint_core::config::{DatabaseConfig, HooksConfig, MigrationSettings, WaypointConfig};
 use waypoint_core::dialect::DialectKind;
-use waypoint_core::Waypoint;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -607,9 +607,13 @@ async fn migrate_runs_lifecycle_hooks() {
     std::fs::create_dir_all(&migrations).unwrap();
 
     // Hooks: beforeMigrate creates a marker table, afterMigrate inserts into it.
+    //
+    // `IF NOT EXISTS` is required, not incidental: beforeMigrate runs on every
+    // migrate invocation including no-ops, so the hook has to be idempotent.
+    // The PostgreSQL fixture has always done this for the same reason.
     std::fs::write(
         migrations.join("beforeMigrate.sql"),
-        "CREATE TABLE _wp_hook_marker (phase VARCHAR(64), n INT NOT NULL DEFAULT 0);",
+        "CREATE TABLE IF NOT EXISTS _wp_hook_marker (phase VARCHAR(64), n INT NOT NULL DEFAULT 0);",
     )
     .unwrap();
     std::fs::write(
@@ -660,11 +664,28 @@ async fn migrate_runs_lifecycle_hooks() {
     drop(conn);
     pool.disconnect().await.ok();
 
-    // Re-running migrate with nothing pending should NOT fire beforeMigrate /
-    // afterMigrate (only fire when there's pending work).
+    // Re-running migrate with nothing pending still fires beforeMigrate and
+    // afterMigrate — they are run-lifecycle hooks, not work-lifecycle hooks.
+    // This matches the PostgreSQL path and Flyway, so a hook that prepares or
+    // tears down session state sees a consistent lifecycle even on a no-op.
+    // The per-migration hooks correctly do not fire.
     let report2 = wp.migrate(None).await.expect("migrate no-op");
     assert_eq!(report2.migrations_applied, 0);
-    assert_eq!(report2.hooks_executed, 0);
+    assert_eq!(report2.hooks_executed, 2, "beforeMigrate + afterMigrate");
+
+    // Fresh pool: the one above was disconnected.
+    let pool2 = mysql_async::Pool::from_url(db_url(name)).unwrap();
+    let mut conn = pool2.get_conn().await.unwrap();
+    let rows2: Vec<(String, i32)> = conn
+        .query("SELECT phase, n FROM _wp_hook_marker ORDER BY phase, n")
+        .await
+        .unwrap();
+    let count2 = |phase: &str| rows2.iter().filter(|(p, _)| p == phase).count();
+    assert_eq!(count2("before_each"), 2, "no new per-migration hooks");
+    assert_eq!(count2("after_each"), 2, "no new per-migration hooks");
+    assert_eq!(count2("after"), 2, "afterMigrate fired again");
+    drop(conn);
+    pool2.disconnect().await.ok();
 }
 
 #[tokio::test]
@@ -715,6 +736,68 @@ async fn simulate_runs_pending_migrations_in_throwaway_db() {
 }
 
 #[tokio::test]
+async fn simulate_does_not_touch_the_source_database() {
+    // Regression: `run_simulation_mysql` used to `USE temp_db` on one pooled
+    // connection and then replay migrations via `DbClient::execute_raw`, which
+    // checks out a *different* connection whose default database is still the
+    // live one. Every pending migration was applied to the real schema.
+    //
+    // Asserting `report.passed` is not enough to catch that — the migration
+    // succeeds either way. The source schema itself has to be checked.
+    let db = fresh_database("simiso").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            ("V1__Base.sql", "CREATE TABLE base (id INT PRIMARY KEY);"),
+            (
+                "V2__Add.sql",
+                "ALTER TABLE base ADD COLUMN name VARCHAR(50);",
+            ),
+        ],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    // Apply only V1 to the source DB, leaving V2 pending.
+    wp.migrate(Some("1")).await.expect("migrate V1");
+
+    let report = wp.simulate().await.expect("simulate");
+    assert!(report.passed, "simulation failed: {:?}", report.errors);
+    assert_eq!(report.migrations_simulated, 1);
+
+    // V2 adds `base.name`. After a simulation it must NOT exist in the source.
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let cols: Vec<String> = conn
+        .exec(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 'base'",
+            (name,),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !cols.iter().any(|c| c == "name"),
+        "simulate leaked into the source database: base has columns {cols:?}"
+    );
+
+    // And the history table must not have gained a V2 row.
+    let versions: Vec<String> = conn
+        .query("SELECT version FROM waypoint_schema_history WHERE version IS NOT NULL")
+        .await
+        .unwrap();
+    assert!(
+        !versions.iter().any(|v| v == "2"),
+        "simulate recorded V2 as applied: {versions:?}"
+    );
+    drop(conn);
+    pool.disconnect().await.ok();
+}
+
+#[tokio::test]
 async fn simulate_reports_sql_errors_without_failing() {
     let db = fresh_database("simerr").await;
     let name = db.name();
@@ -734,6 +817,73 @@ async fn simulate_reports_sql_errors_without_failing() {
     assert!(!report.passed);
     assert_eq!(report.errors.len(), 1);
     assert_eq!(report.errors[0].script, "V1__Bad.sql");
+}
+
+#[tokio::test]
+async fn advisory_lock_is_actually_held_between_acquire_and_release() {
+    // Regression: `GET_LOCK` is session-scoped, and mysql_async's pool resets
+    // connections on return (COM_RESET_CONNECTION explicitly releases GET_LOCK
+    // locks). Acquiring on a borrowed connection that then went back to the
+    // pool released the lock immediately, so the migration lock provided no
+    // mutual exclusion at all.
+    //
+    // `IS_USED_LOCK` returns the connection id holding the named lock, or NULL
+    // if nobody holds it. Observing it from a *separate* session is the direct
+    // test: before the fix this was NULL right after `acquire_lock` returned.
+    let db = fresh_database("lock").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let config = config_for(name, tempdir.path().to_path_buf());
+    let table = config.migrations.table.clone();
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    // Independent connection — not from the Waypoint pool.
+    let observer_pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
+    let mut observer = observer_pool.get_conn().await.unwrap();
+    let lock_key = format!("waypoint_{}", table);
+
+    let holder: Option<Option<u64>> = observer
+        .exec_first("SELECT IS_USED_LOCK(?)", (lock_key.as_str(),))
+        .await
+        .unwrap();
+    assert!(
+        holder.flatten().is_none(),
+        "lock should be free before acquire"
+    );
+
+    wp.client().acquire_lock(&table).await.expect("acquire");
+
+    let holder: Option<Option<u64>> = observer
+        .exec_first("SELECT IS_USED_LOCK(?)", (lock_key.as_str(),))
+        .await
+        .unwrap();
+    assert!(
+        holder.flatten().is_some(),
+        "lock must still be held after acquire_lock returns — the acquiring \
+         session has to stay checked out of the pool"
+    );
+
+    // A second acquirer must not be able to take it while held. GET_LOCK with a
+    // 0s timeout returns 0 when the lock is busy.
+    let busy: Option<i64> = observer
+        .exec_first("SELECT GET_LOCK(?, 0)", (lock_key.as_str(),))
+        .await
+        .unwrap();
+    assert_eq!(busy, Some(0), "a second session must not acquire the lock");
+
+    wp.client().release_lock(&table).await.expect("release");
+
+    let holder: Option<Option<u64>> = observer
+        .exec_first("SELECT IS_USED_LOCK(?)", (lock_key.as_str(),))
+        .await
+        .unwrap();
+    assert!(
+        holder.flatten().is_none(),
+        "lock must be free after release_lock"
+    );
+
+    drop(observer);
+    observer_pool.disconnect().await.ok();
 }
 
 #[tokio::test]

@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use waypoint_core::Waypoint;
 use waypoint_core::commands::info::MigrationState;
 use waypoint_core::commands::snapshot::SnapshotConfig;
 use waypoint_core::commands::undo::UndoTarget;
@@ -19,9 +20,8 @@ use waypoint_core::config::{DatabaseConfig, HooksConfig, MigrationSettings, Wayp
 use waypoint_core::db::{self, quote_ident};
 use waypoint_core::dependency::DependencyGraph;
 use waypoint_core::history;
-use waypoint_core::migration::{scan_migrations, MigrationVersion};
+use waypoint_core::migration::{MigrationVersion, scan_migrations};
 use waypoint_core::safety::SafetyVerdict;
-use waypoint_core::Waypoint;
 
 fn get_test_url() -> String {
     std::env::var("TEST_DATABASE_URL").expect("TEST_DATABASE_URL must be set for integration tests")

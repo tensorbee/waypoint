@@ -15,18 +15,96 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # rust-toolchain.toml pins the version; the action honours it.
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run unit tests
-        run: cargo test --lib
+      # `--features mysql` is additive on top of the default `postgres`, so one
+      # run covers both engine paths. Without it the entire MySQL half of the
+      # crate is never compiled, let alone tested.
+      - name: Run unit tests (both engines)
+        run: cargo test --features mysql --lib
 
+      # Doctests are part of the public API surface: the crate's Quick Start
+      # example silently stopped compiling because nothing ran them.
+      - name: Run doctests
+        run: cargo test --features mysql --doc
+
+      # --all-targets so tests and benches are linted too; --features mysql so
+      # the MySQL code is linted at all.
       - name: Run clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --features mysql --all-targets -- -D warnings
 
       - name: Check formatting
-        run: cargo fmt --check
+        run: cargo fmt --all --check
+
+  # Each feature combination has to compile and lint on its own — a
+  # `#[cfg(feature = "postgres")]` match arm that is missing its MySQL
+  # counterpart only shows up in a single-feature build.
+  feature-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "postgres"
+          - "mysql"
+          - "postgres,mysql"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy waypoint-core (${{ matrix.features }})
+        run: >-
+          cargo clippy -p waypoint-core --no-default-features
+          --features ${{ matrix.features }} --all-targets -- -D warnings
+
+      - name: Clippy waypoint-cli (${{ matrix.features }})
+        run: >-
+          cargo clippy -p waypoint-cli --no-default-features
+          --features ${{ matrix.features }} --all-targets -- -D warnings
+
+      - name: Unit tests waypoint-core (${{ matrix.features }})
+        run: >-
+          cargo test -p waypoint-core --no-default-features
+          --features ${{ matrix.features }} --lib
+
+  # Supply chain. These gates are what keep `aws-lc-sys`, an unreviewed
+  # licence, or a fresh advisory from arriving silently on a dependency bump.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install tools
+        run: cargo install cargo-audit cargo-deny cargo-machete --locked
+
+      - name: Known vulnerabilities
+        run: cargo audit --deny warnings
+
+      # advisories + licenses + bans (see deny.toml) + source registries
+      - name: Licences, bans and sources
+        run: cargo deny --all-features check
+
+      - name: Unused dependencies
+        run: cargo machete
+
+  # `rust-version` is a promise; verify it rather than trusting it.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Check against declared MSRV
+        # rust-toolchain.toml would override the pinned MSRV toolchain.
+        run: |
+          rm -f rust-toolchain.toml
+          cargo check --features mysql --all-targets
 
   integration-test:
     runs-on: ubuntu-latest
@@ -45,6 +123,19 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: waypoint_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pmysql"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -52,7 +143,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run integration tests
+      - name: Run PostgreSQL integration tests
         env:
           TEST_DATABASE_URL: postgres://waypoint:waypoint@localhost:5432/waypoint_test
         run: cargo test --test integration_test
+
+      # These cover the engine where DDL auto-commits and session state matters
+      # (pinned lock connections, USE-scoped simulation) — exactly the things
+      # unit tests cannot reach.
+      - name: Run MySQL integration tests
+        env:
+          TEST_MYSQL_URL: mysql://root:mysql@127.0.0.1:3306/mysql
+        run: cargo test --features mysql --test mysql_integration_test
