@@ -11,7 +11,7 @@ use std::process;
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 
-use waypoint_core::config::{normalize_location, CliOverrides, WaypointConfig};
+use waypoint_core::config::{CliOverrides, WaypointConfig, normalize_location};
 use waypoint_core::error::WaypointError;
 use waypoint_core::migration::MigrationVersion;
 use waypoint_core::{UndoTarget, Waypoint};
@@ -294,6 +294,14 @@ enum Commands {
         /// Check for updates without installing
         #[arg(long)]
         check: bool,
+
+        /// Refuse to install unless the release signature is verified with cosign.
+        ///
+        /// Without this, a missing `cosign` binary downgrades to SHA-256-only
+        /// verification (with a warning). A signature that is present and
+        /// *invalid* always aborts, flag or not.
+        #[arg(long)]
+        require_signature: bool,
     },
 }
 
@@ -383,8 +391,12 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
 
     // Handle self-update before config/DB setup (no database needed)
     #[cfg(feature = "self-update")]
-    if let Commands::SelfUpdate { check } = &cli.command {
-        return self_update::self_update(*check, json_output);
+    if let Commands::SelfUpdate {
+        check,
+        require_signature,
+    } = &cli.command
+    {
+        return self_update::self_update(*check, json_output, *require_signature);
     }
 
     // Build CLI overrides with negation flag support
@@ -531,19 +543,33 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
 
     // === Multi-database mode ===
     if let Some(ref databases) = config.multi_database {
-        let order = waypoint_core::MultiWaypoint::execution_order(databases)?;
-        let clients =
-            waypoint_core::MultiWaypoint::connect(databases, cli.database.as_deref()).await?;
+        // Resolve the full dependency order first so that `--database` is
+        // still validated against the whole graph, then narrow it to what we
+        // actually connected to. Without the narrowing, `--database foo`
+        // connects only `foo` but still walks every name, reporting the rest
+        // as "Database not connected" failures.
+        let full_order = waypoint_core::MultiWaypoint::execution_order(databases)?;
+        let clients = waypoint_core::MultiWaypoint::connect_inheriting(
+            databases,
+            cli.database.as_deref(),
+            &config,
+        )
+        .await?;
+        let order: Vec<String> = full_order
+            .into_iter()
+            .filter(|name| clients.contains_key(name))
+            .collect();
 
         match &cli.command {
             Commands::Migrate { target } => {
-                let result = waypoint_core::MultiWaypoint::migrate_with_options(
+                let result = waypoint_core::MultiWaypoint::migrate_inheriting(
                     databases,
                     &clients,
                     &order,
                     target.as_deref(),
                     cli.fail_fast,
                     force,
+                    &config,
                 )
                 .await?;
                 print_report!(result, json_output, output::print_multi_result);
@@ -555,27 +581,29 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
                 }
             }
             Commands::Info => {
-                let all_info =
-                    waypoint_core::MultiWaypoint::info(databases, &clients, &order).await?;
+                let all_info = waypoint_core::MultiWaypoint::info_inheriting(
+                    databases, &clients, &order, &config,
+                )
+                .await?;
                 print_report!(all_info, json_output, output::print_multi_info);
             }
             _ => {
                 // For other commands, run on filtered single DB
-                if let Some(ref db_name) = cli.database {
-                    if let Some(db) = databases.iter().find(|d| &d.name == db_name) {
-                        let single_config = db.to_waypoint_config();
-                        let wp = Waypoint::new(single_config).await?;
-                        return run_single_db_command(
-                            &cli.command,
-                            &wp,
-                            json_output,
-                            dry_run,
-                            force,
-                            simulate_flag,
-                            quiet,
-                        )
-                        .await;
-                    }
+                if let Some(ref db_name) = cli.database
+                    && let Some(db) = databases.iter().find(|d| &d.name == db_name)
+                {
+                    let single_config = db.to_waypoint_config_inheriting(&config);
+                    let wp = Waypoint::new(single_config).await?;
+                    return run_single_db_command(
+                        &cli.command,
+                        &wp,
+                        json_output,
+                        dry_run,
+                        force,
+                        simulate_flag,
+                        quiet,
+                    )
+                    .await;
                 }
                 return Err(WaypointError::ConfigError(
                     "Multi-database mode: use --database to select a database for this command"
@@ -589,14 +617,11 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
     // === Single database mode ===
 
     // Dry-run mode: show what would be applied using info/explain
-    if dry_run {
-        if let Commands::Migrate { .. } = &cli.command {
-            let wp = Waypoint::new(config).await?;
-            let report =
-                waypoint_core::commands::explain::execute_db(wp.client(), &wp.config).await?;
-            print_report!(report, json_output, output::print_explain_report);
-            return Ok(());
-        }
+    if dry_run && let Commands::Migrate { .. } = &cli.command {
+        let wp = Waypoint::new(config).await?;
+        let report = waypoint_core::commands::explain::execute_db(wp.client(), &wp.config).await?;
+        print_report!(report, json_output, output::print_explain_report);
+        return Ok(());
     }
 
     // Create waypoint instance and run with transient error retry
@@ -667,8 +692,40 @@ async fn run_single_db_command(
                 }
             }
 
+            // `show_progress = false` suppresses the human-readable summary
+            // the same way `--quiet` does, without silencing errors or JSON.
+            let quiet = quiet || !wp.config.migrations.show_progress;
+
             let report = wp.migrate_with_options(target.as_deref(), force).await?;
             print_report!(report, json_output, quiet, output::print_migrate_summary);
+
+            // Post-migrate follow-ups. Both are opt-in and neither may turn a
+            // successful migration into a failed command — the schema changes
+            // are already committed at this point, so a snapshot or advisory
+            // problem is reported and nothing more.
+            if wp.config.snapshots.auto_snapshot_on_migrate && report.migrations_applied > 0 {
+                match wp.snapshot(&wp.config.snapshots).await {
+                    Ok(snap) => {
+                        if !json_output && !quiet {
+                            output::print_snapshot_report(&snap);
+                        }
+                    }
+                    Err(e) => eprintln!("{}", format!("Auto-snapshot failed: {}", e).yellow()),
+                }
+            }
+
+            if wp.config.advisor.run_after_migrate {
+                match wp.advise().await {
+                    Ok(advisories) => {
+                        if !json_output && !quiet {
+                            output::print_advisor_report(&advisories);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{}", format!("Post-migrate advisor failed: {}", e).yellow())
+                    }
+                }
+            }
         }
         Commands::Info => {
             let infos = wp.info().await?;
@@ -856,7 +913,15 @@ fn print_error(error: &WaypointError) {
                     .dimmed()
             );
         }
+        #[cfg(feature = "postgres")]
         WaypointError::DatabaseError(_) => {
+            eprintln!(
+                "{}",
+                "Hint: Verify database is running and connection details are correct.".dimmed()
+            );
+        }
+        #[cfg(feature = "mysql")]
+        WaypointError::MysqlError(_) => {
             eprintln!(
                 "{}",
                 "Hint: Verify database is running and connection details are correct.".dimmed()
@@ -1049,7 +1114,5 @@ fn print_error(error: &WaypointError) {
         | WaypointError::GitError(_)
         | WaypointError::AdvisorError(_)
         | WaypointError::IoError(_) => {}
-        #[cfg(feature = "mysql")]
-        WaypointError::MysqlError(_) => {}
     }
 }
