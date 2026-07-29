@@ -76,6 +76,9 @@ echo "Updating README.md..."
 # Update install pin version: WAYPOINT_VERSION=v0.X.Y
 sed -i '' -E "s/WAYPOINT_VERSION=v[0-9]+\.[0-9]+\.[0-9]+/WAYPOINT_VERSION=v$VERSION/" README.md
 
+# Update the release-verification example: TAG=v0.X.Y
+sed -i '' -E "s/^TAG=v[0-9]+\.[0-9]+\.[0-9]+$/TAG=v$VERSION/" README.md
+
 # Update library dependency version: waypoint-core = "0.X"
 sed -i '' -E "s/waypoint-core = \"[0-9]+\.[0-9]+\"/waypoint-core = \"$MAJOR_MINOR\"/" README.md
 

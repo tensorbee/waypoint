@@ -8,9 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build                                                          # Build both crates (default: postgres feature)
 cargo build --features mysql                                         # Build with MySQL backend (postgres + mysql)
 cargo build -p waypoint-core --no-default-features --features mysql  # MySQL-only (no PostgreSQL deps compiled in)
-cargo test --lib                                                     # Unit tests (postgres only, 261 tests)
-cargo test --features mysql --lib                                    # Unit tests with both backends (267 tests)
-cargo test -p waypoint-core --no-default-features --features mysql --lib  # MySQL-only unit tests (155 tests)
+cargo test --lib                                                     # Unit tests (postgres only, 302 tests)
+cargo test --features mysql --lib                                    # Unit tests with both backends (330 tests)
+cargo test -p waypoint-core --no-default-features --features mysql --lib  # MySQL-only unit tests (253 tests)
 cargo test --features mysql --test mysql_integration_test            # MySQL integration tests (20 tests, needs container)
 cargo test                                               # Integration tests need TEST_DATABASE_URL (PG)
 cargo clippy --features mysql --all-targets -- -D warnings  # Lint (use --features mysql to cover both paths)
@@ -53,12 +53,12 @@ Cargo workspace with two crates:
 | `engines/` | Per-engine implementation modules. `engines/postgres/{history,migrate,advisor,safety}.rs` and `engines/mysql/{history,migrate,advisor,safety}.rs` hold the engine-specific bodies; the top-level modules expose the shared types and dialect-aware dispatchers and re-export the engine entry points for back-compat |
 | `hooks.rs` | SQL callback hooks (beforeMigrate, afterEachMigrate, etc.) |
 | `error.rs` | `WaypointError` enum (36 variants). `DatabaseError(tokio_postgres::Error)` is feature-gated; `MysqlError(mysql_async::Error)` added behind `mysql` feature |
-| `directive.rs` | Parse `-- waypoint:*` directives (env, depends, require, ensure, safety-override) |
+| `directive.rs` | Parse `-- waypoint:*` directives (env, depends, require, ensure, safety-override) + inline `lint-ignore` / `lint-ignore-file` suppressions (`parse_lint_ignores`) |
 | `guard.rs` | Guard expression parser + evaluator (10 built-in assertion functions). PG + MySQL builtin tables; engine paths still co-located. |
 | `reversal.rs` | Auto-reversal generation from schema diffs, storage/retrieval. PG + MySQL paths still co-located. |
 | `safety.rs` | Shared safety types (`LockLevel`, `SafetyVerdict`, `SafetyReport`, `SafetyConfig`) + `analyze_migration_db` dispatcher. Engine analysers live under `engines/{postgres,mysql}/safety.rs` |
 | `advisor.rs` | Shared advisor types (`Advisory`, `AdvisorReport`, `AdvisorConfig`) + `analyze_db` dispatcher + `generate_fix_sql`. Engine rule sets live under `engines/{postgres,mysql}/advisor.rs` (A001-A010 / M001-M005) |
-| `sql_parser.rs` | Regex-based DDL extraction (`DdlOperation` enum), `split_statements()` |
+| `sql_parser.rs` | DDL extraction (`DdlOperation` enum), `split_statements()`, `strip_comments()` (offset-preserving comment blanking), `extract_ddl_operations_located()` (ops + source spans). Most forms are regex-matched; `ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS]` uses a hand-rolled tokenizer so `NOT NULL` / `DEFAULT` are read from the parsed column definition rather than substring-matched |
 | `schema.rs` | Schema introspection, diff, and DDL generation. PG path uses `information_schema`/`pg_catalog` and emits PG-flavoured DDL; MySQL path uses `information_schema` + `SHOW CREATE` and emits MySQL-flavoured DDL via `generate_ddl_mysql` |
 | `dependency.rs` | Migration dependency graph, topological sort (Kahn's algorithm) |
 | `preflight.rs` | Pre-migration health checks. PG checks (recovery mode, replication lag MB, locks, etc.) and MySQL checks (read-only, processlist, replica lag secs, etc.) co-located; dispatcher is `run_preflight_db` |
@@ -118,6 +118,8 @@ No-DB commands (pure file analysis): `lint`, `changelog`, `check_conflicts` — 
 - **All reports are `Serialize`**: Every command returns a report struct that implements `serde::Serialize` for `--json` output
 - **Migration file types**: `V{ver}__desc.sql` (versioned), `R__desc.sql` (repeatable), `U{ver}__desc.sql` (undo)
 - **Directives**: `-- waypoint:env`, `-- waypoint:depends`, `-- waypoint:require`, `-- waypoint:ensure`, `-- waypoint:safety-override` parsed from SQL file headers by `directive.rs`
+- **Lint semantics run on comment-free SQL**: `lint.rs` calls `strip_comments()` (which blanks comments to spaces, preserving byte offsets and line breaks) and evaluates every rule against the individual statement span, not the whole file. Diagnostics resolve offsets back against the original SQL, so E001 points at the column-name token. When adding a rule, anchor it to `LocatedDdl.focus` and never substring-match the raw file text
+- **Lint suppression**: `-- waypoint:lint-ignore <RULES> reason=<why>` (next statement) and `-- waypoint:lint-ignore-file <RULES> reason=<why>` (whole file). The reason is mandatory — a directive missing rules or a reason raises `E003` and is not applied; one that matches nothing raises `I002`. Applied suppressions are reported in `LintReport.suppressions`
 - **Guards**: `require` (preconditions) and `ensure` (postconditions) use a recursive descent parser in `guard.rs`; the legacy `evaluate(&Client, ...)` path queries `information_schema`/`pg_catalog`, and the dialect-aware `evaluate_db(&DbClient, ...)` path dispatches between the PG and MySQL builtin tables (`enum_exists` rejected on MySQL — no enum type)
 - **Auto-reversals**: `reversal.rs` captures before/after schema snapshots, generates reverse DDL, stores in `reversal_sql` column; `undo.rs` falls back to stored reversals when no U file exists. PG uses `schema::generate_ddl`; MySQL uses `schema::generate_ddl_mysql` (with dependent constraint/index diffs filtered when the parent table is being dropped — MySQL has no CASCADE)
 - **Safety analysis**: shared types in `safety.rs` + dialect-aware `analyze_migration_db` dispatcher. PG analyser (`engines/postgres/safety.rs`) maps DDL → PG lock levels and queries `pg_stat_user_tables`; MySQL analyser (`engines/mysql/safety.rs`) uses worst-case ALGORITHM=COPY lock mapping and `information_schema.tables.table_rows`; `migrate.rs` gates DANGER migrations behind `--force` on PG (MySQL safety verdicts are advisory, not gating)

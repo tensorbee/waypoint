@@ -435,6 +435,8 @@ mod tests {
             data_type: "text".into(),
             has_default: false,
             is_not_null: false,
+            if_not_exists: false,
+            default_expr: None,
         };
         assert!(!is_data_loss(&op));
     }

@@ -397,6 +397,8 @@ mod tests {
             data_type: "INT".into(),
             has_default: false,
             is_not_null: false,
+            if_not_exists: false,
+            default_expr: None,
         };
         // 8.0.28 — INSTANT ADD COLUMN restricted to end-of-table only, which
         // we can't detect statically, so we stay conservative.
@@ -421,6 +423,8 @@ mod tests {
             data_type: "INT".into(),
             has_default: false,
             is_not_null: true,
+            if_not_exists: false,
+            default_expr: None,
         };
         assert_eq!(
             lock_level_for_ddl_versioned(&op, MysqlVersion(8, 0, 36)),
@@ -438,6 +442,8 @@ mod tests {
             data_type: "INT".into(),
             has_default: true,
             is_not_null: true,
+            if_not_exists: false,
+            default_expr: None,
         };
         assert_eq!(
             lock_level_for_ddl_versioned(&op, MysqlVersion(8, 0, 36)),
@@ -484,6 +490,8 @@ mod tests {
             data_type: "INT".into(),
             has_default: true,
             is_not_null: false,
+            if_not_exists: false,
+            default_expr: None,
         };
         assert_eq!(
             lock_level_for_ddl_versioned(&op, MysqlVersion(0, 0, 0)),

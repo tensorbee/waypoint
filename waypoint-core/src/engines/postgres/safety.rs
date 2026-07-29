@@ -201,6 +201,8 @@ mod tests {
             data_type: "text".into(),
             has_default: false,
             is_not_null: false,
+            if_not_exists: false,
+            default_expr: None,
         };
         assert_eq!(lock_level_for_ddl(&op), LockLevel::AccessExclusiveLock);
     }
@@ -396,6 +398,8 @@ mod tests {
             data_type: "text".into(),
             has_default: true,
             is_not_null: true,
+            if_not_exists: false,
+            default_expr: None,
         };
         let suggestions = generate_suggestions(&op, TableSize::Large);
         assert_eq!(suggestions.len(), 1);
@@ -410,6 +414,8 @@ mod tests {
             data_type: "text".into(),
             has_default: false,
             is_not_null: false,
+            if_not_exists: false,
+            default_expr: None,
         };
         let suggestions = generate_suggestions(&op, TableSize::Large);
         assert!(suggestions.is_empty());

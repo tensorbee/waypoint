@@ -57,15 +57,37 @@ jobs:
           tar czf ../../../waypoint-${{ github.ref_name }}-${{ matrix.name }}.tar.gz waypoint
           cd ../../..
 
+      # Per-asset digest, computed on the runner that built it. The release
+      # job concatenates these into a single signed SHA256SUMS file.
+      - name: Checksum
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          ASSET_NAME: ${{ matrix.name }}
+        run: |
+          ASSET="waypoint-${REF_NAME}-${ASSET_NAME}.tar.gz"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET" > "$ASSET.sha256"
+          else
+            shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          fi
+          cat "$ASSET.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: waypoint-${{ matrix.name }}
-          path: waypoint-${{ github.ref_name }}-${{ matrix.name }}.tar.gz
+          path: |
+            waypoint-${{ github.ref_name }}-${{ matrix.name }}.tar.gz
+            waypoint-${{ github.ref_name }}-${{ matrix.name }}.tar.gz.sha256
 
   release:
     needs: build
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+      # Required for keyless (OIDC) signing with cosign.
+      id-token: write
 
     steps:
       - uses: actions/checkout@v4
@@ -74,8 +96,34 @@ jobs:
         with:
           merge-multiple: true
 
+      # One checksums file covering every release asset, in the standard
+      # `sha256sum -c` format so consumers can verify without hard-coding
+      # digests of their own.
+      - name: Build SHA256SUMS
+        run: |
+          cat waypoint-*.tar.gz.sha256 | sort -k2 > SHA256SUMS
+          rm -f waypoint-*.tar.gz.sha256
+          sha256sum -c SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: the certificate binds the signature to this
+      # workflow's OIDC identity, so there is no private key to manage.
+      - name: Sign SHA256SUMS
+        run: |
+          cosign sign-blob --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.pem \
+            SHA256SUMS
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: waypoint-*.tar.gz
+          files: |
+            waypoint-*.tar.gz
+            SHA256SUMS
+            SHA256SUMS.sig
+            SHA256SUMS.pem

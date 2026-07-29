@@ -112,6 +112,36 @@ Pin a specific version:
 curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | WAYPOINT_VERSION=v0.4.0 sh
 ```
 
+The installer verifies the downloaded archive against the release
+`SHA256SUMS` file automatically. Set `WAYPOINT_SKIP_CHECKSUM=1` to bypass.
+
+### Verifying a release
+
+Every release publishes `SHA256SUMS` covering all platform archives, plus a
+keyless [cosign](https://github.com/sigstore/cosign) signature
+(`SHA256SUMS.sig`) and its certificate (`SHA256SUMS.pem`). CI consumers can
+verify a download without maintaining their own digest:
+
+```bash
+TAG=v0.4.1
+BASE="https://github.com/tensorbee/waypoint/releases/download/${TAG}"
+
+curl -sSfLO "${BASE}/waypoint-${TAG}-linux-amd64.tar.gz"
+curl -sSfLO "${BASE}/SHA256SUMS"
+curl -sSfLO "${BASE}/SHA256SUMS.sig"
+curl -sSfLO "${BASE}/SHA256SUMS.pem"
+
+# 1. Confirm the checksums file really came from the release workflow
+cosign verify-blob SHA256SUMS \
+  --signature SHA256SUMS.sig \
+  --certificate SHA256SUMS.pem \
+  --certificate-identity-regexp '^https://github\.com/tensorbee/waypoint/\.github/workflows/release\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+
+# 2. Confirm the archive matches
+sha256sum --ignore-missing -c SHA256SUMS
+```
+
 ### Self-update
 
 ```bash
@@ -368,6 +398,7 @@ batch_transaction = true
 |---|---|---|
 | `E001` | error | `ADD COLUMN ... NOT NULL` without `DEFAULT` |
 | `E002` | error | Multiple DDL statements without explicit transaction control |
+| `E003` | error | Inline lint suppression missing a rule ID or a `reason=` |
 | `W001` | warning | `CREATE TABLE` without `IF NOT EXISTS` |
 | `W002` | warning | `CREATE INDEX` without `CONCURRENTLY` |
 | `W003` | warning | `ALTER COLUMN TYPE` (full table rewrite + lock) |
@@ -375,6 +406,42 @@ batch_transaction = true
 | `W006` | warning | Volatile `DEFAULT` on `ADD COLUMN` (pre-PG11 rewrite) |
 | `W007` | warning | `TRUNCATE TABLE` (destructive, locks) |
 | `I001` | info | File contains only comments or whitespace |
+| `I002` | info | Inline lint suppression that matched no issues |
+
+Analysis runs on a comment-stripped copy of each file, so keywords inside
+`--` line comments and `/* ... */` block comments never trigger a rule. Rules
+that inspect a column definition (`E001`, `W006`) read the parsed definition,
+not the raw statement text — a `NOT NULL` inside a `CHECK (...)` expression or
+a string literal does not count.
+
+### Scoped Lint Suppression
+
+`--disable E001` turns a rule off for the entire run. To silence a single
+statement instead, put a directive immediately above it. A reason is
+mandatory — a suppression without one is rejected with `E003` and has no
+effect.
+
+```sql
+-- waypoint:lint-ignore E001 reason="table is empty until the backfill job runs"
+ALTER TABLE reid_shares ADD COLUMN threshold smallint NOT NULL;
+
+-- Still linted normally:
+ALTER TABLE reid_shares ADD COLUMN quorum smallint NOT NULL;
+```
+
+| Directive | Scope |
+|---|---|
+| `-- waypoint:lint-ignore <RULES> reason=<why>` | The next statement only |
+| `-- waypoint:lint-ignore-file <RULES> reason=<why>` | The whole file |
+
+`<RULES>` is a comma- or space-separated list of rule IDs; only those rules are
+suppressed. The reason may be quoted (`reason="..."`) or bare (it runs to the
+end of the line). Directives must sit on their own comment line — a trailing
+comment after SQL is ignored, since its scope would be ambiguous.
+
+Applied suppressions are reported with their justifications (in `--json`
+output too, under `suppressions`), and a directive that matches nothing is
+flagged `I002` so stale suppressions get cleaned up.
 
 ## Guarded Migrations
 

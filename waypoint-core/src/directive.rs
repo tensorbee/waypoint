@@ -22,6 +22,123 @@ pub struct MigrationDirectives {
     pub safety_override: bool,
 }
 
+/// Scope of an inline lint suppression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum LintIgnoreScope {
+    /// `-- waypoint:lint-ignore` — applies to the next statement only.
+    NextStatement,
+    /// `-- waypoint:lint-ignore-file` — applies to the whole file.
+    File,
+}
+
+impl std::fmt::Display for LintIgnoreScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LintIgnoreScope::NextStatement => write!(f, "statement"),
+            LintIgnoreScope::File => write!(f, "file"),
+        }
+    }
+}
+
+/// An inline `-- waypoint:lint-ignore[-file]` directive.
+///
+/// ```sql
+/// -- waypoint:lint-ignore E001 reason="backfilled by the ceremony writer"
+/// ALTER TABLE t ADD COLUMN c int NOT NULL;
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LintIgnoreDirective {
+    /// Whether this suppresses the next statement or the whole file.
+    pub scope: LintIgnoreScope,
+    /// Rule IDs named by the directive, uppercased. Never empty for a valid
+    /// directive; an empty list means the directive named no rules.
+    pub rules: Vec<String>,
+    /// The mandatory `reason=...` value, if one was supplied.
+    pub reason: Option<String>,
+    /// 1-based line number of the directive.
+    pub line: usize,
+    /// Byte offset of the start of the directive's line.
+    pub offset: usize,
+}
+
+/// Parse every `-- waypoint:lint-ignore[-file]` directive in a migration file.
+///
+/// Unlike the header directives, these may appear anywhere in the file, but
+/// only on lines that contain nothing but the comment — a trailing comment on
+/// a line of SQL is ignored, because its scope would be ambiguous.
+pub fn parse_lint_ignores(sql: &str) -> Vec<LintIgnoreDirective> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+
+    // split('\n') rather than lines() so byte offsets stay exact on CRLF input.
+    for (idx, line) in sql.split('\n').enumerate() {
+        let line_offset = offset;
+        offset += line.len() + 1;
+
+        let trimmed = line.trim();
+        let Some(body) = trimmed.strip_prefix("--") else {
+            continue;
+        };
+        let body = body.trim();
+
+        let (scope, rest) =
+            if let Some(rest) = strip_directive_prefix(body, "waypoint:lint-ignore-file") {
+                (LintIgnoreScope::File, rest)
+            } else if let Some(rest) = strip_directive_prefix(body, "waypoint:lint-ignore") {
+                (LintIgnoreScope::NextStatement, rest)
+            } else {
+                continue;
+            };
+
+        let (rules_part, reason) = split_reason(rest);
+        let rules = rules_part
+            .split([',', ' ', '\t'])
+            .map(|r| r.trim())
+            .filter(|r| !r.is_empty())
+            .map(|r| r.to_uppercase())
+            .collect();
+
+        out.push(LintIgnoreDirective {
+            scope,
+            rules,
+            reason,
+            line: idx + 1,
+            offset: line_offset,
+        });
+    }
+
+    out
+}
+
+/// Split a directive tail into its rule list and its `reason=` value.
+///
+/// The reason runs to the end of the line and may be quoted with `"` or `'`.
+fn split_reason(rest: &str) -> (&str, Option<String>) {
+    let lower = rest.to_lowercase();
+    let Some(pos) = lower.find("reason") else {
+        return (rest, None);
+    };
+    // Require `reason` to be a standalone word followed by `=` or `:`.
+    let after = rest[pos + "reason".len()..].trim_start();
+    let Some(value) = after.strip_prefix('=').or_else(|| after.strip_prefix(':')) else {
+        return (rest, None);
+    };
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(value)
+        .trim();
+
+    let reason = if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    };
+    (&rest[..pos], reason)
+}
+
 /// Strip a directive prefix, ensuring the prefix is followed by whitespace or end of string.
 /// This prevents prefix collisions like "waypoint:env" matching "waypoint:environment".
 fn strip_directive_prefix<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
@@ -187,6 +304,67 @@ mod tests {
         let d = parse_directives(sql);
         assert_eq!(d.require.len(), 2);
         assert_eq!(d.ensure.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_lint_ignore_next_statement() {
+        let sql = "-- waypoint:lint-ignore E001 reason=\"empty table at deploy time\"\nALTER TABLE t ADD COLUMN a int NOT NULL;";
+        let d = parse_lint_ignores(sql);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].scope, LintIgnoreScope::NextStatement);
+        assert_eq!(d[0].rules, vec!["E001"]);
+        assert_eq!(d[0].reason.as_deref(), Some("empty table at deploy time"));
+        assert_eq!(d[0].line, 1);
+        assert_eq!(d[0].offset, 0);
+    }
+
+    #[test]
+    fn test_parse_lint_ignore_file_scope_and_multiple_rules() {
+        let sql = "-- header\n-- waypoint:lint-ignore-file E001,W004 reason=legacy migration\nDROP TABLE t;";
+        let d = parse_lint_ignores(sql);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].scope, LintIgnoreScope::File);
+        assert_eq!(d[0].rules, vec!["E001", "W004"]);
+        assert_eq!(d[0].reason.as_deref(), Some("legacy migration"));
+        assert_eq!(d[0].line, 2);
+    }
+
+    #[test]
+    fn test_parse_lint_ignore_without_reason() {
+        let d = parse_lint_ignores("-- waypoint:lint-ignore E001\nSELECT 1;");
+        assert_eq!(d.len(), 1);
+        assert!(d[0].reason.is_none());
+        assert_eq!(d[0].rules, vec!["E001"]);
+    }
+
+    #[test]
+    fn test_parse_lint_ignore_without_rules() {
+        let d = parse_lint_ignores("-- waypoint:lint-ignore reason=because\nSELECT 1;");
+        assert_eq!(d.len(), 1);
+        assert!(d[0].rules.is_empty());
+        assert_eq!(d[0].reason.as_deref(), Some("because"));
+    }
+
+    #[test]
+    fn test_parse_lint_ignore_offsets_are_exact() {
+        let sql = "SELECT 1;\n-- waypoint:lint-ignore E001 reason=x\nSELECT 2;";
+        let d = parse_lint_ignores(sql);
+        assert_eq!(d[0].line, 2);
+        assert_eq!(&sql[d[0].offset..d[0].offset + 2], "--");
+    }
+
+    #[test]
+    fn test_trailing_comment_is_not_a_directive() {
+        // Scope would be ambiguous, so only comment-only lines count.
+        let d = parse_lint_ignores("SELECT 1; -- waypoint:lint-ignore E001 reason=x\n");
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn test_lint_ignore_prefix_does_not_collide() {
+        let d = parse_lint_ignores("-- waypoint:lint-ignore-file E001 reason=x\n");
+        assert_eq!(d[0].scope, LintIgnoreScope::File);
+        assert_eq!(d[0].rules, vec!["E001"]);
     }
 
     #[test]

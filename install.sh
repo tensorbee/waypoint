@@ -47,6 +47,39 @@ trap 'rm -rf "$TMPDIR"' EXIT
 echo "Downloading ${URL}..."
 curl -sSfL "$URL" -o "${TMPDIR}/${TARBALL}"
 
+# Verify against the release SHA256SUMS file. Set WAYPOINT_SKIP_CHECKSUM=1 to
+# bypass (e.g. for a release published before checksums were introduced).
+if [ "${WAYPOINT_SKIP_CHECKSUM:-0}" != "1" ]; then
+    SUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS"
+    if curl -sSfL "$SUMS_URL" -o "${TMPDIR}/SHA256SUMS" 2>/dev/null; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            ACTUAL="$(sha256sum "${TMPDIR}/${TARBALL}" | cut -d' ' -f1)"
+        elif command -v shasum >/dev/null 2>&1; then
+            ACTUAL="$(shasum -a 256 "${TMPDIR}/${TARBALL}" | cut -d' ' -f1)"
+        else
+            echo "Warning: no sha256sum/shasum available, skipping checksum verification"
+            ACTUAL=""
+        fi
+
+        if [ -n "$ACTUAL" ]; then
+            EXPECTED="$(grep " [ *]*${TARBALL}\$" "${TMPDIR}/SHA256SUMS" | cut -d' ' -f1)"
+            if [ -z "$EXPECTED" ]; then
+                echo "Error: ${TARBALL} is not listed in SHA256SUMS"
+                exit 1
+            fi
+            if [ "$ACTUAL" != "$EXPECTED" ]; then
+                echo "Error: checksum mismatch for ${TARBALL}"
+                echo "  expected: ${EXPECTED}"
+                echo "  actual:   ${ACTUAL}"
+                exit 1
+            fi
+            echo "Checksum verified."
+        fi
+    else
+        echo "Warning: no SHA256SUMS published for ${VERSION}, skipping verification"
+    fi
+fi
+
 # Extract
 tar -xzf "${TMPDIR}/${TARBALL}" -C "$TMPDIR"
 

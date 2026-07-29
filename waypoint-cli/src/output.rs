@@ -208,6 +208,7 @@ pub fn print_lint_report(report: &waypoint_core::LintReport) {
                 .green()
                 .bold()
         );
+        print_lint_suppressions(report);
         return;
     }
 
@@ -244,6 +245,42 @@ pub fn print_lint_report(report: &waypoint_core::LintReport) {
         if let Some(ref suggestion) = issue.suggestion {
             println!("    {} {}", "→".dimmed(), suggestion.dimmed());
         }
+    }
+
+    print_lint_suppressions(report);
+}
+
+/// List the inline suppressions that took effect, with their justifications.
+fn print_lint_suppressions(report: &waypoint_core::LintReport) {
+    let applied: Vec<_> = report
+        .suppressions
+        .iter()
+        .filter(|s| s.suppressed_count > 0)
+        .collect();
+    if applied.is_empty() {
+        return;
+    }
+
+    println!();
+    println!(
+        "{}",
+        format!(
+            "{} issue(s) suppressed by {} inline directive(s):",
+            report.suppressed_count,
+            applied.len()
+        )
+        .dimmed()
+    );
+    for s in applied {
+        println!(
+            "  {} {}:{} {} ({} scope) — {}",
+            "·".dimmed(),
+            s.script,
+            s.line,
+            s.rules.join(", "),
+            s.scope,
+            s.reason
+        );
     }
 }
 

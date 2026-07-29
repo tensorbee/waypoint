@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-07-29
+
+### Fixed
+
+- **`lint` E001 false positive on `ADD COLUMN IF NOT EXISTS`.** The
+  `ALTER TABLE ... ADD COLUMN` parser treated the token after `ADD COLUMN` as
+  the column name, so `IF NOT EXISTS` was reported as a column called `IF`.
+  It now parses `ALTER TABLE <table> ADD [COLUMN] [IF NOT EXISTS] <column>
+  <type> [constraints...]` with a real tokenizer that understands quoted and
+  schema-qualified identifiers, multi-word and parenthesised types, and
+  comma-separated `ADD COLUMN` clauses (each of which now yields its own
+  operation).
+- **`NOT NULL` / `DEFAULT` are read from the parsed column definition.**
+  Previously E001 substring-matched the whole statement, so a `NOT NULL` in a
+  comment, a string literal, or a `CHECK (...)` expression triggered the rule.
+- **Comments are ignored during semantic analysis.** Lint, safety analysis,
+  and changelog extraction now run against a comment-blanked copy of each
+  file. Blanking preserves byte offsets, so diagnostics still point at the
+  real statement rather than a preceding comment.
+- **Accurate diagnostic line numbers.** Rules previously reported the first
+  occurrence of a keyword anywhere in the file and counted lines off-by-one.
+  Each finding now anchors to its own statement — E001 points at the column
+  name — and line numbers are 1-based and exact.
+- `W003` (`ALTER COLUMN TYPE`) evaluated its keyword guard against the whole
+  file, so one matching statement could tag unrelated ones. It is now
+  evaluated per statement.
+- `W006` (volatile `DEFAULT`) matched `now()` / `random()` /
+  `gen_random_uuid()` anywhere in the file. It now reads the column's own
+  parsed `DEFAULT` expression, so a sibling clause in the same `ALTER TABLE` —
+  or an unrelated `UPDATE ... now()` — no longer flags it.
+- `E002` counted DDL *operations* rather than statements; a single
+  `ALTER TABLE` with two `ADD COLUMN` clauses no longer trips it.
+- `split_statements` now respects double-quoted and backtick-quoted
+  identifiers, so a `;` inside a quoted identifier no longer splits a
+  statement.
+
+### Added
+
+- **Scoped lint suppression with a mandatory reason.** `--disable E001`
+  silences a rule for the whole run; these directives silence one statement
+  or one file:
+
+  ```sql
+  -- waypoint:lint-ignore E001 reason="table is empty until the backfill runs"
+  ALTER TABLE reid_shares ADD COLUMN threshold smallint NOT NULL;
+  ```
+
+  `-- waypoint:lint-ignore-file <RULES> reason=<why>` covers the whole file.
+  A directive without a rule list or without a reason is rejected with the new
+  `E003` and takes no effect. Applied suppressions and their justifications
+  are reported in both pretty and `--json` output; a directive that matches
+  nothing is flagged with the new `I002`.
+- **Signed release checksums.** Every release now publishes `SHA256SUMS` over
+  all platform archives, plus a keyless cosign signature (`SHA256SUMS.sig`)
+  and certificate (`SHA256SUMS.pem`). `install.sh` verifies the downloaded
+  archive automatically (`WAYPOINT_SKIP_CHECKSUM=1` to bypass).
+- `sql_parser::extract_ddl_operations_located`, `strip_comments`, and
+  `LocatedDdl` for callers that need source positions.
+
+### Changed
+
+- `DdlOperation::AlterTableAddColumn` gained `if_not_exists` and
+  `default_expr` fields, and `LintReport` gained `suppressions` /
+  `suppressed_count`. These are additive but break exhaustive struct-literal
+  construction and exhaustive patterns in downstream code.
+
 ## [0.4.0] - 2026-05-11
 
 ### Added — MySQL 8.0+ support (opt-in via `mysql` Cargo feature)
@@ -209,6 +275,8 @@ Closed the four production cautions previously documented in `docs/ENGINES.md`:
 - CI/CD with GitHub Actions
 - Colored table output with `comfy-table`
 
+[0.5.0]: https://github.com/tensorbee/waypoint/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/tensorbee/waypoint/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/tensorbee/waypoint/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/tensorbee/waypoint/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/tensorbee/waypoint/compare/v0.1.0...v0.1.1
