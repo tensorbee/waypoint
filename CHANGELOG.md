@@ -5,6 +5,92 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-07-30
+
+### Breaking
+
+- **`ssl_mode = "require"` no longer verifies the server certificate.**
+  `SslMode` now implements libpq's full ladder — `disable`, `prefer`,
+  `require`, `verify-ca`, `verify-full` — and each rung carries libpq's
+  meaning. Previously `require` verified against the Mozilla CA bundle, which
+  matched neither libpq's `require` (encrypt, do not authenticate) nor its
+  `verify-full`. **If you set `require` and want the certificate checked,
+  change it to `verify-full`.** In practice most `require` users were not
+  getting verification anyway: a verification failure fell through to the
+  plaintext path described below.
+- **`DatabaseConfig` gained an `ssl_root_cert` field** and `SslMode` gained two
+  variants. Both are additive and `Default` is unchanged, but an exhaustive
+  struct literal or an exhaustive `match` on `SslMode` will need updating.
+  `CliOverrides` gained the matching field.
+- `ssl_mode = "allow"` is now rejected with an error naming `prefer`. libpq's
+  `allow` prefers *plaintext* and only upgrades if the server refuses, so
+  silently treating it as `prefer` would have inverted the preference order.
+- `db::connect`, `db::connect_with_config` and `db::connect_with_full_config`
+  are deprecated in favour of `db::connect_with_transport`, which takes a
+  `TransportConfig`. The old signatures cannot express `ssl_root_cert`. They
+  still work and are scheduled for removal in 1.0.
+
+### Fixed
+
+- **`ssl_mode = "require"` did not require TLS.** Waypoint chose the TLS
+  *connector* but never set `tokio_postgres::Config::ssl_mode`, and
+  `connection_string()` never emitted `sslmode=`. tokio-postgres therefore
+  stayed at its own default of `Prefer`, which accepts a server that answers
+  the SSLRequest with "no" and continues in cleartext. A PostgreSQL server with
+  TLS switched off silently produced an unencrypted connection under
+  `require`. The mode is now pushed into the driver config, so `require` and
+  above genuinely refuse to proceed unencrypted.
+- **`prefer` silently downgraded to plaintext on any TLS error, including
+  certificate failures.** The fallback caught every error and retried without
+  TLS, logging only at `debug`. Against a server using a private CA — RDS with
+  a private CA, or any internal PKI — the default configuration therefore ran
+  unencrypted with no indication. `prefer` now relies on tokio-postgres's
+  in-band downgrade, which only triggers when the server actually declines
+  TLS; a handshake failure is reported instead of being papered over. This also
+  removes a second connection attempt that doubled authentication attempts
+  against the server on every plaintext connect.
+- **MySQL ignored `ssl_mode` entirely.** `connect_for_url` passed the setting
+  only down the PostgreSQL arm and built the MySQL pool with a bare
+  `Pool::from_url`, so MySQL connections were plaintext unless the URL itself
+  carried `require_ssl=true`. The full ladder now applies to both engines.
+- A `sslmode=verify-ca` or `sslmode=verify-full` embedded in a connection URL
+  was a hard parse error, as was `sslrootcert=` — tokio-postgres rejects the
+  first as an invalid value and the second as an unknown option. Both are now
+  lifted out of the connection string and honoured, so an ordinary libpq or
+  JDBC-shaped URL works.
+- An invalid `WAYPOINT_SSL_MODE` or `--ssl-mode` was discarded with no message
+  at all, leaving the connection on `prefer`. A typo in either now warns.
+
+### Added
+
+- **`ssl_root_cert`** — a PEM file of CA certificates to verify the server
+  against, settable as `[database] ssl_root_cert`, `WAYPOINT_SSL_ROOT_CERT`,
+  `--ssl-root-cert`, or `sslrootcert=` in a connection URL. Matching libpq's
+  `sslrootcert`, it **replaces** the built-in Mozilla trust store rather than
+  adding to it — the point of pinning a private CA is that the public ones no
+  longer apply. Only the verifying modes read it, and a missing, unreadable or
+  certificate-free file is an error rather than a quiet fallback to the default
+  roots. `[[databases]]` entries inherit it along with the rest of `[database]`.
+- `SSL_ROOT_CERT` is passed through by the Docker entrypoint, so a CA can be
+  mounted into the container.
+
+### Changed
+
+- TLS trust policy for both engines now lives in one new module,
+  `waypoint-core/src/tls.rs`, so the PostgreSQL and MySQL paths cannot drift.
+- MySQL refuses `require` and above over a Unix socket. `mysql_async` sends the
+  SSLRequest and then skips the upgrade for socket connections, which would
+  otherwise hand back a plaintext session reporting success.
+- `verify-ca` on MySQL warns that it behaves as `verify-full`. `mysql_async`
+  0.37 detects a hostname mismatch by looking for `NotValidForName` in the
+  rustls error text, and rustls 0.23 renders that error as `certificate not
+  valid for name …`, so the relaxation never takes effect. Waypoint still
+  requests it — it starts working as soon as the driver matches on the error
+  enum — and says so, since the failure is stricter than requested rather than
+  weaker. See `docs/ENGINES.md`.
+- No new dependencies. The CA PEM is parsed through `rustls::pki_types::pem`,
+  which is already in the graph, rather than adding `rustls-pemfile`.
+
 ## [0.6.1] - 2026-07-29
 
 ### Fixed
@@ -393,6 +479,9 @@ Closed the four production cautions previously documented in `docs/ENGINES.md`:
 - CI/CD with GitHub Actions
 - Colored table output with `comfy-table`
 
+[0.7.0]: https://github.com/tensorbee/waypoint/compare/v0.6.1...v0.7.0
+[0.6.1]: https://github.com/tensorbee/waypoint/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/tensorbee/waypoint/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/tensorbee/waypoint/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/tensorbee/waypoint/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/tensorbee/waypoint/compare/v0.2.0...v0.3.0

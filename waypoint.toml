@@ -9,6 +9,14 @@
 # password = "password"
 # database = "mydb"
 
+# TLS, using libpq's names and meanings. Note that "require" encrypts but does
+# not verify the server — use "verify-full" if you need its identity checked.
+# ssl_mode = "prefer"   # disable | prefer | require | verify-ca | verify-full
+
+# CA certificate(s) to verify the server against. Replaces the built-in Mozilla
+# trust store rather than adding to it, and is only read by verify-ca/verify-full.
+# ssl_root_cert = "/etc/ssl/certs/internal-ca.pem"
+
 [migrations]
 locations = ["db/migrations"]
 table = "waypoint_schema_history"

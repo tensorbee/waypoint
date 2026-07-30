@@ -59,7 +59,8 @@ The same environment variables work:
 | `DB_USERNAME` | `postgres` | Database user |
 | `DB_PASSWORD` | (empty) | Database password |
 | `CONNECT_RETRIES` | `50` | Connection retry attempts |
-| `SSL_MODE` | `prefer` | TLS mode: `disable`, `prefer`, `require` |
+| `SSL_MODE` | `prefer` | TLS mode: `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
+| `SSL_ROOT_CERT` | (empty) | Path to a CA PEM file inside the container; replaces the built-in trust store |
 | `LOCATIONS` | `/waypoint/sql` | Migration file directory |
 
 ## Entrypoint Behavior
@@ -144,7 +145,19 @@ docker run --rm --entrypoint waypoint \
 
 ## TLS Connections
 
-The image includes Mozilla CA certificates. Control via `SSL_MODE`:
+The image includes the Mozilla CA bundle. `SSL_MODE` takes libpq's values and
+libpq's meanings:
+
+| Mode | TLS | Chain verified | Hostname verified |
+|---|---|---|---|
+| `disable` | no | — | — |
+| `prefer` (default) | opportunistic, may end up plaintext | no | no |
+| `require` | mandatory | no | no |
+| `verify-ca` | mandatory | yes | no |
+| `verify-full` | mandatory | yes | yes |
+
+Note that `require` encrypts but does **not** authenticate the server. Use
+`verify-full` when you need the server's identity checked.
 
 ```bash
 docker run --rm \
@@ -153,9 +166,31 @@ docker run --rm \
   -e DB_NAME=mydb \
   -e DB_USERNAME=admin \
   -e DB_PASSWORD=secret \
-  -e SSL_MODE=require \
+  -e SSL_MODE=verify-full \
   tensorbeeio/waypoint
 ```
+
+### Private certificate authority
+
+For a server whose certificate is issued by an internal CA, mount the CA file
+and point `SSL_ROOT_CERT` at it. As with libpq's `sslrootcert`, it **replaces**
+the built-in trust store rather than adding to it:
+
+```bash
+docker run --rm \
+  -v ./db/migrations:/waypoint/sql \
+  -v /etc/ssl/certs/internal-ca.pem:/ca.pem:ro \
+  -e DB_HOST=db.internal \
+  -e DB_NAME=mydb \
+  -e DB_USERNAME=admin \
+  -e DB_PASSWORD=secret \
+  -e SSL_MODE=verify-full \
+  -e SSL_ROOT_CERT=/ca.pem \
+  tensorbeeio/waypoint
+```
+
+If the file is missing or contains no certificates the run fails rather than
+silently falling back to the public CA bundle.
 
 ## Exit Codes
 

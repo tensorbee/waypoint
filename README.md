@@ -629,7 +629,8 @@ Config is resolved in priority order (highest wins):
 [database]
 url = "postgres://user:pass@localhost:5432/mydb"
 connect_retries = 5
-ssl_mode = "prefer"          # disable | prefer | require
+ssl_mode = "prefer"          # disable | prefer | require | verify-ca | verify-full
+ssl_root_cert = "/etc/ssl/certs/internal-ca.pem"  # optional; replaces the built-in CA bundle
 connect_timeout = 30         # seconds
 statement_timeout = 0        # seconds, 0 = no limit
 
@@ -686,6 +687,54 @@ disabled_rules = []                # e.g. ["A003", "A006"]
 simulate_before_migrate = false    # Auto-simulate before real migrate
 ```
 
+### TLS and certificate trust
+
+`ssl_mode` uses libpq's names and libpq's meanings, on both PostgreSQL and MySQL:
+
+| Mode | TLS | Chain verified | Hostname verified | Falls back to plaintext |
+|---|---|---|---|---|
+| `disable` | no | — | — | — |
+| `prefer` (default) | opportunistic | no | no | yes, if the server refuses TLS |
+| `require` | mandatory | no | no | no |
+| `verify-ca` | mandatory | yes | no | no |
+| `verify-full` | mandatory | yes | yes | no |
+
+Two things are worth being explicit about:
+
+- **`require` encrypts but does not authenticate.** That is what libpq means by
+  it: an attacker able to intercept the connection can still present their own
+  certificate. Use `verify-full` if you need the server's identity checked.
+- **`prefer` can end up unencrypted.** It is the default because it connects
+  anywhere, not because it is safe. Anything carrying production data wants
+  `require` at minimum, and `verify-full` if you have a CA to verify against.
+
+`ssl_root_cert` points at a PEM file of CA certificates and, matching libpq's
+`sslrootcert`, **replaces** the built-in Mozilla trust store rather than adding
+to it — the point of pinning a private CA is that the public ones no longer
+apply. It is only consulted by `verify-ca` and `verify-full`. If the file is
+missing, unreadable, or contains no certificates, the connection fails; waypoint
+will not quietly fall back to the default roots.
+
+```bash
+waypoint --ssl-mode verify-full --ssl-root-cert /etc/ssl/certs/internal-ca.pem migrate
+```
+
+libpq-style `sslmode=` and `sslrootcert=` parameters embedded in a connection
+URL are also understood, including the `verify-*` values:
+
+```bash
+waypoint --url "postgres://user@db.internal/app?sslmode=verify-full&sslrootcert=/etc/ssl/ca.pem" migrate
+```
+
+An explicitly configured `ssl_mode` wins over one embedded in the URL; a URL
+value applies when `ssl_mode` is left at its default.
+
+**MySQL caveats.** `verify-ca` currently behaves as `verify-full` — the driver
+cannot skip hostname validation against the TLS backend we use, so the name is
+checked too, and waypoint warns when you select it. TLS also cannot be used over
+a Unix socket; `require` and above will refuse rather than hand back a
+connection that looks encrypted but is not. See [docs/ENGINES.md](docs/ENGINES.md).
+
 ### Multi-Database Configuration
 
 Manage migrations across multiple databases with dependency ordering:
@@ -726,7 +775,8 @@ Per-database env vars: `WAYPOINT_DB_{NAME}_URL` (e.g., `WAYPOINT_DB_AUTH_DB_URL`
 | Variable | Description |
 |---|---|
 | `WAYPOINT_DATABASE_URL` | Database connection URL |
-| `WAYPOINT_SSL_MODE` | TLS mode: `disable`, `prefer`, `require` |
+| `WAYPOINT_SSL_MODE` | TLS mode: `disable`, `prefer`, `require`, `verify-ca`, `verify-full` |
+| `WAYPOINT_SSL_ROOT_CERT` | PEM file of CA certificates; replaces the built-in trust store |
 | `WAYPOINT_CONNECT_TIMEOUT` | Connection timeout in seconds |
 | `WAYPOINT_STATEMENT_TIMEOUT` | Statement timeout in seconds |
 | `WAYPOINT_CONNECT_RETRIES` | Number of connection retry attempts |
@@ -749,7 +799,8 @@ Global options (can be placed before or after the subcommand):
       --table <TABLE>            History table name
       --locations <PATHS>        Migration locations (comma-separated)
       --connect-retries <N>      Connection retry attempts
-      --ssl-mode <MODE>          TLS mode: disable, prefer, require
+      --ssl-mode <MODE>          TLS mode: disable, prefer, require, verify-ca, verify-full
+      --ssl-root-cert <PATH>     CA certificate PEM file (replaces the built-in trust store)
       --connect-timeout <SECS>   Connection timeout (default: 30)
       --statement-timeout <SECS> Statement timeout (default: 0)
       --out-of-order             Allow out-of-order migrations

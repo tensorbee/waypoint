@@ -45,7 +45,9 @@ pub async fn execute(
 
     let target_snapshot = match target {
         DiffTarget::Database(ref url) => {
-            let target_client = crate::db::connect(url).await?;
+            let target_client =
+                crate::db::connect_with_transport(url, &crate::db::TransportConfig::default())
+                    .await?;
             schema::introspect(&target_client, schema_name).await?
         }
     };

@@ -198,6 +198,39 @@ isn't recreated there. Those views' simulation steps fail with a debug-log
 warning; if your migrations reference such views via `SELECT`, simulate
 won't catch errors against them.
 
+### 10. TLS: `verify-ca` and Unix sockets differ on MySQL
+
+`ssl_mode` uses libpq's ladder on both engines (`disable`, `prefer`,
+`require`, `verify-ca`, `verify-full`), and `ssl_root_cert` replaces the
+built-in trust store on both. Two rungs behave differently on MySQL.
+
+**`verify-ca` behaves as `verify-full`.** It is supposed to verify the
+certificate chain while ignoring the hostname. `mysql_async` 0.37 implements
+that by testing whether the rustls error's text contains `NotValidForName` —
+but rustls 0.23 renders that error as `certificate not valid for name …`, so
+the check never matches and the hostname ends up being verified after all.
+Waypoint still asks for the relaxation (it costs nothing and starts working
+the moment the driver matches on the error enum instead of its text) and warns
+when you select `verify-ca` on MySQL, so a certificate rejected for its name
+tells you why. The failure is in the safe direction — stricter than asked, not
+weaker — but it means a certificate issued to a different name will be
+rejected where PostgreSQL would accept it.
+
+**TLS cannot be used over a Unix socket.** `mysql_async` sends the SSLRequest
+packet and then skips the upgrade for socket connections, yielding a plaintext
+session that reports success. Waypoint refuses up front when `ssl_mode` is
+`require` or above and the connection targets a socket, rather than returning
+a connection that looks encrypted and is not. Use a TCP `host:port`, or set
+`ssl_mode = "disable"` if the socket is trusted.
+
+On PostgreSQL, `prefer` downgrades to plaintext in band — tokio-postgres sends
+the SSLRequest and continues unencrypted on the same socket if the server
+declines. On MySQL there is no opportunistic mode in the driver, so `prefer`
+makes one eager probe connection with TLS and rebuilds the pool without it if
+the server turns out not to support TLS. That probe connection is returned to
+the pool, so the successful path costs nothing extra; the fallback happens only
+for genuinely TLS-related failures, never for a bad password.
+
 ## Preflight checks
 
 The check names and numbers match across engines, but the underlying signal

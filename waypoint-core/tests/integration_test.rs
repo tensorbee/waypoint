@@ -51,10 +51,18 @@ fn test_config(schema: &str, migrations_dir: &str) -> WaypointConfig {
     }
 }
 
+/// Helper: connect with default transport settings.
+///
+/// The suite used to call the now-deprecated `db::connect`; this keeps the call
+/// sites short while going through the supported entry point.
+async fn connect_test(url: &str) -> waypoint_core::error::Result<tokio_postgres::Client> {
+    db::connect_with_transport(url, &db::TransportConfig::default()).await
+}
+
 /// Helper: connect, create a fresh schema, return client + schema name.
 async fn setup_schema(prefix: &str) -> (tokio_postgres::Client, String) {
     let url = get_test_url();
-    let client = db::connect(&url).await.expect("Failed to connect to DB");
+    let client = connect_test(&url).await.expect("Failed to connect to DB");
 
     // Use a unique schema name per test to avoid collisions
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
@@ -151,7 +159,7 @@ async fn test_migrate_applies_versioned_migrations() {
     assert_eq!(report2.migrations_applied, 0);
 
     // Verify table exists by querying it
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     let rows = conn
         .query(&format!("SELECT column_name FROM information_schema.columns WHERE table_schema = '{}' AND table_name = 'things' ORDER BY ordinal_position", schema), &[])
         .await
@@ -205,13 +213,13 @@ async fn test_migrate_applies_repeatable_and_reapplies_on_change() {
     )
     .unwrap();
 
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config, client2);
 
     let report2 = wp2.migrate(None).await.expect("second migrate failed");
     assert_eq!(report2.migrations_applied, 1); // Only R re-applied
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -239,7 +247,7 @@ async fn test_info_shows_correct_states() {
     assert_eq!(report.migrations_applied, 1);
 
     // Now check info
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config, client2);
     let infos = wp2.info().await.expect("info failed");
 
@@ -249,7 +257,7 @@ async fn test_info_shows_correct_states() {
     assert_eq!(infos[1].state, MigrationState::Pending);
     assert_eq!(infos[1].version.as_deref(), Some("2"));
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
 }
 
@@ -283,13 +291,13 @@ async fn test_validate_detects_checksum_mismatch() {
     // Validate should fail
     let mut config2 = config;
     config2.migrations.validate_on_migrate = false;
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config2, client2);
 
     let result = wp2.validate().await;
     assert!(result.is_err(), "validate should fail on checksum mismatch");
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -317,7 +325,7 @@ async fn test_repair_removes_failed_and_updates_checksums() {
     wp.migrate(None).await.expect("migrate failed");
 
     // Manually insert a failed row
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     history::insert_applied_migration(
         &client2,
         &schema,
@@ -344,14 +352,14 @@ async fn test_repair_removes_failed_and_updates_checksums() {
     )
     .unwrap();
 
-    let client3 = db::connect(&get_test_url()).await.unwrap();
+    let client3 = connect_test(&get_test_url()).await.unwrap();
     let wp3 = Waypoint::with_client(config, client3);
     let report = wp3.repair().await.expect("repair failed");
 
     assert_eq!(report.failed_removed, 1);
     assert_eq!(report.checksums_updated, 1);
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -367,7 +375,7 @@ async fn test_baseline_inserts_baseline_row() {
     wp.baseline(Some("3"), None).await.expect("baseline failed");
 
     // Check that baseline row exists
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let applied = history::get_applied_migrations(&client2, &schema, "waypoint_schema_history")
         .await
         .unwrap();
@@ -382,7 +390,7 @@ async fn test_baseline_inserts_baseline_row() {
     let result = wp2.baseline(None, None).await;
     assert!(result.is_err(), "second baseline should fail");
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
 }
 
@@ -412,14 +420,14 @@ async fn test_baseline_prevents_old_migrations() {
     wp.baseline(Some("2"), None).await.expect("baseline failed");
 
     // Migrate — should only apply V3
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config, client2);
     let report = wp2.migrate(None).await.expect("migrate failed");
 
     assert_eq!(report.migrations_applied, 1);
     assert_eq!(report.details[0].version.as_deref(), Some("3"));
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
 }
 
@@ -437,7 +445,7 @@ async fn test_clean_drops_everything() {
     wp.migrate(None).await.expect("migrate failed");
 
     // Verify table exists
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let exists = client2
         .query_one(
             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'clean_tbl')",
@@ -452,7 +460,7 @@ async fn test_clean_drops_everything() {
     assert!(!dropped.is_empty());
 
     // Verify table is gone
-    let client3 = db::connect(&get_test_url()).await.unwrap();
+    let client3 = connect_test(&get_test_url()).await.unwrap();
     let exists2 = client3
         .query_one(
             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'clean_tbl')",
@@ -477,7 +485,7 @@ async fn test_clean_disabled_by_default() {
     let result = wp.clean(false).await;
     assert!(result.is_err(), "clean should fail when disabled");
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
 }
 
@@ -509,12 +517,12 @@ async fn test_out_of_order_rejected_by_default() {
     )
     .unwrap();
 
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config, client2);
     let result = wp2.migrate(None).await;
     assert!(result.is_err(), "out-of-order should be rejected");
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -548,7 +556,7 @@ async fn test_out_of_order_allowed_when_enabled() {
     .unwrap();
 
     config.migrations.out_of_order = true;
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config, client2);
     let report = wp2
         .migrate(None)
@@ -557,7 +565,7 @@ async fn test_out_of_order_allowed_when_enabled() {
     assert_eq!(report.migrations_applied, 1);
     assert_eq!(report.details[0].version.as_deref(), Some("1"));
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -588,7 +596,7 @@ async fn test_target_version_limits_migration() {
     assert_eq!(report.migrations_applied, 2);
     assert_eq!(report.details.last().unwrap().version.as_deref(), Some("2"));
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
 }
 
@@ -621,7 +629,7 @@ async fn test_undo_manual_u_file() {
     assert_eq!(report.migrations_applied, 2);
 
     // Undo the last migration (V2)
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config.clone(), client2);
     let undo_report = wp2.undo(UndoTarget::Last).await.expect("undo failed");
     assert_eq!(undo_report.migrations_undone, 1);
@@ -629,7 +637,7 @@ async fn test_undo_manual_u_file() {
     assert!(!undo_report.details[0].auto_reversal);
 
     // Verify only V1 is effectively applied via info
-    let client3 = db::connect(&get_test_url()).await.unwrap();
+    let client3 = connect_test(&get_test_url()).await.unwrap();
     let wp3 = Waypoint::with_client(config, client3);
     let infos = wp3.info().await.expect("info failed");
     // V1 should be applied, V2 should be pending (since it was undone)
@@ -641,7 +649,7 @@ async fn test_undo_manual_u_file() {
     assert_eq!(applied[0].version.as_deref(), Some("1"));
 
     // Verify the column was actually dropped
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     let rows = conn
         .query(
             "SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'undo_tbl' ORDER BY ordinal_position",
@@ -684,7 +692,7 @@ async fn test_undo_with_count() {
     assert_eq!(report.migrations_applied, 3);
 
     // Undo the last 2 migrations
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config.clone(), client2);
     let undo_report = wp2
         .undo(UndoTarget::Count(2))
@@ -693,7 +701,7 @@ async fn test_undo_with_count() {
     assert_eq!(undo_report.migrations_undone, 2);
 
     // Verify only V1 remains effectively applied
-    let client3 = db::connect(&get_test_url()).await.unwrap();
+    let client3 = connect_test(&get_test_url()).await.unwrap();
     let applied = history::get_applied_migrations(&client3, &schema, "waypoint_schema_history")
         .await
         .unwrap();
@@ -733,7 +741,7 @@ async fn test_undo_to_target_version() {
     assert_eq!(report.migrations_applied, 3);
 
     // Undo to version "1" — V2 and V3 should be undone
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config.clone(), client2);
     let target = MigrationVersion::parse("1").unwrap();
     let undo_report = wp2
@@ -743,7 +751,7 @@ async fn test_undo_to_target_version() {
     assert_eq!(undo_report.migrations_undone, 2);
 
     // Verify effective state
-    let client3 = db::connect(&get_test_url()).await.unwrap();
+    let client3 = connect_test(&get_test_url()).await.unwrap();
     let applied = history::get_applied_migrations(&client3, &schema, "waypoint_schema_history")
         .await
         .unwrap();
@@ -778,7 +786,7 @@ async fn test_batch_transaction_mode() {
     assert_eq!(report.migrations_applied, 2);
 
     // Verify both tables exist
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     for tbl in &["batch_t1", "batch_t2"] {
         let exists = conn
             .query_one(
@@ -817,7 +825,7 @@ async fn test_batch_transaction_rollback_on_failure() {
     assert!(result.is_err(), "batch migrate should fail on bad SQL");
 
     // Verify V1 table does NOT exist — the whole batch should have been rolled back
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     let exists = conn
         .query_one(
             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'batch_ok')",
@@ -882,7 +890,7 @@ async fn test_environment_scoping() {
     assert_eq!(report.details[0].version.as_deref(), Some("2"));
 
     // Verify that only env_all table exists, not env_prod
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     let exists_prod = conn
         .query_one(
             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'env_prod')",
@@ -932,7 +940,7 @@ async fn test_placeholders() {
     assert_eq!(report.migrations_applied, 1);
 
     // Verify the table was created with the replaced name
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     let exists = conn
         .query_one(
             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'placeholder_tbl')",
@@ -986,7 +994,7 @@ async fn test_hooks_before_migrate() {
     assert!(report.hooks_executed > 0, "hooks should have been executed");
 
     // Verify the hook ran by checking the log table exists
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     let exists = conn
         .query_one(
             "SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_schema = $1 AND table_name = 'hook_log')",
@@ -1082,7 +1090,7 @@ async fn test_snapshot_and_drift() {
         strip_definer_mysql: true,
     };
 
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     client2
         .batch_execute(&format!("SET search_path TO {}", quote_ident(&schema)))
         .await
@@ -1098,7 +1106,7 @@ async fn test_snapshot_and_drift() {
     )
     .unwrap();
 
-    let client3 = db::connect(&get_test_url()).await.unwrap();
+    let client3 = connect_test(&get_test_url()).await.unwrap();
     client3
         .batch_execute(&format!("SET search_path TO {}", quote_ident(&schema)))
         .await
@@ -1107,7 +1115,7 @@ async fn test_snapshot_and_drift() {
     wp3.migrate(None).await.expect("migrate V2 failed");
 
     // Run drift detection — should detect no drift since migrations match DB
-    let client4 = db::connect(&get_test_url()).await.unwrap();
+    let client4 = connect_test(&get_test_url()).await.unwrap();
     let wp4 = Waypoint::with_client(config.clone(), client4);
     let drift_report = wp4.drift().await.expect("drift detection failed");
     assert!(
@@ -1116,7 +1124,7 @@ async fn test_snapshot_and_drift() {
     );
 
     // Now introduce manual drift by adding a column outside migrations
-    let client5 = db::connect(&get_test_url()).await.unwrap();
+    let client5 = connect_test(&get_test_url()).await.unwrap();
     client5
         .batch_execute(&format!(
             "ALTER TABLE {}.snap_tbl ADD COLUMN extra_col TEXT;",
@@ -1134,7 +1142,7 @@ async fn test_snapshot_and_drift() {
     );
 
     // Cleanup
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&snap_dir);
@@ -1178,7 +1186,7 @@ async fn test_safety_analysis_drop_table() {
         .any(|s| s.data_loss);
     assert!(has_data_loss, "DROP TABLE should be flagged as data loss");
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
 }
 
@@ -1218,7 +1226,7 @@ async fn test_advisor_detects_table_without_pk() {
     let advisory = a004.unwrap();
     assert_eq!(advisory.object, "no_pk_tbl");
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
 }
 
@@ -1234,7 +1242,7 @@ async fn test_advisory_lock_prevents_concurrent_access() {
         .expect("first lock acquire failed");
 
     // Try to acquire the same lock on a second connection with a short timeout
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let result = db::acquire_advisory_lock_with_timeout(&client2, table, 2).await;
     assert!(
         result.is_err(),
@@ -1292,7 +1300,7 @@ async fn test_dotted_version_numbers() {
     assert_eq!(report.details[2].version.as_deref(), Some("2.0"));
 
     // Verify all three tables exist
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     for tbl in &["dot_t1", "dot_t2", "dot_t3"] {
         let exists = conn
             .query_one(
@@ -1349,7 +1357,7 @@ async fn test_validate_on_migrate_detects_modification() {
     let mut config2 = test_config(&schema, dir.to_str().unwrap());
     config2.migrations.validate_on_migrate = true;
 
-    let client2 = db::connect(&get_test_url()).await.unwrap();
+    let client2 = connect_test(&get_test_url()).await.unwrap();
     let wp2 = Waypoint::with_client(config2, client2);
     let result = wp2.migrate(None).await;
     assert!(
@@ -1357,7 +1365,7 @@ async fn test_validate_on_migrate_detects_modification() {
         "migrate should fail when validate_on_migrate detects checksum change"
     );
 
-    let conn = db::connect(&get_test_url()).await.unwrap();
+    let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
     let _ = std::fs::remove_dir_all(&dir);
 }

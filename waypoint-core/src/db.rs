@@ -5,8 +5,10 @@
 //! New code paths should use [`DbClient`] which abstracts over the configured
 //! backend (PostgreSQL or MySQL).
 
+use crate::config::SslMode;
 use crate::dialect::{DatabaseDialect, DialectKind};
 use crate::error::{Result, WaypointError};
+use std::path::PathBuf;
 
 #[cfg(feature = "postgres")]
 use fastrand;
@@ -14,8 +16,55 @@ use fastrand;
 #[cfg(feature = "postgres")]
 use tokio_postgres::Client;
 
-#[cfg(feature = "postgres")]
-use crate::config::SslMode;
+/// Transport-level connection settings: how to reach the server and how much
+/// to trust it.
+///
+/// Introduced to stop the connect helpers growing another positional argument
+/// — [`connect_with_full_config`] already took six, and TLS trust needs two
+/// more. Build one with [`TransportConfig::from_database_config`].
+#[derive(Debug, Clone)]
+pub struct TransportConfig {
+    /// TLS mode; see [`SslMode`] for the ladder.
+    pub ssl_mode: SslMode,
+    /// PEM file of CA certificates that replaces the built-in trust store.
+    pub ssl_root_cert: Option<PathBuf>,
+    /// Connection attempts to retry before giving up.
+    pub retries: u32,
+    /// Per-attempt connection timeout in seconds (0 disables).
+    pub connect_timeout_secs: u32,
+    /// `statement_timeout` to set once connected (0 leaves it alone).
+    pub statement_timeout_secs: u32,
+    /// TCP keepalive interval in seconds (0 disables).
+    pub keepalive_secs: u32,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        // Mirrors `DatabaseConfig::default` so the two cannot drift apart.
+        Self {
+            ssl_mode: SslMode::Prefer,
+            ssl_root_cert: None,
+            retries: 0,
+            connect_timeout_secs: 30,
+            statement_timeout_secs: 0,
+            keepalive_secs: 120,
+        }
+    }
+}
+
+impl TransportConfig {
+    /// Extract the transport settings from a loaded `[database]` config.
+    pub fn from_database_config(db: &crate::config::DatabaseConfig) -> Self {
+        Self {
+            ssl_mode: db.ssl_mode,
+            ssl_root_cert: db.ssl_root_cert.clone(),
+            retries: db.connect_retries,
+            connect_timeout_secs: db.connect_timeout_secs,
+            statement_timeout_secs: db.statement_timeout_secs,
+            keepalive_secs: db.keepalive_secs,
+        }
+    }
+}
 
 /// Quote a SQL identifier to prevent SQL injection.
 ///
@@ -403,22 +452,18 @@ impl DbClient {
 /// (SSL mode, retries, timeouts, keepalive).
 pub async fn connect_for_url(
     conn_string: &str,
-    #[cfg_attr(not(feature = "postgres"), allow(unused_variables))]
+    #[cfg_attr(
+        not(any(feature = "postgres", feature = "mysql")),
+        allow(unused_variables)
+    )]
     config: &crate::config::WaypointConfig,
 ) -> Result<DbClient> {
     let kind = DialectKind::from_url(conn_string).unwrap_or(config.database.engine);
     match kind {
         #[cfg(feature = "postgres")]
         DialectKind::Postgres => {
-            let client = connect_with_full_config(
-                conn_string,
-                &config.database.ssl_mode,
-                config.database.connect_retries,
-                config.database.connect_timeout_secs,
-                config.database.statement_timeout_secs,
-                config.database.keepalive_secs,
-            )
-            .await?;
+            let transport = TransportConfig::from_database_config(&config.database);
+            let client = connect_with_transport(conn_string, &transport).await?;
             Ok(DbClient::with_postgres(client))
         }
         #[cfg(not(feature = "postgres"))]
@@ -427,9 +472,12 @@ pub async fn connect_for_url(
         )),
         #[cfg(feature = "mysql")]
         DialectKind::Mysql => {
-            let pool = mysql_async::Pool::from_url(conn_string).map_err(|e| {
-                WaypointError::ConfigError(format!("Invalid MySQL connection URL: {}", e))
-            })?;
+            let pool = connect_mysql_pool(
+                conn_string,
+                config.database.ssl_mode,
+                config.database.ssl_root_cert.as_deref(),
+            )
+            .await?;
             Ok(DbClient::with_mysql(pool))
         }
         #[cfg(not(feature = "mysql"))]
@@ -437,6 +485,102 @@ pub async fn connect_for_url(
             "MySQL support is not compiled in (enable the `mysql` feature)".into(),
         )),
     }
+}
+
+/// Build a MySQL pool with TLS configured from the `[database]` settings.
+///
+/// Before 0.7.0 this was a bare `Pool::from_url`, which meant `ssl_mode` was
+/// ignored entirely on MySQL and connections ran in plaintext unless the URL
+/// itself carried `require_ssl=true`.
+///
+/// # The `prefer` probe
+///
+/// `mysql_async` has no opportunistic TLS: attaching `SslOpts` makes TLS
+/// *mandatory*, and `Pool` is lazy, so a handshake failure would not surface
+/// until the first query. To give `prefer` its libpq meaning we therefore
+/// connect once eagerly and rebuild the pool without TLS if that fails. The
+/// probe connection is returned to the pool rather than discarded, so the
+/// successful path costs nothing extra. Every other mode stays lazy.
+#[cfg(feature = "mysql")]
+async fn connect_mysql_pool(
+    conn_string: &str,
+    ssl_mode: SslMode,
+    ssl_root_cert: Option<&std::path::Path>,
+) -> Result<mysql_async::Pool> {
+    let base = mysql_async::Opts::from_url(conn_string)
+        .map_err(|e| WaypointError::ConfigError(format!("Invalid MySQL connection URL: {}", e)))?;
+
+    // mysql_async writes the SSLRequest packet and then silently skips the
+    // upgrade for socket connections, handing back a plaintext session that
+    // reports success. Refuse instead of pretending the connection is
+    // encrypted.
+    if ssl_mode.requires_tls() && base.socket().is_some() {
+        return Err(WaypointError::ConfigError(format!(
+            "ssl_mode = '{}' requires TLS, but this MySQL connection uses a Unix \
+             socket, which the driver cannot secure. Use a TCP host:port, or set \
+             ssl_mode = 'disable'.",
+            ssl_mode
+        )));
+    }
+
+    // A URL that already spells out its TLS wishes (`require_ssl`, `verify_ca`,
+    // …) wins while ssl_mode is still at its default, mirroring how the
+    // PostgreSQL path treats an embedded `sslmode=`.
+    if ssl_mode == SslMode::Prefer && base.ssl_opts().is_some() {
+        log::debug!(
+            "Using the TLS options from the MySQL connection URL (ssl_mode is at its default)."
+        );
+        return Ok(mysql_async::Pool::new(base));
+    }
+
+    let Some(ssl_opts) = crate::tls::make_mysql_ssl_opts(ssl_mode, ssl_root_cert) else {
+        // ssl_mode = disable.
+        return Ok(mysql_async::Pool::new(base));
+    };
+
+    let secure = mysql_async::Pool::new(
+        mysql_async::OptsBuilder::from_opts(base.clone()).ssl_opts(Some(ssl_opts)),
+    );
+
+    if ssl_mode != SslMode::Prefer {
+        return Ok(secure);
+    }
+
+    match secure.get_conn().await {
+        Ok(conn) => {
+            drop(conn);
+            Ok(secure)
+        }
+        // Only retry in plaintext when the failure was actually about TLS.
+        // Falling back on *any* error would mask a wrong password behind a
+        // second, differently-failing attempt and double the authentication
+        // attempts against the server.
+        Err(e) if mysql_tls_unavailable(&e) => {
+            log::warn!(
+                "MySQL server does not support TLS ({}); continuing with an UNENCRYPTED \
+                 connection because ssl_mode is 'prefer'. Set ssl_mode to 'require' or \
+                 higher to refuse this.",
+                e
+            );
+            let _ = secure.disconnect().await;
+            Ok(mysql_async::Pool::new(base))
+        }
+        Err(e) => Err(WaypointError::MysqlError(e)),
+    }
+}
+
+/// Did this MySQL connection fail because TLS was unavailable, as opposed to
+/// for an unrelated reason like bad credentials or a refused connection?
+///
+/// Matched on the typed error rather than its `Display` text — the string
+/// approach is exactly what leaves `verify-ca` broken inside mysql_async
+/// itself (see `tls::make_mysql_ssl_opts`).
+#[cfg(feature = "mysql")]
+fn mysql_tls_unavailable(e: &mysql_async::Error) -> bool {
+    matches!(
+        e,
+        mysql_async::Error::Driver(mysql_async::DriverError::NoClientSslFlagFromServer)
+    ) || matches!(e, mysql_async::Error::Io(mysql_async::IoError::Tls(_)))
 }
 
 /// Compute the MySQL named-lock key for a history table in a given database.
@@ -553,18 +697,26 @@ fn unpark_lock_conn(pool: &mysql_async::Pool, key: &str) -> Option<mysql_async::
 
 // ── PostgreSQL-specific connection helpers (legacy entry points) ──────────────
 
-/// Build a rustls ClientConfig using the Mozilla CA bundle and ring crypto provider.
+/// Translate waypoint's [`SslMode`] into tokio-postgres's own three-value mode.
+///
+/// tokio-postgres has no concept of `verify-ca` / `verify-full` — it only
+/// decides whether TLS is *attempted* or *demanded*. All three of our
+/// mandatory modes therefore map to `Require`, and the strength of the
+/// verification is expressed entirely in the rustls verifier built by
+/// [`crate::tls::make_rustls_config`].
+///
+/// Setting this at all is what makes `require` actually require TLS: without
+/// it tokio-postgres defaults to `Prefer` and silently accepts a server that
+/// refuses SSL.
 #[cfg(feature = "postgres")]
-fn make_rustls_config() -> rustls::ClientConfig {
-    let root_store =
-        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_safe_default_protocol_versions()
-    .unwrap()
-    .with_root_certificates(root_store)
-    .with_no_client_auth()
+fn to_pg_ssl_mode(mode: SslMode) -> tokio_postgres::config::SslMode {
+    match mode {
+        SslMode::Disable => tokio_postgres::config::SslMode::Disable,
+        SslMode::Prefer => tokio_postgres::config::SslMode::Prefer,
+        SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {
+            tokio_postgres::config::SslMode::Require
+        }
+    }
 }
 
 /// Check if a postgres error is a permanent authentication failure that should not be retried.
@@ -626,47 +778,39 @@ where
     });
 }
 
-/// Connect to the database using the provided connection string with TLS support.
+/// Make one connection attempt against an already-prepared config.
 ///
-/// Spawns the connection task on the tokio runtime.
+/// `pg_config` carries the enforced `ssl_mode`, and `tls_config` is `None`
+/// only for [`SslMode::Disable`]. Both are built once by the caller so a CA
+/// file is not re-read on every retry.
+///
+/// There is deliberately no outer plaintext retry for `prefer`. Now that the
+/// mode is pushed into `tokio_postgres::Config`, tokio-postgres performs the
+/// `prefer` downgrade *in band* — it sends the SSLRequest, and on the server's
+/// `N` reply continues on the same socket unencrypted. The old code instead
+/// caught every error from the TLS attempt and opened a second connection,
+/// which doubled the authentication attempts against the server (enough to
+/// trip lockout policies) and reported "falling back to plaintext" for
+/// failures that had nothing to do with TLS, such as a refused connection or a
+/// bad password.
 #[cfg(feature = "postgres")]
 async fn connect_once(
-    conn_string: &str,
-    ssl_mode: &SslMode,
+    pg_config: &tokio_postgres::Config,
+    tls_config: Option<&rustls::ClientConfig>,
     connect_timeout_secs: u32,
 ) -> std::result::Result<Client, tokio_postgres::Error> {
     let connect_fut = async {
-        match ssl_mode {
-            SslMode::Disable => {
-                let (client, connection) =
-                    tokio_postgres::connect(conn_string, tokio_postgres::NoTls).await?;
+        match tls_config {
+            None => {
+                let (client, connection) = pg_config.connect(tokio_postgres::NoTls).await?;
                 spawn_connection_task(connection);
                 Ok(client)
             }
-            SslMode::Require => {
-                let tls_config = make_rustls_config();
-                let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
-                let (client, connection) = tokio_postgres::connect(conn_string, tls).await?;
+            Some(tls_config) => {
+                let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config.clone());
+                let (client, connection) = pg_config.connect(tls).await?;
                 spawn_connection_task(connection);
                 Ok(client)
-            }
-            SslMode::Prefer => {
-                // Try TLS first, fall back to plaintext
-                let tls_config = make_rustls_config();
-                let tls = tokio_postgres_rustls::MakeRustlsConnect::new(tls_config);
-                match tokio_postgres::connect(conn_string, tls).await {
-                    Ok((client, connection)) => {
-                        spawn_connection_task(connection);
-                        Ok(client)
-                    }
-                    Err(_) => {
-                        log::debug!("TLS connection failed, falling back to plaintext");
-                        let (client, connection) =
-                            tokio_postgres::connect(conn_string, tokio_postgres::NoTls).await?;
-                        spawn_connection_task(connection);
-                        Ok(client)
-                    }
-                }
             }
         }
     };
@@ -690,8 +834,12 @@ async fn connect_once(
 ///
 /// Spawns the connection task on the tokio runtime.
 #[cfg(feature = "postgres")]
+#[deprecated(
+    since = "0.7.0",
+    note = "Use connect_with_transport, which supports the full sslmode ladder and a custom CA. Will be removed in 1.0."
+)]
 pub async fn connect(conn_string: &str) -> Result<Client> {
-    connect_with_config(conn_string, &SslMode::Prefer, 0, 30, 0).await
+    connect_with_transport(conn_string, &TransportConfig::default()).await
 }
 
 /// Connect to the database, retrying up to `retries` times with exponential backoff + jitter.
@@ -699,6 +847,10 @@ pub async fn connect(conn_string: &str) -> Result<Client> {
 /// Each retry waits `min(2^attempt, 30) + rand(0..1000ms)` before the next attempt.
 /// Permanent errors (authentication failures) are not retried.
 #[cfg(feature = "postgres")]
+#[deprecated(
+    since = "0.7.0",
+    note = "Use connect_with_transport, which supports the full sslmode ladder and a custom CA. Will be removed in 1.0."
+)]
 pub async fn connect_with_config(
     conn_string: &str,
     ssl_mode: &SslMode,
@@ -706,19 +858,25 @@ pub async fn connect_with_config(
     connect_timeout_secs: u32,
     statement_timeout_secs: u32,
 ) -> Result<Client> {
-    connect_with_full_config(
+    connect_with_transport(
         conn_string,
-        ssl_mode,
-        retries,
-        connect_timeout_secs,
-        statement_timeout_secs,
-        120,
+        &TransportConfig {
+            ssl_mode: *ssl_mode,
+            retries,
+            connect_timeout_secs,
+            statement_timeout_secs,
+            ..TransportConfig::default()
+        },
     )
     .await
 }
 
 /// Connect to the database with all configuration options including TCP keepalive.
 #[cfg(feature = "postgres")]
+#[deprecated(
+    since = "0.7.0",
+    note = "Use connect_with_transport — this signature cannot express ssl_root_cert. Will be removed in 1.0."
+)]
 pub async fn connect_with_full_config(
     conn_string: &str,
     ssl_mode: &SslMode,
@@ -727,7 +885,57 @@ pub async fn connect_with_full_config(
     statement_timeout_secs: u32,
     keepalive_secs: u32,
 ) -> Result<Client> {
-    let conn_string = inject_keepalive(conn_string, keepalive_secs);
+    connect_with_transport(
+        conn_string,
+        &TransportConfig {
+            ssl_mode: *ssl_mode,
+            ssl_root_cert: None,
+            retries,
+            connect_timeout_secs,
+            statement_timeout_secs,
+            keepalive_secs,
+        },
+    )
+    .await
+}
+
+/// Connect to PostgreSQL with retry, honouring the full TLS trust configuration.
+///
+/// Unlike the older helpers this actually *enforces* the requested
+/// [`SslMode`]: the mode is pushed into `tokio_postgres::Config`, so a server
+/// that refuses SSL is rejected under `require` and above rather than being
+/// silently downgraded to plaintext.
+#[cfg(feature = "postgres")]
+pub async fn connect_with_transport(
+    conn_string: &str,
+    transport: &TransportConfig,
+) -> Result<Client> {
+    let conn_string = inject_keepalive(conn_string, transport.keepalive_secs);
+
+    // Take libpq's `sslmode=` / `sslrootcert=` out of the string before
+    // tokio-postgres sees it — its parser rejects `verify-ca` / `verify-full`
+    // outright, and rejects `sslrootcert` as an unknown option.
+    let (conn_string, embedded) = crate::tls::parse_url_sslmode(&conn_string);
+    let ssl_mode = crate::tls::reconcile_ssl_mode(transport.ssl_mode, embedded.mode);
+    let ssl_root_cert =
+        crate::tls::reconcile_root_cert(transport.ssl_root_cert.as_deref(), embedded.root_cert);
+
+    let mut pg_config: tokio_postgres::Config = conn_string.parse().map_err(|e| {
+        WaypointError::ConfigError(format!("Invalid PostgreSQL connection string: {}", e))
+    })?;
+    pg_config.ssl_mode(to_pg_ssl_mode(ssl_mode));
+
+    // Built once, outside the retry loop, so the CA file is read at most once
+    // and a bad path fails immediately instead of after every backoff.
+    let tls_config = match ssl_mode {
+        SslMode::Disable => None,
+        _ => Some(crate::tls::make_rustls_config(
+            ssl_mode,
+            ssl_root_cert.as_deref(),
+        )?),
+    };
+
+    let retries = transport.retries;
     let mut last_err = None;
 
     for attempt in 0..=retries {
@@ -745,7 +953,13 @@ pub async fn connect_with_full_config(
             tokio::time::sleep(delay).await;
         }
 
-        match connect_once(&conn_string, ssl_mode, connect_timeout_secs).await {
+        match connect_once(
+            &pg_config,
+            tls_config.as_ref(),
+            transport.connect_timeout_secs,
+        )
+        .await
+        {
             Ok(client) => {
                 if attempt > 0 {
                     log::info!(
@@ -756,9 +970,11 @@ pub async fn connect_with_full_config(
                 }
 
                 // Set statement timeout if configured
-                if statement_timeout_secs > 0 {
-                    let timeout_sql =
-                        format!("SET statement_timeout = '{}s'", statement_timeout_secs);
+                if transport.statement_timeout_secs > 0 {
+                    let timeout_sql = format!(
+                        "SET statement_timeout = '{}s'",
+                        transport.statement_timeout_secs
+                    );
                     client.batch_execute(&timeout_sql).await?;
                 }
 

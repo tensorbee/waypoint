@@ -6,6 +6,7 @@ mod output;
 #[cfg(feature = "self-update")]
 mod self_update;
 
+use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -77,9 +78,14 @@ struct Cli {
     #[arg(long, value_name = "N")]
     connect_retries: Option<u32>,
 
-    /// SSL/TLS mode: disable, prefer, require
+    /// SSL/TLS mode: disable, prefer, require, verify-ca, verify-full
     #[arg(long, value_name = "MODE")]
     ssl_mode: Option<String>,
+
+    /// PEM file of CA certificates used to verify the server, replacing the
+    /// built-in trust store (like libpq's sslrootcert)
+    #[arg(long, value_name = "PATH")]
+    ssl_root_cert: Option<PathBuf>,
 
     /// Connection timeout in seconds (default: 30, 0 = no timeout)
     #[arg(long, value_name = "SECS")]
@@ -431,6 +437,7 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
         },
         connect_retries: cli.connect_retries,
         ssl_mode: cli.ssl_mode,
+        ssl_root_cert: cli.ssl_root_cert,
         connect_timeout: cli.connect_timeout,
         statement_timeout: cli.statement_timeout,
         environment: cli.environment,

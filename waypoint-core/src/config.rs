@@ -56,30 +56,98 @@ macro_rules! apply_option_some_clone {
 }
 
 /// SSL/TLS connection mode.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// These are libpq's `sslmode` values and carry libpq's meanings. In
+/// particular `Require` encrypts but does **not** authenticate the server —
+/// use [`SslMode::VerifyFull`] if you want the certificate chain and hostname
+/// checked. libpq's `allow` is deliberately not supported; see `FromStr`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SslMode {
-    /// Never use TLS (current default behavior).
+    /// Never use TLS.
     Disable,
-    /// Try TLS first, fall back to plaintext.
+    /// Try TLS first (without verifying the certificate), fall back to plaintext.
     #[default]
     Prefer,
-    /// Require TLS — fail if handshake fails.
+    /// Require TLS, but do not verify the server certificate.
     Require,
+    /// Require TLS and verify the certificate chain, but not the hostname.
+    VerifyCa,
+    /// Require TLS and verify both the certificate chain and the hostname.
+    VerifyFull,
+}
+
+impl SslMode {
+    /// Whether this mode verifies the server certificate chain at all.
+    pub fn verifies_certificate(&self) -> bool {
+        matches!(self, SslMode::VerifyCa | SslMode::VerifyFull)
+    }
+
+    /// Whether TLS is mandatory — i.e. a plaintext connection is not acceptable.
+    pub fn requires_tls(&self) -> bool {
+        matches!(
+            self,
+            SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull
+        )
+    }
+
+    /// The canonical libpq spelling, for log and error messages.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SslMode::Disable => "disable",
+            SslMode::Prefer => "prefer",
+            SslMode::Require => "require",
+            SslMode::VerifyCa => "verify-ca",
+            SslMode::VerifyFull => "verify-full",
+        }
+    }
+}
+
+impl fmt::Display for SslMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl std::str::FromStr for SslMode {
     type Err = WaypointError;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s.to_lowercase().as_str() {
+        // Accept `-`, `_` and bare spellings so `verify-ca`, `verify_ca` and
+        // `verifyca` all land in the same place.
+        let normalized = s.to_lowercase().replace(['-', '_'], "");
+        match normalized.as_str() {
             "disable" | "disabled" => Ok(SslMode::Disable),
             "prefer" => Ok(SslMode::Prefer),
             "require" | "required" => Ok(SslMode::Require),
+            "verifyca" => Ok(SslMode::VerifyCa),
+            "verifyfull" => Ok(SslMode::VerifyFull),
+            // libpq's `allow` tries plaintext *first* and only then TLS. We do
+            // not implement it, and aliasing it to `prefer` would quietly give
+            // the opposite preference order, so reject it explicitly.
+            "allow" => Err(WaypointError::ConfigError(
+                "SSL mode 'allow' is not supported. Use 'prefer' to try TLS first \
+                 and fall back to plaintext."
+                    .to_string(),
+            )),
             _ => Err(WaypointError::ConfigError(format!(
-                "Invalid SSL mode '{}'. Use 'disable', 'prefer', or 'require'.",
+                "Invalid SSL mode '{}'. Use 'disable', 'prefer', 'require', \
+                 'verify-ca', or 'verify-full'.",
                 s
             ))),
         }
+    }
+}
+
+/// Apply an `ssl_mode` string from one of the config layers, warning rather
+/// than silently discarding a value that does not parse.
+///
+/// All three layers (TOML, env, CLI) route through here. The env and CLI paths
+/// used to drop bad values with no message at all, which meant a typo in
+/// `WAYPOINT_SSL_MODE` downgraded you to `prefer` invisibly.
+fn apply_ssl_mode(target: &mut SslMode, value: &str, source: &str) {
+    match value.parse() {
+        Ok(mode) => *target = mode,
+        Err(e) => log::warn!("{} (from {}); keeping '{}'.", e, source, target),
     }
 }
 
@@ -133,6 +201,12 @@ pub struct DatabaseConfig {
     pub connect_retries: u32,
     /// SSL/TLS mode for the database connection.
     pub ssl_mode: SslMode,
+    /// PEM file holding the CA certificate(s) used to verify the server.
+    ///
+    /// Mirrors libpq's `sslrootcert`: when set, these certificates **replace**
+    /// the built-in Mozilla trust store rather than adding to it. Only
+    /// consulted by the verifying modes (`verify-ca` / `verify-full`).
+    pub ssl_root_cert: Option<PathBuf>,
     /// Connection timeout in seconds.
     pub connect_timeout_secs: u32,
     /// Statement timeout in seconds (0 means no timeout).
@@ -158,6 +232,7 @@ impl Default for DatabaseConfig {
             database: None,
             connect_retries: 0,
             ssl_mode: SslMode::Prefer,
+            ssl_root_cert: None,
             connect_timeout_secs: 30,
             statement_timeout_secs: 0,
             keepalive_secs: 120,
@@ -177,6 +252,10 @@ impl fmt::Debug for DatabaseConfig {
             .field("database", &self.database)
             .field("connect_retries", &self.connect_retries)
             .field("ssl_mode", &self.ssl_mode)
+            // A CA path is not a secret, so it prints plainly — knowing which
+            // trust anchor was in play is the first thing you want when
+            // debugging a handshake failure.
+            .field("ssl_root_cert", &self.ssl_root_cert)
             .field("connect_timeout_secs", &self.connect_timeout_secs)
             .field("statement_timeout_secs", &self.statement_timeout_secs)
             .field("keepalive_secs", &self.keepalive_secs)
@@ -289,6 +368,7 @@ struct TomlDatabaseConfig {
     database: Option<String>,
     connect_retries: Option<u32>,
     ssl_mode: Option<String>,
+    ssl_root_cert: Option<String>,
     connect_timeout: Option<u32>,
     statement_timeout: Option<u32>,
     keepalive: Option<u32>,
@@ -403,6 +483,8 @@ pub struct CliOverrides {
     pub connect_retries: Option<u32>,
     /// Override the SSL/TLS connection mode.
     pub ssl_mode: Option<String>,
+    /// Override the CA certificate file used to verify the server.
+    pub ssl_root_cert: Option<PathBuf>,
     /// Override the connection timeout in seconds.
     pub connect_timeout: Option<u32>,
     /// Override the statement timeout in seconds.
@@ -488,13 +570,10 @@ impl WaypointConfig {
             apply_option_some!(db.database => self.database.database);
             apply_option!(db.connect_retries => self.database.connect_retries);
             if let Some(v) = db.ssl_mode {
-                match v.parse() {
-                    Ok(mode) => self.database.ssl_mode = mode,
-                    Err(_) => log::warn!(
-                        "Invalid ssl_mode '{}' in config, using default 'prefer'. Valid values: disable, prefer, require",
-                        v
-                    ),
-                }
+                apply_ssl_mode(&mut self.database.ssl_mode, &v, "waypoint.toml");
+            }
+            if let Some(v) = db.ssl_root_cert {
+                self.database.ssl_root_cert = Some(PathBuf::from(v));
             }
             apply_option!(db.connect_timeout => self.database.connect_timeout_secs);
             apply_option!(db.statement_timeout => self.database.statement_timeout_secs);
@@ -703,10 +782,11 @@ impl WaypointConfig {
         {
             self.database.connect_retries = n;
         }
-        if let Ok(v) = std::env::var("WAYPOINT_SSL_MODE")
-            && let Ok(mode) = v.parse()
-        {
-            self.database.ssl_mode = mode;
+        if let Ok(v) = std::env::var("WAYPOINT_SSL_MODE") {
+            apply_ssl_mode(&mut self.database.ssl_mode, &v, "WAYPOINT_SSL_MODE");
+        }
+        if let Ok(v) = std::env::var("WAYPOINT_SSL_ROOT_CERT") {
+            self.database.ssl_root_cert = Some(PathBuf::from(v));
         }
         if let Ok(v) = std::env::var("WAYPOINT_CONNECT_TIMEOUT")
             && let Ok(n) = v.parse::<u32>()
@@ -769,11 +849,9 @@ impl WaypointConfig {
         apply_option_clone!(overrides.baseline_version => self.migrations.baseline_version);
         apply_option!(overrides.connect_retries => self.database.connect_retries);
         if let Some(ref v) = overrides.ssl_mode {
-            // Ignore parse errors here — they'll be caught in validation
-            if let Ok(mode) = v.parse() {
-                self.database.ssl_mode = mode;
-            }
+            apply_ssl_mode(&mut self.database.ssl_mode, v, "--ssl-mode");
         }
+        apply_option_some_clone!(overrides.ssl_root_cert => self.database.ssl_root_cert);
         apply_option!(overrides.connect_timeout => self.database.connect_timeout_secs);
         apply_option!(overrides.statement_timeout => self.database.statement_timeout_secs);
         apply_option_some_clone!(overrides.environment => self.migrations.environment);
@@ -1008,6 +1086,7 @@ mod tests {
             baseline_version: Some("5".to_string()),
             connect_retries: None,
             ssl_mode: None,
+            ssl_root_cert: None,
             connect_timeout: None,
             statement_timeout: None,
             environment: None,
@@ -1226,5 +1305,120 @@ database = "app"
         config.apply_toml(toml_config);
         assert_eq!(config.database.engine, crate::dialect::DialectKind::Mysql);
         assert!(config.connection_string().unwrap().starts_with("mysql://"));
+    }
+
+    #[test]
+    fn test_ssl_mode_parses_the_libpq_ladder() {
+        for (input, want) in [
+            ("disable", SslMode::Disable),
+            ("DISABLE", SslMode::Disable),
+            ("disabled", SslMode::Disable),
+            ("prefer", SslMode::Prefer),
+            ("require", SslMode::Require),
+            ("required", SslMode::Require),
+            ("verify-ca", SslMode::VerifyCa),
+            ("verify_ca", SslMode::VerifyCa),
+            ("verifyca", SslMode::VerifyCa),
+            ("Verify-Full", SslMode::VerifyFull),
+            ("verify_full", SslMode::VerifyFull),
+        ] {
+            assert_eq!(input.parse::<SslMode>().unwrap(), want, "input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_ssl_mode_rejects_allow_and_names_the_alternative() {
+        // libpq's `allow` prefers plaintext; aliasing it to `prefer` would
+        // silently invert the preference order, so it is rejected outright.
+        let err = "allow".parse::<SslMode>().unwrap_err().to_string();
+        assert!(err.contains("not supported"), "got: {}", err);
+        assert!(err.contains("prefer"), "must name the replacement: {}", err);
+    }
+
+    #[test]
+    fn test_ssl_mode_rejects_unknown_values() {
+        assert!("verify".parse::<SslMode>().is_err());
+        assert!("".parse::<SslMode>().is_err());
+        let err = "banana".parse::<SslMode>().unwrap_err().to_string();
+        assert!(
+            err.contains("verify-full"),
+            "should list valid modes: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_ssl_mode_predicates_form_a_ladder() {
+        use SslMode::*;
+        let ladder = [Disable, Prefer, Require, VerifyCa, VerifyFull];
+        assert_eq!(
+            ladder.map(|m| m.requires_tls()),
+            [false, false, true, true, true]
+        );
+        assert_eq!(
+            ladder.map(|m| m.verifies_certificate()),
+            [false, false, false, true, true]
+        );
+    }
+
+    #[test]
+    fn test_ssl_root_cert_defaults_to_none() {
+        assert_eq!(WaypointConfig::default().database.ssl_root_cert, None);
+    }
+
+    #[test]
+    fn test_toml_ssl_root_cert_key() {
+        let toml_str = r#"
+[database]
+url = "postgres://user@localhost/mydb"
+ssl_mode = "verify-full"
+ssl_root_cert = "/etc/ssl/certs/internal-ca.pem"
+"#;
+        let toml_config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut config = WaypointConfig::default();
+        config.apply_toml(toml_config);
+        assert_eq!(config.database.ssl_mode, SslMode::VerifyFull);
+        assert_eq!(
+            config.database.ssl_root_cert,
+            Some(PathBuf::from("/etc/ssl/certs/internal-ca.pem"))
+        );
+    }
+
+    #[test]
+    fn test_invalid_toml_ssl_mode_keeps_the_default() {
+        let toml_str = r#"
+[database]
+url = "postgres://user@localhost/mydb"
+ssl_mode = "verify-fulll"
+"#;
+        let toml_config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut config = WaypointConfig::default();
+        config.apply_toml(toml_config);
+        assert_eq!(config.database.ssl_mode, SslMode::Prefer);
+    }
+
+    #[test]
+    fn test_multi_database_inherits_tls_settings() {
+        // `[[databases]]` entries carry the top-level transport policy, so a
+        // custom CA configured once applies to every target.
+        let toml_str = r#"
+[database]
+ssl_mode = "verify-full"
+ssl_root_cert = "/etc/ssl/ca.pem"
+
+[[databases]]
+name = "orders"
+url = "postgres://user@localhost/orders"
+"#;
+        let toml_config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut config = WaypointConfig::default();
+        config.apply_toml(toml_config);
+        let multi = config.multi_database.expect("expected a multi-db config");
+        let db = &multi[0];
+        assert_eq!(db.database.ssl_mode, SslMode::VerifyFull);
+        assert_eq!(
+            db.database.ssl_root_cert,
+            Some(PathBuf::from("/etc/ssl/ca.pem"))
+        );
     }
 }

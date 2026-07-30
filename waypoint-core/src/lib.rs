@@ -62,6 +62,7 @@ pub mod reversal;
 pub mod safety;
 pub mod schema;
 pub mod sql_parser;
+pub mod tls;
 
 use std::path::PathBuf;
 
