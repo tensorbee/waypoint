@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] - 2026-07-30
+
+### Fixed
+
+- **Preflight panicked on managed PostgreSQL with replication.** The
+  replication-lag check read `pg_wal_lsn_diff()` (which returns
+  `numeric`) into an `i64`, and `pg_stat_replication` only has rows on
+  servers with replication configured, so managed providers
+  (DigitalOcean, RDS class) panicked with
+  `error deserializing column 0` while local servers never executed
+  the path. The query now casts to `bigint` in SQL.
+- **Preflight decode failures degrade instead of panicking.** The lag
+  value is read with `try_get` and any decode error reports the check
+  as `Warn`. Preflight is advisory and must never abort a migration
+  run on its own account.
+
 ## [0.7.0] - 2026-07-30
 
 ### Breaking
