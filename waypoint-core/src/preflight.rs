@@ -216,12 +216,28 @@ async fn check_long_running_queries(client: &Client, threshold_secs: i64) -> Pre
 
 #[cfg(feature = "postgres")]
 async fn check_replication_lag(client: &Client, max_lag_mb: i64) -> PreflightCheck {
-    let query = "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)
+    // pg_wal_lsn_diff returns numeric, which tokio-postgres does not
+    // deserialize into i64, so cast in SQL. The row only exists where
+    // replication is configured (managed providers always have it,
+    // local Postgres never does), which is why this path went
+    // unexercised before 0.7.1.
+    let query = "SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), replay_lsn)::bigint
                  FROM pg_stat_replication
                  ORDER BY replay_lsn ASC LIMIT 1";
     match client.query_opt(query, &[]).await {
         Ok(Some(row)) => {
-            let lag_bytes: Option<i64> = row.get(0);
+            // Preflight is advisory: a decode failure degrades to Warn,
+            // it must never panic the migration run.
+            let lag_bytes: Option<i64> = match row.try_get(0) {
+                Ok(value) => value,
+                Err(e) => {
+                    return PreflightCheck {
+                        name: "Replication Lag".to_string(),
+                        status: CheckStatus::Warn,
+                        detail: format!("Could not decode lag value: {}", e),
+                    };
+                }
+            };
             let lag_mb = lag_bytes.unwrap_or(0) / (1024 * 1024);
             let status = if lag_mb > max_lag_mb {
                 CheckStatus::Warn
