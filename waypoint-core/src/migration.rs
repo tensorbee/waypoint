@@ -272,11 +272,21 @@ pub fn scan_migrations(locations: &[std::path::PathBuf]) -> Result<Vec<ResolvedM
                 continue;
             }
 
-            // Skip files that don't start with V, U, or R
+            // A `.sql` file that is neither a hook nor a `V`/`U`/`R` migration
+            // is skipped — but say so. This used to be a bare `continue`, so
+            // `v1__create_users.sql` with a lowercase `v` (an easy mistake, and
+            // invisible on a case-insensitive filesystem) was never applied and
+            // nothing anywhere mentioned it. The malformed-name branch below
+            // already warns; these two must agree.
             if !filename.starts_with('V')
                 && !filename.starts_with('U')
                 && !filename.starts_with('R')
             {
+                log::warn!(
+                    "Ignoring '{}': migration filenames must start with V (versioned), \
+                     U (undo) or R (repeatable), and the prefix is case-sensitive.",
+                    filename
+                );
                 continue;
             }
 

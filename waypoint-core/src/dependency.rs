@@ -3,7 +3,7 @@
 //! Supports `-- waypoint:depends V3,V5` directives for non-linear
 //! migration ordering using Kahn's algorithm.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use crate::error::{Result, WaypointError};
 use crate::migration::ResolvedMigration;
@@ -136,26 +136,50 @@ impl DependencyGraph {
 
     /// Produce a topologically sorted order of versions using Kahn's algorithm.
     ///
+    /// Ties — migrations that become runnable at the same moment — are broken
+    /// by **version order**, which makes the result deterministic.
+    ///
+    /// This matters more than it looks. The ready set used to be a `VecDeque`
+    /// fed from `reverse_edges`, a `HashSet` whose iteration order is randomly
+    /// seeded per process. Five independent migrations therefore applied in a
+    /// different order on almost every run: the order `explain` previewed was
+    /// not the order `migrate` used, and staging and production disagreed on
+    /// `installed_rank`. Any topological order is *correct*, but only a
+    /// reproducible one is honest.
+    ///
     /// Uses borrowed `&str` references internally to avoid cloning during
     /// the sort; only clones into owned `String`s for the output.
     pub fn topological_sort(&self) -> Result<Vec<String>> {
+        // Rank each version by its position in `all_versions`, which `build`
+        // sorted by parsed version — so "10" ranks after "2", not before it as
+        // a string comparison would have it.
+        let rank: HashMap<&str, usize> = self
+            .all_versions
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.as_str(), i))
+            .collect();
+
         // Compute in-degree for each node using borrowed keys
         let mut in_degree: HashMap<&str, usize> = HashMap::new();
         for v in &self.all_versions {
             in_degree.insert(v, self.edges.get(v).map_or(0, |deps| deps.len()));
         }
 
-        // Start with nodes that have no dependencies
-        let mut queue: VecDeque<&str> = VecDeque::new();
-        for v in &self.all_versions {
-            if *in_degree.get(v.as_str()).unwrap_or(&0) == 0 {
-                queue.push_back(v);
-            }
-        }
+        // Ready set, ordered by version. `BTreeSet` keeps it sorted as nodes
+        // are added, so the next migration is always the lowest-versioned one
+        // whose dependencies are satisfied.
+        let mut ready: std::collections::BTreeSet<(usize, &str)> = self
+            .all_versions
+            .iter()
+            .filter(|v| *in_degree.get(v.as_str()).unwrap_or(&0) == 0)
+            .map(|v| (rank[v.as_str()], v.as_str()))
+            .collect();
 
         let mut sorted = Vec::new();
 
-        while let Some(node) = queue.pop_front() {
+        while let Some(&(_, node)) = ready.iter().next() {
+            ready.remove(&(rank[node], node));
             sorted.push(node.to_string());
 
             // For each node that depends on this one, decrement in-degree
@@ -164,7 +188,7 @@ impl DependencyGraph {
                     let deg = in_degree.get_mut(dep.as_str()).unwrap();
                     *deg -= 1;
                     if *deg == 0 {
-                        queue.push_back(dep);
+                        ready.insert((rank[dep.as_str()], dep.as_str()));
                     }
                 }
             }
@@ -358,5 +382,25 @@ mod tests {
 
         let graph = DependencyGraph::build(&migrations, false).unwrap();
         assert!(graph.topological_sort().is_err());
+    }
+
+    #[test]
+    fn test_topological_sort_is_deterministic_for_independent_migrations() {
+        // V2..V6 all depend only on V1, so all five become ready at once.
+        // Kahn's ready-queue is fed from `reverse_edges`, a HashSet, whose
+        // iteration order is randomly seeded per process — so the apply order
+        // could differ between the `explain` preview and the real run, and
+        // between staging and production.
+        let migs: Vec<ResolvedMigration> = std::iter::once(make_migration("1", vec![]))
+            .chain((2..=6).map(|v| make_migration(&v.to_string(), vec!["1"])))
+            .collect();
+        let refs: Vec<&ResolvedMigration> = migs.iter().collect();
+        let graph = DependencyGraph::build(&refs, true).unwrap();
+        let order = graph.topological_sort().unwrap();
+        assert_eq!(
+            order,
+            vec!["1", "2", "3", "4", "5", "6"],
+            "independent migrations must apply in version order, not hash order"
+        );
     }
 }

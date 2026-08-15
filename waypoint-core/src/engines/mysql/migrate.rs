@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use crate::commands::migrate::{
-    GuardAction, MigrateDetail, MigrateReport, PendingCriteria, classify_ensure, classify_require,
-    guard_parse_error, select_pending,
+    GuardAction, MigrateDetail, MigrateReport, PendingCriteria, SkippedMigration, classify_ensure,
+    classify_require, guard_parse_error, select_pending,
 };
 use crate::config::WaypointConfig;
 use crate::db::DbClient;
@@ -110,13 +110,15 @@ pub async fn execute_with_options(
         )));
     }
 
+    // Resolve before locking: the lock key is scoped by schema.
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
     let table = &config.migrations.table;
 
-    client.acquire_lock(table).await?;
+    client.acquire_lock(&schema, table).await?;
 
     let result = run_migrate(client, config, target_version).await;
 
-    if let Err(e) = client.release_lock(table).await {
+    if let Err(e) = client.release_lock(&schema, table).await {
         log::error!("Failed to release advisory lock: {}", e);
     }
 
@@ -232,6 +234,7 @@ async fn run_migrate(
         details: Vec::new(),
         hooks_executed: 0,
         hooks_time_ms: 0,
+        skipped: Vec::new(),
     };
 
     // `beforeMigrate` / `afterMigrate` fire on every run, matching the
@@ -259,7 +262,14 @@ async fn run_migrate(
 
         match evaluate_require_guards_db(client, &schema, m, config).await? {
             GuardAction::Continue => {}
-            GuardAction::Skip => continue,
+            GuardAction::Skip(expression) => {
+                report.skipped.push(SkippedMigration {
+                    version: m.version().map(|v| v.raw.clone()),
+                    script: m.script.clone(),
+                    expression,
+                });
+                continue;
+            }
             GuardAction::Error(e) => return Err(e),
         }
 
@@ -347,7 +357,14 @@ async fn run_migrate(
 
         match evaluate_require_guards_db(client, &schema, m, config).await? {
             GuardAction::Continue => {}
-            GuardAction::Skip => continue,
+            GuardAction::Skip(expression) => {
+                report.skipped.push(SkippedMigration {
+                    version: None,
+                    script: m.script.clone(),
+                    expression,
+                });
+                continue;
+            }
             GuardAction::Error(e) => return Err(e),
         }
 

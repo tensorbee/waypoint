@@ -5,7 +5,7 @@
 use mysql_async::prelude::*;
 
 use crate::advisor::{AdvisorConfig, AdvisorReport, Advisory, AdvisorySeverity};
-use crate::db::DbClient;
+use crate::db::{DbClient, quote_ident_mysql as qi};
 use crate::error::Result;
 
 /// Run all MySQL advisory rules against a schema.
@@ -99,7 +99,9 @@ async fn check_m001_fk_without_index(client: &DbClient, schema: &str) -> Result<
                 table, column
             ),
             fix_sql: Some(format!(
-                "CREATE INDEX `idx_{table}_{column}` ON `{table}` (`{column}`);"
+                "CREATE INDEX `idx_{table}_{column}` ON {} ({});",
+                qi(&table),
+                qi(&column)
             )),
         })
         .collect())
@@ -172,8 +174,9 @@ async fn check_m003_non_utf8mb4_charset(client: &DbClient, schema: &str) -> Resu
                 table, charset
             ),
             fix_sql: Some(format!(
-                "ALTER TABLE `{table}` CONVERT TO CHARACTER SET utf8mb4 \
-                 COLLATE utf8mb4_0900_ai_ci;"
+                "ALTER TABLE {} CONVERT TO CHARACTER SET utf8mb4 \
+                 COLLATE utf8mb4_0900_ai_ci;",
+                qi(&table)
             )),
         })
         .collect())
@@ -205,7 +208,7 @@ async fn check_m004_non_innodb_engine(client: &DbClient, schema: &str) -> Result
                  recovery support",
                 table, engine
             ),
-            fix_sql: Some(format!("ALTER TABLE `{table}` ENGINE = InnoDB;")),
+            fix_sql: Some(format!("ALTER TABLE {} ENGINE = InnoDB;", qi(&table))),
         })
         .collect())
 }

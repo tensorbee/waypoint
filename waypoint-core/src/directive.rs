@@ -201,10 +201,39 @@ pub fn parse_directives(sql: &str) -> MigrationDirectives {
             }
         } else if comment_body.trim() == "waypoint:safety-override" {
             directives.safety_override = true;
+        } else if let Some(unknown) = unrecognised_directive(comment_body) {
+            // A misspelled directive used to be indistinguishable from an
+            // ordinary comment. `-- waypoint:requires table_exists("x")` — the
+            // plural is an easy slip — silently dropped the precondition, and
+            // the migration then ran without the guard the author wrote.
+            log::warn!(
+                "Unrecognised directive '-- waypoint:{}' — this line is being treated as an \
+                 ordinary comment and has no effect. Known directives: depends, env, require, \
+                 ensure, safety-override, lint-ignore, lint-ignore-file.",
+                unknown
+            );
         }
     }
 
     directives
+}
+
+/// The directive name in `comment_body`, if it looks like a `waypoint:`
+/// directive but is not one we know.
+///
+/// Returns `None` for ordinary comments and for the `lint-ignore` family, which
+/// [`parse_lint_ignores`] handles in its own pass over the file.
+fn unrecognised_directive(comment_body: &str) -> Option<&str> {
+    let name = comment_body.strip_prefix("waypoint:")?;
+    let head = name
+        .split_whitespace()
+        .next()
+        .unwrap_or(name)
+        .trim_end_matches(':');
+    if head.is_empty() || matches!(head, "lint-ignore" | "lint-ignore-file") {
+        return None;
+    }
+    Some(head)
 }
 
 #[cfg(test)]
@@ -418,5 +447,68 @@ mod tests {
         let sql = "-- waypoint:require table_exists(\"my-table\")\nCREATE TABLE foo();";
         let d = parse_directives(sql);
         assert_eq!(d.require, vec!["table_exists(\"my-table\")"]);
+    }
+
+    #[test]
+    fn test_unrecognised_directive_detects_typos_but_not_ordinary_comments() {
+        // Typos in directive names used to be silently indistinguishable from
+        // a plain comment, so a mistyped `require` dropped the precondition.
+        assert_eq!(
+            unrecognised_directive("waypoint:requires foo()"),
+            Some("requires")
+        );
+        assert_eq!(
+            unrecognised_directive("waypoint:saftey-override"),
+            Some("saftey-override")
+        );
+        assert_eq!(
+            unrecognised_directive("waypoint:ensures x"),
+            Some("ensures")
+        );
+
+        // Known directives and ordinary comments are not flagged.
+        assert_eq!(
+            unrecognised_directive("waypoint:lint-ignore E001 reason=\"x\""),
+            None
+        );
+        assert_eq!(
+            unrecognised_directive("waypoint:lint-ignore-file E001 reason=\"x\""),
+            None
+        );
+        assert_eq!(unrecognised_directive("just a normal comment"), None);
+        assert_eq!(unrecognised_directive("waypoint is a tool"), None);
+    }
+
+    #[test]
+    fn test_known_directives_still_parse_and_are_not_warned_about() {
+        let sql = "-- waypoint:require table_exists(\"a\")\n\
+                   -- waypoint:ensure table_exists(\"b\")\n\
+                   -- waypoint:env prod\n\
+                   -- waypoint:depends V1\n\
+                   -- waypoint:safety-override\n\
+                   SELECT 1;";
+        let d = parse_directives(sql);
+        assert_eq!(d.require.len(), 1);
+        assert_eq!(d.ensure.len(), 1);
+        assert_eq!(d.env, vec!["prod"]);
+        assert_eq!(d.depends, vec!["1"]);
+        assert!(d.safety_override);
+        // None of these should look unrecognised.
+        for body in [
+            "waypoint:require x",
+            "waypoint:ensure x",
+            "waypoint:env prod",
+            "waypoint:depends V1",
+            "waypoint:safety-override",
+        ] {
+            let head = unrecognised_directive(body);
+            assert!(
+                matches!(
+                    head,
+                    Some("require" | "ensure" | "env" | "depends" | "safety-override")
+                ),
+                "known directive {body:?} classified as {head:?}"
+            );
+        }
     }
 }

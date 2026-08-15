@@ -364,6 +364,332 @@ async fn test_repair_removes_failed_and_updates_checksums() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `repair` realigns a versioned checksum with `UPDATE ... WHERE version = $1`.
+/// An `UNDO_SQL` row carries the *U file's* checksum under the same version, so
+/// an unqualified update rewrites it to the forward migration's checksum —
+/// recording something in the ledger that was never true.
+#[tokio::test]
+async fn test_repair_does_not_clobber_undo_row_checksums() {
+    let (client, schema) = setup_schema("repairundo").await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "waypoint_test_repundo_{}",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("V1__Good.sql"),
+        format!("CREATE TABLE {}.undo_ck (id SERIAL);", schema),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("U1__Good.sql"),
+        format!("DROP TABLE {}.undo_ck;", schema),
+    )
+    .unwrap();
+
+    let config = test_config(&schema, dir.to_str().unwrap());
+    let wp = Waypoint::with_client(config.clone(), client);
+    wp.migrate(None).await.expect("migrate failed");
+
+    // Undo leaves an UNDO_SQL row with version = "1" and the U file's checksum.
+    let undo_client = connect_test(&get_test_url()).await.unwrap();
+    Waypoint::with_client(config.clone(), undo_client)
+        .undo(UndoTarget::Last)
+        .await
+        .expect("undo failed");
+
+    let probe = connect_test(&get_test_url()).await.unwrap();
+    let undo_checksum_before =
+        history::get_applied_migrations(&probe, &schema, "waypoint_schema_history")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|m| m.migration_type == "UNDO_SQL")
+            .expect("undo row must exist")
+            .checksum;
+
+    // Drift V1 so repair has a versioned checksum to realign.
+    std::fs::write(
+        dir.join("V1__Good.sql"),
+        format!("CREATE TABLE {}.undo_ck (id SERIAL PRIMARY KEY);", schema),
+    )
+    .unwrap();
+
+    let repair_client = connect_test(&get_test_url()).await.unwrap();
+    Waypoint::with_client(config, repair_client)
+        .repair()
+        .await
+        .expect("repair failed");
+
+    let after = history::get_applied_migrations(&probe, &schema, "waypoint_schema_history")
+        .await
+        .unwrap();
+    let undo_row = after
+        .iter()
+        .find(|m| m.migration_type == "UNDO_SQL")
+        .expect("undo row must survive repair");
+    assert_eq!(
+        undo_row.checksum, undo_checksum_before,
+        "repair rewrote the UNDO_SQL row's checksum to the forward migration's"
+    );
+
+    teardown_schema(&probe, &schema).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A repeatable migration is pending precisely when its stored checksum differs
+/// from the file. If `repair` realigns that checksum without re-applying the
+/// script, the change is silently dropped: the ledger says the current file is
+/// applied while the database still holds the previous definition.
+#[tokio::test]
+async fn test_repair_does_not_silently_drop_a_pending_repeatable() {
+    let (client, schema) = setup_schema("repairrep").await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "waypoint_test_repairrep_{}",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("V1__Base.sql"),
+        format!("CREATE TABLE {}.rep_src (id SERIAL PRIMARY KEY);", schema),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("R__View.sql"),
+        format!(
+            "CREATE OR REPLACE VIEW {}.rep_v AS SELECT id FROM {}.rep_src;",
+            schema, schema
+        ),
+    )
+    .unwrap();
+
+    let config = test_config(&schema, dir.to_str().unwrap());
+    let wp = Waypoint::with_client(config.clone(), client);
+    wp.migrate(None).await.expect("migrate failed");
+
+    // Change the repeatable. It is now pending.
+    std::fs::write(
+        dir.join("R__View.sql"),
+        format!(
+            "CREATE OR REPLACE VIEW {}.rep_v AS SELECT id FROM {}.rep_src WHERE id > 0;",
+            schema, schema
+        ),
+    )
+    .unwrap();
+
+    let repair_client = connect_test(&get_test_url()).await.unwrap();
+    Waypoint::with_client(config.clone(), repair_client)
+        .repair()
+        .await
+        .expect("repair failed");
+
+    // After repair, migrate must still re-apply the changed repeatable.
+    let migrate_client = connect_test(&get_test_url()).await.unwrap();
+    let report = Waypoint::with_client(config, migrate_client)
+        .migrate(None)
+        .await
+        .expect("migrate after repair failed");
+    assert_eq!(
+        report.migrations_applied, 1,
+        "repair marked the modified repeatable as applied without running it, \
+         so the view definition in the database is stale"
+    );
+
+    let probe = connect_test(&get_test_url()).await.unwrap();
+    let def: String = probe
+        .query_one(
+            &format!(
+                "SELECT pg_get_viewdef('{}.rep_v'::regclass, true)",
+                quote_ident(&schema)
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(
+        def.contains("id > 0"),
+        "database still holds the pre-change view definition: {}",
+        def
+    );
+
+    teardown_schema(&probe, &schema).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #2: `repair --dry-run` performed writes. A dry run must leave the
+/// history table byte-for-byte unchanged, and the real repair that follows must
+/// still find the same work to do.
+#[tokio::test]
+async fn test_repair_dry_run_makes_no_changes_and_reports_same_work_as_real_repair() {
+    let (client, schema) = setup_schema("repairdry").await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "waypoint_test_repdry_{}",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("V1__Good.sql"),
+        format!("CREATE TABLE {}.repair_dry_test (id SERIAL);", schema),
+    )
+    .unwrap();
+
+    let config = test_config(&schema, dir.to_str().unwrap());
+
+    let wp = Waypoint::with_client(config.clone(), client);
+    wp.migrate(None).await.expect("migrate failed");
+
+    // Seed exactly the two conditions from the report: a failed row, and a
+    // checksum that has drifted from the file on disk.
+    let client2 = connect_test(&get_test_url()).await.unwrap();
+    history::insert_applied_migration(
+        &client2,
+        &schema,
+        "waypoint_schema_history",
+        Some("2"),
+        "Bad migration",
+        "SQL",
+        "V2__Bad.sql",
+        Some(12345),
+        "test",
+        0,
+        false,
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        dir.join("V1__Good.sql"),
+        format!(
+            "CREATE TABLE {}.repair_dry_test (id SERIAL PRIMARY KEY);",
+            schema
+        ),
+    )
+    .unwrap();
+
+    let before = history::get_applied_migrations(&client2, &schema, "waypoint_schema_history")
+        .await
+        .unwrap();
+
+    // --- dry run ---
+    let dry_client = connect_test(&get_test_url()).await.unwrap();
+    let dry = Waypoint::with_client(config.clone(), dry_client)
+        .repair_with(true)
+        .await
+        .expect("dry-run repair failed");
+
+    assert!(dry.dry_run);
+    assert_eq!(dry.failed_removed, 1);
+    assert_eq!(dry.checksums_updated, 1);
+    assert!(
+        dry.details.iter().all(|d| d.starts_with("Would ")),
+        "dry-run details must read as a proposal: {:?}",
+        dry.details
+    );
+
+    // The ledger must be untouched: same row count, same checksums, same
+    // success flags.
+    let after_dry = history::get_applied_migrations(&client2, &schema, "waypoint_schema_history")
+        .await
+        .unwrap();
+    assert_eq!(after_dry.len(), before.len(), "dry run changed row count");
+    for (b, a) in before.iter().zip(after_dry.iter()) {
+        assert_eq!(b.installed_rank, a.installed_rank);
+        assert_eq!(b.version, a.version);
+        assert_eq!(b.checksum, a.checksum, "dry run rewrote a checksum");
+        assert_eq!(b.success, a.success, "dry run changed a success flag");
+    }
+
+    // --- real repair: must still find the same work ---
+    let real_client = connect_test(&get_test_url()).await.unwrap();
+    let real = Waypoint::with_client(config, real_client)
+        .repair()
+        .await
+        .expect("repair failed");
+
+    assert!(!real.dry_run);
+    assert_eq!(real.failed_removed, dry.failed_removed);
+    assert_eq!(real.checksums_updated, dry.checksums_updated);
+
+    let conn = connect_test(&get_test_url()).await.unwrap();
+    teardown_schema(&conn, &schema).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #2, defect 2: repair deleted rows even though its migration location
+/// did not exist, so it had nothing to compare checksums against.
+#[tokio::test]
+async fn test_repair_refuses_when_migration_location_is_missing() {
+    let (client, schema) = setup_schema("repairnoloc").await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "waypoint_test_repnoloc_{}",
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("V1__Good.sql"),
+        format!("CREATE TABLE {}.repair_noloc_test (id SERIAL);", schema),
+    )
+    .unwrap();
+
+    let config = test_config(&schema, dir.to_str().unwrap());
+    let wp = Waypoint::with_client(config.clone(), client);
+    wp.migrate(None).await.expect("migrate failed");
+
+    let client2 = connect_test(&get_test_url()).await.unwrap();
+    history::insert_applied_migration(
+        &client2,
+        &schema,
+        "waypoint_schema_history",
+        Some("2"),
+        "Bad migration",
+        "SQL",
+        "V2__Bad.sql",
+        Some(12345),
+        "test",
+        0,
+        false,
+    )
+    .await
+    .unwrap();
+
+    let before = history::get_applied_migrations(&client2, &schema, "waypoint_schema_history")
+        .await
+        .unwrap();
+
+    // Now make the location vanish, exactly as a repair run from the wrong
+    // working directory would see it.
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let repair_client = connect_test(&get_test_url()).await.unwrap();
+    let err = Waypoint::with_client(config, repair_client)
+        .repair()
+        .await
+        .expect_err("repair must refuse when it cannot see the migration files");
+    assert!(
+        err.to_string().contains("migration location(s) not found"),
+        "unexpected error: {}",
+        err
+    );
+
+    // Crucially: the failed row is still there.
+    let after = history::get_applied_migrations(&client2, &schema, "waypoint_schema_history")
+        .await
+        .unwrap();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "refused repair still deleted rows"
+    );
+    assert_eq!(after.iter().filter(|m| !m.success).count(), 1);
+
+    let conn = connect_test(&get_test_url()).await.unwrap();
+    teardown_schema(&conn, &schema).await;
+}
+
 #[tokio::test]
 async fn test_baseline_inserts_baseline_row() {
     let (client, schema) = setup_schema("baseline").await;
@@ -429,6 +755,49 @@ async fn test_baseline_prevents_old_migrations() {
 
     let conn = connect_test(&get_test_url()).await.unwrap();
     teardown_schema(&conn, &schema).await;
+}
+
+/// `clean` is documented as dropping *all* objects in the managed schema. It
+/// used to issue `DROP FUNCTION` for every `pg_proc` row, which PostgreSQL
+/// rejects for procedures ("is not a function") and aggregates — aborting the
+/// command *after* the tables had already been dropped and leaving the routines
+/// behind.
+#[tokio::test]
+async fn test_clean_drops_procedures_and_aggregates_not_just_functions() {
+    let (client, schema) = setup_schema("cleankinds").await;
+
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {s}.t (id int);
+             CREATE FUNCTION {s}.f(a int) RETURNS int AS $$ SELECT a $$ LANGUAGE sql;
+             CREATE PROCEDURE {s}.p() LANGUAGE sql AS $$ SELECT 1 $$;
+             CREATE AGGREGATE {s}.agg (int) (sfunc = int4pl, stype = int, initcond = '0');",
+            s = quote_ident(&schema)
+        ))
+        .await
+        .unwrap();
+
+    let migrations = create_temp_migrations(&[]);
+    let config = test_config(&schema, migrations.path().to_str().unwrap());
+    let wp = Waypoint::with_client(config, client);
+    let dropped = wp.clean(true).await.expect("clean must not abort midway");
+
+    let probe = connect_test(&get_test_url()).await.unwrap();
+    let remaining: i64 = probe
+        .query_one(
+            "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON p.pronamespace = n.oid \
+             WHERE n.nspname = $1",
+            &[&schema],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        remaining, 0,
+        "clean left routines behind; it dropped: {dropped:?}"
+    );
+
+    teardown_schema(&probe, &schema).await;
 }
 
 #[tokio::test]
@@ -764,6 +1133,209 @@ async fn test_undo_to_target_version() {
 }
 
 #[tokio::test]
+async fn test_ensure_guards_are_evaluated_for_repeatable_migrations() {
+    let (client, schema) = setup_schema("repensure").await;
+
+    let migrations = create_temp_migrations(&[(
+        "R__With_ensure.sql",
+        &format!(
+            "-- waypoint:ensure table_exists(\"absent_table\")\n\
+             CREATE OR REPLACE VIEW {}.rep_ensure_v AS SELECT 1 AS n;",
+            schema
+        ),
+    )]);
+
+    let config = test_config(&schema, migrations.path().to_str().unwrap());
+    let wp = Waypoint::with_client(config, client);
+    let err = wp
+        .migrate(None)
+        .await
+        .expect_err("a false `ensure` guard on a repeatable must fail the migration");
+    assert!(
+        matches!(err, waypoint_core::error::WaypointError::GuardFailed { .. }),
+        "expected GuardFailed, got {err:?}"
+    );
+
+    let conn = connect_test(&get_test_url()).await.unwrap();
+    teardown_schema(&conn, &schema).await;
+}
+
+#[tokio::test]
+async fn test_ensure_guards_are_evaluated_in_batch_transaction_mode() {
+    let (client, schema) = setup_schema("batchensure").await;
+
+    // The ensure postcondition is false: the migration creates `present`, not
+    // `absent`. Outside batch mode this fails the migration.
+    let migrations = create_temp_migrations(&[(
+        "V1__With_ensure.sql",
+        &format!(
+            "-- waypoint:ensure table_exists(\"absent_table\")\n\
+             CREATE TABLE {}.present (id SERIAL PRIMARY KEY);",
+            schema
+        ),
+    )]);
+
+    let mut config = test_config(&schema, migrations.path().to_str().unwrap());
+    config.migrations.batch_transaction = true;
+
+    let wp = Waypoint::with_client(config, client);
+    let err = wp
+        .migrate(None)
+        .await
+        .expect_err("a false `ensure` guard must fail the migration in batch mode too");
+    assert!(
+        matches!(err, waypoint_core::error::WaypointError::GuardFailed { .. }),
+        "expected GuardFailed, got {err:?}"
+    );
+
+    let conn = connect_test(&get_test_url()).await.unwrap();
+    teardown_schema(&conn, &schema).await;
+}
+
+/// `beforeEachMigrate` must not run for a migration that a `require` guard then
+/// skips: the paired `afterEachMigrate` never runs, so anything the pair sets up
+/// and tears down is left dangling. The MySQL path, the PG repeatable path and
+/// the PG batch path all evaluate the guard first.
+#[tokio::test]
+async fn test_require_skip_does_not_run_unpaired_before_each_hook() {
+    let (client, schema) = setup_schema("guardhook").await;
+
+    let dir = std::env::temp_dir().join(format!(
+        "waypoint_test_guardhook_{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // The hook log has to pre-exist: the hooks run before any migration does.
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {}.hook_log (id SERIAL PRIMARY KEY, phase TEXT)",
+            quote_ident(&schema)
+        ))
+        .await
+        .unwrap();
+
+    // A hook pair that appends a row each time it runs.
+    std::fs::write(
+        dir.join("V1__Applied.sql"),
+        format!(
+            "CREATE TABLE {}.applied_ok (id SERIAL PRIMARY KEY);",
+            schema
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("beforeEachMigrate__log.sql"),
+        format!("INSERT INTO {}.hook_log (phase) VALUES ('before');", schema),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("afterEachMigrate__log.sql"),
+        format!("INSERT INTO {}.hook_log (phase) VALUES ('after');", schema),
+    )
+    .unwrap();
+    // V2 is skipped: its require guard names a table that does not exist.
+    std::fs::write(
+        dir.join("V2__Skipped.sql"),
+        format!(
+            "-- waypoint:require table_exists(\"no_such_table\")\n\
+             CREATE TABLE {}.never_created (id SERIAL PRIMARY KEY);",
+            schema
+        ),
+    )
+    .unwrap();
+
+    let mut config = test_config(&schema, dir.to_str().unwrap());
+    config.guards.on_require_fail = waypoint_core::guard::OnRequireFail::Skip;
+
+    let wp = Waypoint::with_client(config, client);
+    wp.migrate(None).await.expect("migrate failed");
+
+    let conn = connect_test(&get_test_url()).await.unwrap();
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT phase FROM {}.hook_log ORDER BY id",
+                quote_ident(&schema)
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    let phases: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+    let befores = phases.iter().filter(|p| *p == "before").count();
+    let afters = phases.iter().filter(|p| *p == "after").count();
+    assert_eq!(
+        befores, afters,
+        "beforeEachMigrate ran {befores} time(s) but afterEachMigrate ran {afters}; \
+         a guard-skipped migration ran its before-hook with no matching after-hook"
+    );
+
+    teardown_schema(&conn, &schema).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A `require` guard skip used to leave no trace in the report — only an INFO
+/// log line, which `--json` and `--quiet` both suppress. A pipeline reading
+/// `migrations_applied` could not tell a deliberate skip from an empty run.
+#[tokio::test]
+async fn test_guard_skipped_migrations_are_reported() {
+    let (client, schema) = setup_schema("guardreport").await;
+
+    let migrations = create_temp_migrations(&[
+        (
+            "V1__Applied.sql",
+            &format!(
+                "CREATE TABLE {}.applied_ok (id SERIAL PRIMARY KEY);",
+                schema
+            ),
+        ),
+        (
+            "V2__Skipped.sql",
+            &format!(
+                "-- waypoint:require table_exists(\"no_such_table\")\n\
+                 CREATE TABLE {}.never_created (id SERIAL PRIMARY KEY);",
+                schema
+            ),
+        ),
+    ]);
+
+    let mut config = test_config(&schema, migrations.path().to_str().unwrap());
+    config.guards.on_require_fail = waypoint_core::guard::OnRequireFail::Skip;
+
+    let wp = Waypoint::with_client(config, client);
+    let report = wp.migrate(None).await.expect("migrate failed");
+
+    assert_eq!(report.migrations_applied, 1);
+    assert_eq!(
+        report.skipped.len(),
+        1,
+        "the skip must appear in the report"
+    );
+    let skipped = &report.skipped[0];
+    assert_eq!(skipped.version.as_deref(), Some("2"));
+    assert_eq!(skipped.script, "V2__Skipped.sql");
+    assert!(
+        skipped.expression.contains("no_such_table"),
+        "the report must name the guard that failed: {}",
+        skipped.expression
+    );
+
+    // And it must survive serialisation, which is what `--json` consumers read.
+    let json = serde_json::to_string(&report).unwrap();
+    assert!(json.contains("\"skipped\""), "missing from JSON: {json}");
+    assert!(
+        json.contains("V2__Skipped.sql"),
+        "missing from JSON: {json}"
+    );
+
+    let conn = connect_test(&get_test_url()).await.unwrap();
+    teardown_schema(&conn, &schema).await;
+}
+
+#[tokio::test]
 async fn test_batch_transaction_mode() {
     let (client, schema) = setup_schema("batch").await;
 
@@ -1049,6 +1621,321 @@ async fn test_dependency_ordering() {
     );
 }
 
+/// The preview runs every pending migration in one transaction, in order, so a
+/// migration can see what the previous one created. Each used to get its own
+/// rolled-back transaction, so V2 could not see V1's table and the dry run
+/// reported a false failure for the ordinary case of dependent migrations.
+#[tokio::test]
+async fn test_dry_run_lets_a_migration_see_the_previous_one() {
+    let (client, schema) = setup_schema("explaindeps").await;
+
+    let migrations = create_temp_migrations(&[
+        (
+            "V1__Users.sql",
+            &format!(
+                "CREATE TABLE {}.users (id serial PRIMARY KEY);",
+                quote_ident(&schema)
+            ),
+        ),
+        (
+            "V2__Orders.sql",
+            &format!(
+                "CREATE TABLE {s}.orders (id serial PRIMARY KEY, \
+                 user_id int REFERENCES {s}.users(id));",
+                s = quote_ident(&schema)
+            ),
+        ),
+    ]);
+
+    let config = test_config(&schema, migrations.path().to_str().unwrap());
+    let wp = Waypoint::with_client(config, client);
+    let report = wp.explain().await.expect("explain failed");
+
+    assert!(
+        !report.has_failures(),
+        "V2 references V1's table; the preview must apply them in one transaction: {:?}",
+        report
+            .migrations
+            .iter()
+            .filter_map(|m| m.error.as_ref())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(report.migrations.len(), 2);
+
+    // …and the preview must leave nothing behind.
+    let probe = connect_test(&get_test_url()).await.unwrap();
+    let tables: i64 = probe
+        .query_one(
+            "SELECT count(*) FROM pg_tables WHERE schemaname = $1",
+            &[&schema],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(tables, 0, "the dry run committed something");
+
+    teardown_schema(&probe, &schema).await;
+}
+
+/// `migrate --dry-run` routes to `explain`, which executes each DDL statement
+/// inside a transaction it later rolls back. A failing statement used to be
+/// swallowed at `debug` level — and PostgreSQL aborts the whole transaction, so
+/// every *later* statement failed too and was swallowed as well. The preview
+/// listed all of them as fine, telling the operator a migration that cannot
+/// possibly apply was ready to go.
+#[tokio::test]
+async fn test_dry_run_reports_a_statement_that_would_fail() {
+    let (client, schema) = setup_schema("explainfail").await;
+
+    let migrations = create_temp_migrations(&[(
+        "V1__Broken.sql",
+        &format!(
+            "CREATE TABLE {s}.good (id int);\n\
+             CREATE TABLE {s}.good (id int);\n\
+             ALTER TABLE {s}.good ADD COLUMN name text;",
+            s = quote_ident(&schema)
+        ),
+    )]);
+
+    let config = test_config(&schema, migrations.path().to_str().unwrap());
+    let wp = Waypoint::with_client(config, client);
+    let report = wp.explain().await.expect("explain should not itself error");
+
+    assert!(
+        report.has_failures(),
+        "the preview must report that this migration fails"
+    );
+    let m = &report.migrations[0];
+    let err = m.error.as_ref().expect("the failure must be recorded");
+    assert!(err.contains("already exists"), "unhelpful message: {err}");
+
+    // The preview stops at the failure rather than reporting the statements
+    // after it as checked — they were not.
+    assert_eq!(
+        m.statements.len(),
+        2,
+        "statements after the failure must not be reported as checked"
+    );
+
+    let conn = connect_test(&get_test_url()).await.unwrap();
+    teardown_schema(&conn, &schema).await;
+}
+
+/// `row_count` reads `pg_stat_user_tables`, which has no row for a name that
+/// is not a plain table. `query_one` turned that into tokio-postgres's
+/// "query returned an unexpected number of rows", which says nothing about the
+/// actual problem — a typo, a view, or a partitioned parent.
+#[tokio::test]
+async fn test_row_count_guard_on_a_missing_table_explains_why() {
+    let (client, schema) = setup_schema("rowcountguard").await;
+
+    let migrations = create_temp_migrations(&[(
+        "V1__Guarded.sql",
+        &format!(
+            "-- waypoint:require row_count(\"no_such_table\") < 1000000\n\
+             CREATE TABLE {}.guarded (id SERIAL PRIMARY KEY);",
+            quote_ident(&schema)
+        ),
+    )]);
+
+    let config = test_config(&schema, migrations.path().to_str().unwrap());
+    let wp = Waypoint::with_client(config, client);
+    let err = wp
+        .migrate(None)
+        .await
+        .expect_err("a row_count guard on a missing table must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no row-count statistics"),
+        "error should explain why, got: {msg}"
+    );
+    assert!(
+        !msg.contains("unexpected number of rows"),
+        "the driver's opaque message should not reach the operator: {msg}"
+    );
+
+    let conn = connect_test(&get_test_url()).await.unwrap();
+    teardown_schema(&conn, &schema).await;
+}
+
+/// Auto-reversal of a dropped table was broken three ways at once: statements
+/// came out in diff order (so `CREATE TABLE … DEFAULT nextval('s')` preceded
+/// `CREATE SEQUENCE s`), the constraint-backing indexes were emitted *and* the
+/// constraints that recreate them, and the DDL used unqualified names while
+/// nothing set `search_path`, so it targeted the wrong schema. `undo` failed
+/// and the table did not come back.
+#[tokio::test]
+async fn test_auto_reversal_restores_a_dropped_table_with_constraints_and_indexes() {
+    let (client, schema) = setup_schema("revfidelity").await;
+
+    client
+        .batch_execute(&format!(
+            "CREATE TABLE {s}.orders (
+                 id serial PRIMARY KEY,
+                 code text NOT NULL UNIQUE,
+                 status text NOT NULL DEFAULT 'new'
+             );
+             CREATE INDEX orders_status_idx ON {s}.orders (status);",
+            s = quote_ident(&schema)
+        ))
+        .await
+        .unwrap();
+
+    let migrations = create_temp_migrations(&[(
+        "V1__Drop_orders.sql",
+        &format!("DROP TABLE {}.orders;", quote_ident(&schema)),
+    )]);
+
+    let mut config = test_config(&schema, migrations.path().to_str().unwrap());
+    config.reversals.enabled = true;
+
+    let wp = Waypoint::with_client(config.clone(), client);
+    wp.migrate(None).await.expect("migrate failed");
+
+    let undo_client = connect_test(&get_test_url()).await.unwrap();
+    Waypoint::with_client(config, undo_client)
+        .undo(UndoTarget::Last)
+        .await
+        .expect("undo via auto-reversal must succeed");
+
+    let probe = connect_test(&get_test_url()).await.unwrap();
+
+    // The table is back, in the *right* schema, with its column nullability.
+    let cols: Vec<(String, String)> = probe
+        .query(
+            "SELECT column_name, is_nullable FROM information_schema.columns \
+             WHERE table_schema = $1 AND table_name = 'orders' ORDER BY ordinal_position",
+            &[&schema],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(
+        cols,
+        vec![
+            ("id".to_string(), "NO".to_string()),
+            ("code".to_string(), "NO".to_string()),
+            ("status".to_string(), "NO".to_string()),
+        ],
+        "columns not restored faithfully"
+    );
+
+    // …and its constraints and indexes, each exactly once.
+    let mut indexes: Vec<String> = probe
+        .query(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = 'orders'",
+            &[&schema],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    indexes.sort();
+    assert_eq!(
+        indexes,
+        vec!["orders_code_key", "orders_pkey", "orders_status_idx"],
+        "indexes not restored"
+    );
+
+    let constraints: i64 = probe
+        .query_one(
+            "SELECT count(*) FROM pg_constraint c \
+             JOIN pg_class t ON c.conrelid = t.oid \
+             JOIN pg_namespace n ON t.relnamespace = n.oid \
+             WHERE n.nspname = $1 AND t.relname = 'orders' AND c.contype IN ('p', 'u')",
+            &[&schema],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        constraints, 2,
+        "primary key and unique constraint not restored"
+    );
+
+    teardown_schema(&probe, &schema).await;
+}
+
+/// Generated DDL interpolated enum labels raw, so a label containing an
+/// apostrophe produced `ENUM ('fine', 'it's bad')` — a snapshot PostgreSQL
+/// rejects. `restore` only warns on a failed statement, so the type silently
+/// vanished from the restored schema.
+#[tokio::test]
+async fn test_snapshot_ddl_escapes_quotes_in_enum_labels() {
+    let (client, schema) = setup_schema("enumquote").await;
+
+    client
+        .batch_execute(&format!(
+            "CREATE TYPE {}.mood AS ENUM ('fine', 'it''s bad');",
+            quote_ident(&schema)
+        ))
+        .await
+        .unwrap();
+
+    let snap_dir = std::env::temp_dir().join(format!(
+        "waypoint_test_enumquote_{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = std::fs::remove_dir_all(&snap_dir);
+
+    let migrations = create_temp_migrations(&[]);
+    let config = test_config(&schema, migrations.path().to_str().unwrap());
+    let snapshot_config = SnapshotConfig {
+        directory: snap_dir.clone(),
+        ..Default::default()
+    };
+    let wp = Waypoint::with_client(config, client);
+    let report = wp
+        .snapshot(&snapshot_config)
+        .await
+        .expect("snapshot failed");
+
+    let ddl = std::fs::read_to_string(&report.snapshot_path).unwrap();
+    let create_type = ddl
+        .lines()
+        .find(|l| l.contains("CREATE TYPE"))
+        .expect("snapshot must contain the enum");
+    assert!(
+        create_type.contains("'it''s bad'"),
+        "apostrophe not escaped: {create_type}"
+    );
+
+    // The real test: PostgreSQL must accept what we generated.
+    let probe = connect_test(&get_test_url()).await.unwrap();
+    let verify_schema = format!("{}_verify", schema);
+    probe
+        .batch_execute(&format!(
+            "DROP SCHEMA IF EXISTS {s} CASCADE; CREATE SCHEMA {s}; SET search_path TO {s}; {ddl}",
+            s = quote_ident(&verify_schema),
+            ddl = create_type
+        ))
+        .await
+        .expect("generated enum DDL must be valid SQL");
+
+    let labels: Vec<String> = probe
+        .query(
+            "SELECT enumlabel FROM pg_enum e \
+             JOIN pg_type t ON e.enumtypid = t.oid \
+             JOIN pg_namespace n ON t.typnamespace = n.oid \
+             WHERE n.nspname = $1 ORDER BY enumsortorder",
+            &[&verify_schema],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(labels, vec!["fine".to_string(), "it's bad".to_string()]);
+
+    teardown_schema(&probe, &verify_schema).await;
+    teardown_schema(&probe, &schema).await;
+    let _ = std::fs::remove_dir_all(&snap_dir);
+}
+
 #[tokio::test]
 async fn test_snapshot_and_drift() {
     let (client, schema) = setup_schema("snap_drift").await;
@@ -1230,39 +2117,81 @@ async fn test_advisor_detects_table_without_pk() {
     teardown_schema(&conn, &schema).await;
 }
 
+/// The lock key includes the schema, so migrations in unrelated schemas of one
+/// database no longer queue behind each other. It used to hash the table name
+/// alone, and every schema names its history table the same thing.
+#[tokio::test]
+async fn test_advisory_lock_does_not_serialise_unrelated_schemas() {
+    let (client_a, schema_a) = setup_schema("lockscope_a").await;
+    let (client_b, schema_b) = setup_schema("lockscope_b").await;
+    let table = "waypoint_schema_history";
+
+    db::acquire_advisory_lock(&client_a, &schema_a, table)
+        .await
+        .expect("first schema lock");
+
+    // A different schema must be free to proceed immediately, not wait.
+    db::acquire_advisory_lock_with_timeout(&client_b, &schema_b, table, 2)
+        .await
+        .expect("a different schema must not be blocked by the first one's lock");
+
+    // …while the *same* schema still blocks, which is the point of the lock.
+    let same_schema = connect_test(&get_test_url()).await.unwrap();
+    let blocked = db::acquire_advisory_lock_with_timeout(&same_schema, &schema_a, table, 2).await;
+    assert!(
+        blocked.is_err(),
+        "the same schema must still be mutually exclusive"
+    );
+
+    db::release_advisory_lock(&client_a, &schema_a, table)
+        .await
+        .unwrap();
+    db::release_advisory_lock(&client_b, &schema_b, table)
+        .await
+        .unwrap();
+
+    teardown_schema(&client_a, &schema_a).await;
+    teardown_schema(&client_b, &schema_b).await;
+}
+
 #[tokio::test]
 async fn test_advisory_lock_prevents_concurrent_access() {
     let (client, schema) = setup_schema("lock").await;
 
-    let table = "waypoint_schema_history";
+    // A per-test lock name. The schema is already unique per test, so the key
+    // would be too — but naming the table distinctly as well keeps this test
+    // independent of the lock's scoping rules, which is what
+    // `test_advisory_lock_does_not_serialise_unrelated_schemas` exists to pin.
+    let table_owned = format!("waypoint_lock_probe_{}", schema);
+    let table = table_owned.as_str();
 
     // Acquire the advisory lock on the first connection
-    db::acquire_advisory_lock(&client, table)
+    db::acquire_advisory_lock(&client, &schema, table)
         .await
         .expect("first lock acquire failed");
 
     // Try to acquire the same lock on a second connection with a short timeout
     let client2 = connect_test(&get_test_url()).await.unwrap();
-    let result = db::acquire_advisory_lock_with_timeout(&client2, table, 2).await;
+    let result = db::acquire_advisory_lock_with_timeout(&client2, &schema, table, 2).await;
     assert!(
         result.is_err(),
         "Second lock acquire should fail (timeout) while first holds it"
     );
 
     // Release the first lock
-    db::release_advisory_lock(&client, table)
+    db::release_advisory_lock(&client, &schema, table)
         .await
         .expect("release failed");
 
     // Now the second client should be able to acquire it
-    let result2 = db::acquire_advisory_lock_with_timeout(&client2, table, 5).await;
+    let result2 = db::acquire_advisory_lock_with_timeout(&client2, &schema, table, 5).await;
     assert!(
         result2.is_ok(),
         "Second lock acquire should succeed after release"
     );
 
     // Clean up
-    db::release_advisory_lock(&client2, table)
+    db::release_advisory_lock(&client2, &schema, table)
         .await
         .expect("cleanup release failed");
 

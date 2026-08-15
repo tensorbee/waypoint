@@ -5,7 +5,7 @@
 //! mix `postgres://` and `mysql://` databases; the engine is auto-detected per
 //! database from the URL scheme.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -100,10 +100,28 @@ pub struct MultiResult {
 impl MultiWaypoint {
     /// Determine execution order based on depends_on relationships (Kahn's algorithm).
     ///
+    /// Databases that are ready at the same moment run in **declaration order**
+    /// — the order they appear in `[[databases]]` — which makes the result
+    /// deterministic.
+    ///
+    /// The ready set used to be seeded by iterating a `HashMap`, whose order is
+    /// randomly seeded per process, so three independent databases migrated in
+    /// a different order on almost every run. Any topological order is correct,
+    /// but a varying one makes `--fail-fast` leave a different subset migrated
+    /// each time, and makes staging and production disagree for no reason.
+    ///
     /// Uses borrowed `&str` references internally to avoid cloning database names
     /// during the topological sort; only clones into owned `String`s for the output.
     pub fn execution_order(databases: &[NamedDatabaseConfig]) -> Result<Vec<String>> {
         let all_names: HashSet<&str> = databases.iter().map(|d| d.name.as_str()).collect();
+        // Declaration order, used both to break ties and to keep the
+        // "available databases" error message stable.
+        let declared: Vec<&str> = databases.iter().map(|d| d.name.as_str()).collect();
+        let rank: HashMap<&str, usize> = declared
+            .iter()
+            .enumerate()
+            .map(|(i, &name)| (name, i))
+            .collect();
 
         let mut in_degree: HashMap<&str, usize> = HashMap::new();
         let mut reverse_edges: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -114,7 +132,7 @@ impl MultiWaypoint {
                 if !all_names.contains(dep.as_str()) {
                     return Err(WaypointError::DatabaseNotFound {
                         name: dep.clone(),
-                        available: all_names.iter().copied().collect::<Vec<_>>().join(", "),
+                        available: declared.join(", "),
                     });
                 }
                 *in_degree.entry(db.name.as_str()).or_insert(0) += 1;
@@ -125,15 +143,15 @@ impl MultiWaypoint {
             }
         }
 
-        let mut queue: VecDeque<&str> = VecDeque::new();
-        for (&name, &deg) in &in_degree {
-            if deg == 0 {
-                queue.push_back(name);
-            }
-        }
+        let mut ready: std::collections::BTreeSet<(usize, &str)> = declared
+            .iter()
+            .filter(|name| in_degree.get(*name).copied().unwrap_or(0) == 0)
+            .map(|&name| (rank[name], name))
+            .collect();
 
         let mut sorted = Vec::new();
-        while let Some(name) = queue.pop_front() {
+        while let Some(&(_, name)) = ready.iter().next() {
+            ready.remove(&(rank[name], name));
             sorted.push(name.to_string());
             if let Some(dependents) = reverse_edges.get(name) {
                 for &dep in dependents {
@@ -142,17 +160,19 @@ impl MultiWaypoint {
                         .expect("dependency not found in in_degree map");
                     *deg -= 1;
                     if *deg == 0 {
-                        queue.push_back(dep);
+                        ready.insert((rank[dep], dep));
                     }
                 }
             }
         }
 
         if sorted.len() != databases.len() {
-            let in_cycle: Vec<&str> = in_degree
+            // Declaration order again, so the reported cycle is the same on
+            // every run rather than a fresh permutation each time.
+            let in_cycle: Vec<&str> = declared
                 .iter()
-                .filter(|(_, deg)| **deg > 0)
-                .map(|(&name, _)| name)
+                .copied()
+                .filter(|name| in_degree.get(name).copied().unwrap_or(0) > 0)
                 .collect();
             return Err(WaypointError::MultiDbDependencyCycle {
                 path: in_cycle.join(" -> "),
@@ -386,5 +406,59 @@ async fn dispatch_migrate(
         DialectKind::Mysql => Err(WaypointError::ConfigError(
             "MySQL support is not compiled in (enable the `mysql` feature)".into(),
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{DatabaseConfig, HooksConfig, MigrationSettings};
+
+    fn db(name: &str, depends_on: &[&str]) -> NamedDatabaseConfig {
+        NamedDatabaseConfig {
+            name: name.to_string(),
+            database: DatabaseConfig::default(),
+            migrations: MigrationSettings::default(),
+            hooks: HooksConfig::default(),
+            placeholders: std::collections::HashMap::new(),
+            depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn test_execution_order_is_deterministic_for_independent_databases() {
+        // The ready set used to be seeded by iterating a HashMap, so these
+        // migrated in a different order on almost every process.
+        let dbs = vec![
+            db("alpha", &[]),
+            db("bravo", &[]),
+            db("charlie", &[]),
+            db("delta", &[]),
+        ];
+        let order = MultiWaypoint::execution_order(&dbs).unwrap();
+        assert_eq!(
+            order,
+            vec!["alpha", "bravo", "charlie", "delta"],
+            "independent databases must run in declaration order"
+        );
+    }
+
+    #[test]
+    fn test_execution_order_respects_dependencies_then_declaration_order() {
+        // `app` depends on `auth`, so it runs after it despite being declared
+        // first; the two independent databases keep declaration order.
+        let dbs = vec![db("app", &["auth"]), db("reports", &[]), db("auth", &[])];
+        let order = MultiWaypoint::execution_order(&dbs).unwrap();
+        assert_eq!(order, vec!["reports", "auth", "app"]);
+    }
+
+    #[test]
+    fn test_execution_order_reports_a_missing_dependency_stably() {
+        let dbs = vec![db("app", &["nope"]), db("auth", &[]), db("reports", &[])];
+        let err = MultiWaypoint::execution_order(&dbs).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("nope"), "{msg}");
+        // Declaration order, not hash order, so the message is reproducible.
+        assert!(msg.contains("app, auth, reports"), "{msg}");
     }
 }

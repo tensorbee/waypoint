@@ -155,15 +155,16 @@ pub async fn execute(
     config: &WaypointConfig,
     target: UndoTarget,
 ) -> Result<UndoReport> {
+    let schema = &config.migrations.schema;
     let table = &config.migrations.table;
 
     // Acquire advisory lock
-    db::acquire_advisory_lock(client, table).await?;
+    db::acquire_advisory_lock(client, schema, table).await?;
 
     let result = run_undo(client, config, target).await;
 
     // Always release the advisory lock
-    if let Err(e) = db::release_advisory_lock(client, table).await {
+    if let Err(e) = db::release_advisory_lock(client, schema, table).await {
         log::error!("Failed to release advisory lock: {}", e);
     }
 
@@ -370,13 +371,14 @@ async fn execute_mysql(
     config: &WaypointConfig,
     target: UndoTarget,
 ) -> Result<UndoReport> {
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
     let table = &config.migrations.table;
 
-    client.acquire_lock(table).await?;
+    client.acquire_lock(&schema, table).await?;
 
     let result = run_undo_mysql(client, config, target).await;
 
-    if let Err(e) = client.release_lock(table).await {
+    if let Err(e) = client.release_lock(&schema, table).await {
         log::error!("Failed to release advisory lock: {}", e);
     }
 

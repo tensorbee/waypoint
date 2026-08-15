@@ -252,7 +252,7 @@ CREATE TABLE users (id SERIAL PRIMARY KEY);
 | `migrate` | Apply pending migrations | Yes |
 | `info` | Show migration status | Yes |
 | `validate` | Verify applied migrations match local files | Yes |
-| `repair` | Remove failed entries, update checksums | Yes |
+| `repair` | Remove failed entries, realign versioned checksums (`--dry-run` previews without writing) | Yes |
 | `baseline` | Mark an existing database at a version | Yes |
 | `undo` | Undo applied migrations (manual U files or auto-generated reversals) | Yes |
 | `clean` | Drop all objects in managed schemas (requires `--allow-clean`) | Yes |
@@ -805,7 +805,8 @@ Global options (can be placed before or after the subcommand):
       --statement-timeout <SECS> Statement timeout (default: 0)
       --out-of-order             Allow out-of-order migrations
       --json                     Output as JSON
-      --dry-run                  Preview without applying changes
+      --dry-run                  Preview without applying changes (`migrate`, `repair`;
+                                 refused on commands that cannot preview)
   -q, --quiet                    Suppress non-essential output
   -v, --verbose                  Enable debug output
       --environment <ENV>        Environment for scoped migrations
@@ -1032,6 +1033,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `wp.info()` | `Vec<MigrationInfo>` | Get migration status |
 | `wp.validate()` | `ValidateReport` | Validate applied migrations |
 | `wp.repair()` | `RepairReport` | Fix history table |
+| `wp.repair_with(dry_run)` | `RepairReport` | Fix history table, or preview without writing |
 | `wp.baseline(version, desc)` | `()` | Baseline existing database |
 | `wp.undo(target)` | `UndoReport` | Undo applied migrations |
 | `wp.clean(allow)` | `Vec<String>` | Drop all managed objects |
@@ -1058,7 +1060,7 @@ Waypoint is designed for production-grade migration safety:
 - **Placeholder protection**: `${placeholder}` substitution is skipped inside dollar-quoted blocks (`$$...$$`) to prevent unintended modification of function bodies.
 
 ### Concurrency Safety
-- **Advisory locking**: All state-modifying commands (`migrate`, `repair`, `baseline`, `clean`) acquire a PostgreSQL advisory lock before execution, preventing concurrent runs from corrupting the schema history.
+- **Advisory locking**: Every state-modifying command (`migrate`, `repair`, `baseline`, `clean`, `undo`, `restore`) acquires an advisory lock before execution, preventing concurrent runs from corrupting the schema history. The lock is scoped to the schema *and* history table, so unrelated schemas in one database do not queue behind each other. Note that the key changed in 0.8.0 — see the upgrade note in `CHANGELOG.md` before running a mix of versions against one database.
 - **Lock timeout support**: `acquire_advisory_lock_with_timeout()` uses `pg_try_advisory_lock()` to avoid indefinite blocking.
 - **Atomic transactions**: Each migration's SQL and history record are applied in a single `BEGIN`/`COMMIT` block — either both succeed or both are rolled back.
 

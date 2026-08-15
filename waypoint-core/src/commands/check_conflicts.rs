@@ -128,19 +128,45 @@ fn git_added_files(from: &str, to: &str) -> Result<Vec<String>> {
     Ok(files)
 }
 
+/// Keep only files inside the configured migration locations.
+///
+/// This used to fall back to "any filename starting with V or R" when a file
+/// was outside every configured location, which silently overrode
+/// `[migrations] locations`. A `V1__example.sql` in a docs or fixtures
+/// directory was then treated as a real migration, and two branches touching
+/// such examples produced a conflict that blocks a git hook with exit 11.
+///
+/// Files that look like migrations but sit outside the configured locations are
+/// reported rather than either silently included or silently dropped — that
+/// combination usually means `locations` is wrong.
 fn filter_migration_files(files: &[String], locations: &[PathBuf]) -> Vec<String> {
-    files
-        .iter()
-        .filter(|f| {
-            let path = PathBuf::from(f);
-            // Check if file is in one of the configured locations
-            locations.iter().any(|loc| path.starts_with(loc))
-                || path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    (n.starts_with('V') || n.starts_with('R')) && n.ends_with(".sql")
-                })
-        })
-        .cloned()
-        .collect()
+    let mut kept = Vec::new();
+    let mut stray = Vec::new();
+
+    for f in files {
+        let path = PathBuf::from(f);
+        if locations.iter().any(|loc| path.starts_with(loc)) {
+            kept.push(f.clone());
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| (n.starts_with('V') || n.starts_with('R')) && n.ends_with(".sql"))
+        {
+            stray.push(f.clone());
+        }
+    }
+
+    if !stray.is_empty() {
+        log::warn!(
+            "Ignoring {} file(s) that look like migrations but are outside \
+             `[migrations] locations`: {}. Add their directory to `locations` if \
+             they should be checked.",
+            stray.len(),
+            stray.join(", ")
+        );
+    }
+
+    kept
 }
 
 fn extract_versions(files: &[String]) -> std::collections::HashMap<String, String> {
@@ -202,7 +228,10 @@ fn check_semantic_conflict(file_a: &str, file_b: &str) -> Option<Conflict> {
         })
         .collect();
 
-    let overlaps: Vec<String> = targets_a.intersection(&targets_b).cloned().collect();
+    // Sorted: `HashSet::intersection` yields in hash order, so the description
+    // listed the same objects differently on every run.
+    let mut overlaps: Vec<String> = targets_a.intersection(&targets_b).cloned().collect();
+    overlaps.sort();
 
     if overlaps.is_empty() {
         None

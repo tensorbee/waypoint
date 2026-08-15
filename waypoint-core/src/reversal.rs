@@ -16,6 +16,30 @@ use crate::dialect::DialectKind;
 use crate::error::Result;
 use crate::schema::{self, SchemaDiff, SchemaSnapshot};
 
+/// Make generated PostgreSQL reversal SQL target the configured schema.
+///
+/// `schema::generate_ddl` emits object names unqualified (`CREATE TABLE
+/// "orders"`) while embedding qualified references it read from the catalog
+/// (`DEFAULT nextval('revchk.orders_id_seq'::regclass)`). Neither `migrate` nor
+/// `undo` sets `search_path` — hand-written migrations are expected to qualify
+/// their own names — so an auto-reversal for a schema other than the one on the
+/// connection's search path recreated its objects in the *wrong schema*, and
+/// then failed on the first qualified reference that did not resolve.
+///
+/// Prepending the setting makes the stored reversal self-contained: it is
+/// correct wherever it is later executed, without changing `search_path`
+/// semantics for user-written SQL. `SET LOCAL` because `undo` runs this inside
+/// a transaction, so it reverts on COMMIT or ROLLBACK rather than leaking into
+/// the session.
+#[cfg(feature = "postgres")]
+fn scope_reversal_to_schema(schema: &str, sql: &str) -> String {
+    format!(
+        "SET LOCAL search_path TO {};\n\n{}",
+        quote_ident(schema),
+        sql
+    )
+}
+
 /// Configuration for auto-reversal generation.
 #[derive(Debug, Clone)]
 pub struct ReversalConfig {
@@ -108,7 +132,7 @@ pub async fn generate_reversal(
     }
 
     // Generate DDL from the reverse diff
-    let mut sql = schema::generate_ddl(&reverse_diffs);
+    let mut sql = scope_reversal_to_schema(schema_name, &schema::generate_ddl(&reverse_diffs));
 
     // Prepend data-loss warnings as SQL comments
     if has_data_loss && warn_data_loss {
@@ -219,7 +243,14 @@ pub async fn generate_reversal_db(
 
     // Emit DDL in the dialect of the connection.
     let mut sql = match client.dialect_kind() {
+        #[cfg(feature = "postgres")]
+        DialectKind::Postgres => {
+            scope_reversal_to_schema(schema_name, &schema::generate_ddl(&reverse_diffs))
+        }
+        #[cfg(not(feature = "postgres"))]
         DialectKind::Postgres => schema::generate_ddl(&reverse_diffs),
+        // MySQL has no search_path; unqualified names resolve against the
+        // connection's default database, which `undo` already targets.
         DialectKind::Mysql => schema::generate_ddl_mysql(&reverse_diffs),
     };
 

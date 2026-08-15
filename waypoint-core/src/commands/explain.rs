@@ -26,6 +26,16 @@ pub struct ExplainReport {
     pub migrations: Vec<MigrationExplain>,
 }
 
+impl ExplainReport {
+    /// Whether the preview proved a migration will fail.
+    ///
+    /// `migrate --dry-run` routes here, so this is the difference between
+    /// "your migration is fine" and "your migration will fail on statement 2".
+    pub fn has_failures(&self) -> bool {
+        self.migrations.iter().any(|m| m.error.is_some())
+    }
+}
+
 /// EXPLAIN analysis for a single migration.
 #[derive(Debug, Serialize)]
 pub struct MigrationExplain {
@@ -35,6 +45,16 @@ pub struct MigrationExplain {
     pub version: Option<String>,
     /// EXPLAIN results for each statement in the migration.
     pub statements: Vec<StatementExplain>,
+    /// The statement failure that stopped the preview, if any.
+    ///
+    /// A DDL statement that fails inside the preview transaction used to be
+    /// swallowed at `debug` level, and PostgreSQL then aborts the transaction
+    /// so every *later* statement fails too — which was also swallowed. The
+    /// dry run therefore listed every statement as if it were fine. Recording
+    /// the first real failure, and stopping there, is the whole point of a
+    /// preview.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// EXPLAIN analysis for a single statement.
@@ -77,7 +97,28 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Explain
 
     let mut migrations = Vec::new();
 
+    // One transaction for the *whole* preview, rolled back at the end.
+    //
+    // Each migration used to get its own transaction, so V2 could not see the
+    // table V1 had just created — the preview reported a false failure for any
+    // migration that builds on an earlier pending one, which is the normal
+    // case. A real `migrate` applies them in order against accumulating state,
+    // and the preview has to do the same to mean anything.
+    client.batch_execute("BEGIN").await?;
+    let mut aborted = false;
+
+    // The loop body is fallible (placeholder substitution can error), and the
+    // transaction is already open — so its result is captured and the rollback
+    // runs before anything propagates. A bare `?` here would leave the
+    // connection inside an open transaction holding the migrations' DDL.
+    let preview = async {
     for info in &pending {
+        // A failed statement aborts the transaction, so nothing after it can be
+        // checked. Stop rather than report later migrations as if they had been.
+        if aborted {
+            break;
+        }
+
         // Find the resolved migration matching this info
         let migration = resolved.iter().find(|m| m.script == info.script);
         let sql = match migration {
@@ -91,9 +132,7 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Explain
 
         let statements_raw = split_statements(&sql);
         let mut statements = Vec::new();
-
-        // Begin a transaction for EXPLAIN
-        client.batch_execute("BEGIN").await?;
+        let mut failure: Option<String> = None;
 
         for stmt_str in &statements_raw {
             let trimmed = stmt_str.trim();
@@ -116,11 +155,25 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Explain
 
             if is_ddl {
                 // DDL can't be meaningfully EXPLAINed; execute it to build schema state
-                match client.batch_execute(trimmed).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        log::debug!("DDL statement failed during explain: {}", e);
-                    }
+                if let Err(e) = client.batch_execute(trimmed).await {
+                    // Stop here. PostgreSQL aborts the whole transaction on a
+                    // failed statement, so every statement after this one would
+                    // fail with "current transaction is aborted" — reporting
+                    // them as if they were checked is worse than not checking.
+                    let reason = crate::error::format_db_error(&e);
+                    statements.push(StatementExplain {
+                        statement_preview: preview,
+                        plan: format!("FAILED: {}", reason),
+                        estimated_rows: None,
+                        estimated_cost: None,
+                        warnings: vec![format!(
+                            "This statement failed during the dry run; `migrate` would fail here: {}",
+                            reason
+                        )],
+                        is_ddl: true,
+                    });
+                    failure = Some(format!("statement {} failed: {}", statements.len(), reason));
+                    break;
                 }
                 statements.push(StatementExplain {
                     statement_preview: preview,
@@ -151,29 +204,57 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Explain
                         });
                     }
                     Err(e) => {
+                        // As with DDL above: the transaction is now aborted, so
+                        // stop rather than reporting cascading
+                        // "current transaction is aborted" for every statement
+                        // that follows.
+                        let reason = crate::error::format_db_error(&e);
                         statements.push(StatementExplain {
                             statement_preview: preview,
-                            plan: format!("EXPLAIN failed: {}", e),
+                            plan: format!("FAILED: {}", reason),
                             estimated_rows: None,
                             estimated_cost: None,
-                            warnings: vec![],
+                            warnings: vec![format!(
+                                "This statement failed during the dry run; \
+                                 `migrate` would fail here: {}",
+                                reason
+                            )],
                             is_ddl: false,
                         });
+                        failure =
+                            Some(format!("statement {} failed: {}", statements.len(), reason));
+                        break;
                     }
                 }
             }
         }
 
-        // Rollback the transaction
-        let _ = client.batch_execute("ROLLBACK").await;
+        aborted = failure.is_some();
 
         migrations.push(MigrationExplain {
             script: info.script.clone(),
             version: info.version.clone(),
             statements,
+            error: failure,
         });
     }
+    Ok::<(), crate::error::WaypointError>(())
+    }
+    .await;
 
+    // The whole preview rests on this rollback: everything above executed the
+    // migrations' DDL for real. A failure leaves the connection inside an open
+    // transaction holding those changes, which matters for library callers that
+    // keep using the client — so say so rather than discard it.
+    if let Err(e) = client.batch_execute("ROLLBACK").await {
+        log::error!(
+            "Failed to roll back the dry-run transaction; this connection may still hold \
+             uncommitted schema changes: {}",
+            e
+        );
+    }
+
+    preview?;
     Ok(ExplainReport { migrations })
 }
 
@@ -313,6 +394,12 @@ async fn execute_mysql(client: &DbClient, config: &WaypointConfig) -> Result<Exp
             script: info.script.clone(),
             version: info.version.clone(),
             statements,
+            // The MySQL path deliberately does not execute the migration's DDL
+            // (see the note above), so an `EXPLAIN` failure here is expected
+            // whenever a statement references a not-yet-created object. It is
+            // not evidence that `migrate` would fail, so it is not recorded as
+            // a preview failure.
+            error: None,
         });
     }
 

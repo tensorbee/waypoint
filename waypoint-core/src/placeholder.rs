@@ -51,7 +51,10 @@ pub fn replace_placeholders(sql: &str, placeholders: &HashMap<String, String>) -
         if let Some(value) = lower_map.get(&key_lower) {
             result.push_str(value);
         } else {
-            let available: Vec<&str> = placeholders.keys().map(|k| k.as_str()).collect();
+            // Sorted: `HashMap::keys` yields in hash order, so the same error
+            // listed the available placeholders differently on every run.
+            let mut available: Vec<&str> = placeholders.keys().map(|k| k.as_str()).collect();
+            available.sort_unstable();
             return Err(WaypointError::PlaceholderNotFound {
                 key: key.to_string(),
                 available: if available.is_empty() {

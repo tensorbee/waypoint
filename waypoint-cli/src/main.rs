@@ -386,6 +386,46 @@ fn exit_code(error: &WaypointError) -> i32 {
     }
 }
 
+/// Reject `--dry-run` on subcommands that cannot honour it.
+///
+/// `--dry-run` is `global = true`, so clap advertises "Preview what would be
+/// done without making changes" in *every* subcommand's `--help`. Only
+/// `migrate` and `repair` actually implement a preview. For the rest, accepting
+/// the flag and mutating anyway is the worst available outcome — an operator
+/// reaches for `--dry-run` precisely when they are unsure — so refuse instead
+/// of silently ignoring it.
+fn reject_unpreviewable_dry_run(command: &Commands) -> Result<(), WaypointError> {
+    let (name, hint) = match command {
+        Commands::Baseline { .. } => (
+            "baseline",
+            "run `waypoint info` to see the state that would be recorded",
+        ),
+        Commands::Undo { .. } => (
+            "undo",
+            "run `waypoint info` to see the applied migrations that would be reverted",
+        ),
+        Commands::Clean { .. } => (
+            "clean",
+            "there is no preview for `clean`; it drops every object in the schema",
+        ),
+        // Without an ID, `restore` only lists snapshots and changes nothing.
+        Commands::Restore { snapshot_id } if snapshot_id.is_some() => (
+            "restore",
+            "run `waypoint restore` with no ID to list snapshots; restoring wipes \
+             the target database before replaying",
+        ),
+        #[cfg(feature = "self-update")]
+        Commands::SelfUpdate { .. } => ("self-update", "use `waypoint self-update --check`"),
+        _ => return Ok(()),
+    };
+
+    Err(WaypointError::ConfigError(format!(
+        "--dry-run is not supported for `{}` and would not stop it from making \
+         changes, so it is refused rather than ignored. Instead: {}.",
+        name, hint
+    )))
+}
+
 /// Build configuration, resolve multi-database mode, and dispatch the chosen subcommand.
 async fn run(cli: Cli) -> Result<(), WaypointError> {
     let json_output = cli.json;
@@ -394,6 +434,10 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
     let skip_preflight = cli.skip_preflight;
     let force = cli.force;
     let simulate_flag = cli.simulate;
+
+    if dry_run {
+        reject_unpreviewable_dry_run(&cli.command)?;
+    }
 
     // Handle self-update before config/DB setup (no database needed)
     #[cfg(feature = "self-update")]
@@ -627,7 +671,15 @@ async fn run(cli: Cli) -> Result<(), WaypointError> {
     if dry_run && let Commands::Migrate { .. } = &cli.command {
         let wp = Waypoint::new(config).await?;
         let report = waypoint_core::commands::explain::execute_db(wp.client(), &wp.config).await?;
+        let failed = report.has_failures();
         print_report!(report, json_output, output::print_explain_report);
+        // A preview that proved the migration will fail must not exit 0 — a CI
+        // job would otherwise go green and the real `migrate` fail later.
+        if failed {
+            return Err(WaypointError::SimulationFailed {
+                reason: "dry run: a statement failed; see the report above".to_string(),
+            });
+        }
         return Ok(());
     }
 
@@ -673,7 +725,7 @@ async fn run_single_db_command(
     command: &Commands,
     wp: &Waypoint,
     json_output: bool,
-    _dry_run: bool,
+    dry_run: bool,
     force: bool,
     simulate_before: bool,
     quiet: bool,
@@ -743,7 +795,7 @@ async fn run_single_db_command(
             print_report!(report, json_output, quiet, output::print_validate_result);
         }
         Commands::Repair => {
-            let report = wp.repair().await?;
+            let report = wp.repair_with(dry_run).await?;
             print_report!(report, json_output, quiet, output::print_repair_result);
         }
         Commands::Baseline {
@@ -913,12 +965,19 @@ fn print_error(error: &WaypointError) {
 
     // Provide actionable guidance
     match error {
-        WaypointError::ConfigError(_) => {
-            eprintln!(
-                "{}",
-                "Hint: Check your waypoint.toml or set WAYPOINT_DATABASE_URL environment variable."
-                    .dimmed()
-            );
+        WaypointError::ConfigError(msg) => {
+            // Not every ConfigError is a connection-setup problem: `repair`'s
+            // missing-location refusal and the `--dry-run` guard each state
+            // their own remedy, and appending "set WAYPOINT_DATABASE_URL" to
+            // those points the operator at the wrong thing. Offer the generic
+            // hint only when the message did not already say what to do.
+            if !msg.contains("Instead:") && !msg.contains("Check `[migrations]") {
+                eprintln!(
+                    "{}",
+                    "Hint: Check your waypoint.toml or set WAYPOINT_DATABASE_URL environment variable."
+                        .dimmed()
+                );
+            }
         }
         #[cfg(feature = "postgres")]
         WaypointError::DatabaseError(_) => {

@@ -151,6 +151,52 @@ fn apply_ssl_mode(target: &mut SslMode, value: &str, source: &str) {
     }
 }
 
+/// Apply a numeric environment override, warning rather than silently
+/// discarding a value that does not parse.
+///
+/// The numeric env vars used to be read with `if let Ok(v) = var(..) && let
+/// Ok(n) = v.parse()`, which drops a bad value with no message at all. A very
+/// ordinary mistake — `WAYPOINT_CONNECT_TIMEOUT=30s`, with the unit — left the
+/// default silently in force while the operator believed the setting had taken
+/// effect. Enum-valued vars already warned; this makes the numeric ones agree.
+fn apply_env_number<T>(target: &mut T, value: &str, var: &str)
+where
+    T: std::str::FromStr + std::fmt::Display,
+{
+    match value.parse::<T>() {
+        Ok(n) => *target = n,
+        Err(_) => log::warn!(
+            "Invalid {} '{}': expected a whole number; keeping '{}'.",
+            var,
+            value,
+            target
+        ),
+    }
+}
+
+/// Parse a boolean environment variable, warning on anything unrecognised.
+///
+/// `WAYPOINT_BATCH_TRANSACTION` used to be `v == "1" || eq_ignore_ascii_case
+/// ("true")` **assigned unconditionally**, so any other spelling — `yes`, `on`,
+/// or a typo — silently set it to `false`, overriding a `batch_transaction =
+/// true` in the TOML. Turning all-or-nothing mode off without saying so is
+/// exactly the kind of quiet downgrade this codebase treats as a defect.
+fn parse_env_bool(value: &str, var: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        other => {
+            log::warn!(
+                "Invalid {} '{}': expected one of 1/true/yes/on or 0/false/no/off; \
+                 leaving the setting unchanged.",
+                var,
+                other
+            );
+            None
+        }
+    }
+}
+
 /// Top-level configuration for Waypoint.
 #[derive(Debug, Clone, Default)]
 pub struct WaypointConfig {
@@ -706,7 +752,19 @@ impl WaypointConfig {
                     db_config.url = Some(url);
                 }
 
-                let mut mig_settings = MigrationSettings::default();
+                // Start from the resolved top-level `[migrations]`, not from
+                // defaults, so a `[databases.migrations]` block *overrides* the
+                // global policy rather than replacing it. Starting from
+                // `default()` meant a globally-set `table`, `schema`,
+                // `out_of_order` or `validate_on_migrate` silently reverted for
+                // every `[[databases]]` entry — writing the ledger to
+                // `public.waypoint_schema_history` regardless of what the
+                // top-level block said. `[database]` above already works this
+                // way; `[migrations]` was the odd one out.
+                //
+                // `[migrations]` is applied before this block, so `self` is
+                // fully resolved here.
+                let mut mig_settings = self.migrations.clone();
                 if let Some(m) = db.migrations {
                     if let Some(v) = m.locations {
                         mig_settings.locations =
@@ -763,10 +821,15 @@ impl WaypointConfig {
         if let Ok(v) = std::env::var("WAYPOINT_DATABASE_HOST") {
             self.database.host = Some(v);
         }
-        if let Ok(v) = std::env::var("WAYPOINT_DATABASE_PORT")
-            && let Ok(port) = v.parse::<u16>()
-        {
-            self.database.port = Some(port);
+        if let Ok(v) = std::env::var("WAYPOINT_DATABASE_PORT") {
+            match v.parse::<u16>() {
+                Ok(port) => self.database.port = Some(port),
+                Err(_) => log::warn!(
+                    "Invalid WAYPOINT_DATABASE_PORT '{}': expected a port number; \
+                     keeping the existing setting.",
+                    v
+                ),
+            }
         }
         if let Ok(v) = std::env::var("WAYPOINT_DATABASE_USER") {
             self.database.user = Some(v);
@@ -777,10 +840,12 @@ impl WaypointConfig {
         if let Ok(v) = std::env::var("WAYPOINT_DATABASE_NAME") {
             self.database.database = Some(v);
         }
-        if let Ok(v) = std::env::var("WAYPOINT_CONNECT_RETRIES")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.database.connect_retries = n;
+        if let Ok(v) = std::env::var("WAYPOINT_CONNECT_RETRIES") {
+            apply_env_number(
+                &mut self.database.connect_retries,
+                &v,
+                "WAYPOINT_CONNECT_RETRIES",
+            );
         }
         if let Ok(v) = std::env::var("WAYPOINT_SSL_MODE") {
             apply_ssl_mode(&mut self.database.ssl_mode, &v, "WAYPOINT_SSL_MODE");
@@ -788,15 +853,19 @@ impl WaypointConfig {
         if let Ok(v) = std::env::var("WAYPOINT_SSL_ROOT_CERT") {
             self.database.ssl_root_cert = Some(PathBuf::from(v));
         }
-        if let Ok(v) = std::env::var("WAYPOINT_CONNECT_TIMEOUT")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.database.connect_timeout_secs = n;
+        if let Ok(v) = std::env::var("WAYPOINT_CONNECT_TIMEOUT") {
+            apply_env_number(
+                &mut self.database.connect_timeout_secs,
+                &v,
+                "WAYPOINT_CONNECT_TIMEOUT",
+            );
         }
-        if let Ok(v) = std::env::var("WAYPOINT_STATEMENT_TIMEOUT")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.database.statement_timeout_secs = n;
+        if let Ok(v) = std::env::var("WAYPOINT_STATEMENT_TIMEOUT") {
+            apply_env_number(
+                &mut self.database.statement_timeout_secs,
+                &v,
+                "WAYPOINT_STATEMENT_TIMEOUT",
+            );
         }
         if let Ok(v) = std::env::var("WAYPOINT_MIGRATIONS_LOCATIONS") {
             self.migrations.locations =
@@ -818,13 +887,13 @@ impl WaypointConfig {
                 ),
             }
         }
-        if let Ok(v) = std::env::var("WAYPOINT_KEEPALIVE")
-            && let Ok(n) = v.parse::<u32>()
-        {
-            self.database.keepalive_secs = n;
+        if let Ok(v) = std::env::var("WAYPOINT_KEEPALIVE") {
+            apply_env_number(&mut self.database.keepalive_secs, &v, "WAYPOINT_KEEPALIVE");
         }
-        if let Ok(v) = std::env::var("WAYPOINT_BATCH_TRANSACTION") {
-            self.migrations.batch_transaction = v == "1" || v.eq_ignore_ascii_case("true");
+        if let Ok(v) = std::env::var("WAYPOINT_BATCH_TRANSACTION")
+            && let Some(b) = parse_env_bool(&v, "WAYPOINT_BATCH_TRANSACTION")
+        {
+            self.migrations.batch_transaction = b;
         }
         if let Ok(v) = std::env::var("WAYPOINT_ENVIRONMENT") {
             self.migrations.environment = Some(v);
@@ -1420,5 +1489,84 @@ url = "postgres://user@localhost/orders"
             db.database.ssl_root_cert,
             Some(PathBuf::from("/etc/ssl/ca.pem"))
         );
+    }
+
+    #[test]
+    fn test_multi_database_inherits_top_level_migration_settings() {
+        // The `[database]` twin above proves transport policy is inherited.
+        // `[migrations]` must behave the same way: a `[[databases]]` entry
+        // *overrides* the global block, it does not replace it with defaults.
+        // Otherwise a globally-configured history table or schema silently
+        // reverts per database — writing the ledger to the wrong place.
+        let toml_str = r#"
+[migrations]
+table = "custom_history"
+schema = "app"
+out_of_order = true
+validate_on_migrate = false
+
+[[databases]]
+name = "orders"
+url = "postgres://user@localhost/orders"
+
+[databases.migrations]
+locations = ["db/orders"]
+"#;
+        let toml_config: TomlConfig = toml::from_str(toml_str).unwrap();
+        let mut config = WaypointConfig::default();
+        config.apply_toml(toml_config);
+        let multi = config.multi_database.expect("expected a multi-db config");
+        let db = &multi[0];
+
+        // Overridden per database.
+        assert_eq!(db.migrations.locations, vec![PathBuf::from("db/orders")]);
+        // Inherited from the top-level block.
+        assert_eq!(db.migrations.table, "custom_history");
+        assert_eq!(db.migrations.schema, "app");
+        assert!(db.migrations.out_of_order);
+        assert!(!db.migrations.validate_on_migrate);
+    }
+
+    #[test]
+    fn test_apply_env_number_keeps_previous_value_on_garbage() {
+        // The bug this replaces: `WAYPOINT_CONNECT_TIMEOUT=30s` parsed as a
+        // number fails, and the old let-chain silently kept the default with no
+        // message at all.
+        let mut timeout: u32 = 30;
+        apply_env_number(&mut timeout, "45", "WAYPOINT_CONNECT_TIMEOUT");
+        assert_eq!(timeout, 45, "a valid value must be applied");
+
+        apply_env_number(&mut timeout, "30s", "WAYPOINT_CONNECT_TIMEOUT");
+        assert_eq!(
+            timeout, 45,
+            "a unit suffix must not silently reset the value"
+        );
+
+        apply_env_number(&mut timeout, "", "WAYPOINT_CONNECT_TIMEOUT");
+        assert_eq!(timeout, 45);
+    }
+
+    #[test]
+    fn test_parse_env_bool_accepts_common_spellings() {
+        for v in ["1", "true", "TRUE", "yes", "on", " True "] {
+            assert_eq!(parse_env_bool(v, "T"), Some(true), "input: {v:?}");
+        }
+        for v in ["0", "false", "FALSE", "no", "off"] {
+            assert_eq!(parse_env_bool(v, "T"), Some(false), "input: {v:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_env_bool_rejects_unknown_instead_of_defaulting_to_false() {
+        // The old expression coerced anything unrecognised to `false`, so a
+        // typo silently turned off all-or-nothing batch mode that the TOML had
+        // switched on. `None` means "leave the setting alone".
+        for v in ["y", "enabled", "maybe", "tru"] {
+            assert_eq!(
+                parse_env_bool(v, "WAYPOINT_BATCH_TRANSACTION"),
+                None,
+                "input: {v:?}"
+            );
+        }
     }
 }

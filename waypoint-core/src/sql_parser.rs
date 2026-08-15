@@ -307,12 +307,35 @@ pub fn extract_ddl_operations(sql: &str) -> Vec<DdlOperation> {
 
 /// Extract DDL operations along with their source positions.
 pub fn extract_ddl_operations_located(sql: &str) -> Vec<LocatedDdl> {
+    // Comments *and* string literals are blanked before matching. The patterns
+    // in `parse_statement_ops` are unanchored, so without this an INSERT whose
+    // payload happens to mention DDL is classified as that DDL:
+    //
+    //   INSERT INTO runbook (step) VALUES ('then DROP TABLE users');
+    //     → DropTable { table: "users" }
+    //
+    // which made `safety` report a table drop that does not exist and, with
+    // `block_on_danger`, refuse the migration — pushing the operator towards
+    // `--force`, which then also disables the checks that are real.
+    //
+    // Both helpers preserve byte offsets and line breaks, so `start`, `end` and
+    // `focus` below still index the original `sql`, and the two copies can be
+    // used interchangeably by offset.
+    //
+    // `parse_statement_ops` takes both: the regex battery runs on the blanked
+    // text, while `parse_add_columns` gets the literals intact. That tokenizer
+    // is already literal-aware — it classifies `'…'` as a single string token,
+    // so it cannot be fooled — and it is the one branch that captures a value a
+    // literal may legitimately *be*: `default_expr` for
+    // `ADD COLUMN c text DEFAULT 'x'`. Blanking that would corrupt a public
+    // field of `DdlOperation`.
     let stripped = strip_comments(sql);
+    let blanked = blank_string_literals(&stripped);
     let mut ops = Vec::new();
 
-    for (start, end) in statement_ranges(&stripped) {
-        let stmt = &stripped[start..end];
-        let parsed = parse_statement_ops(stmt);
+    for (start, end) in statement_ranges(&blanked) {
+        let stmt = &blanked[start..end];
+        let parsed = parse_statement_ops(stmt, &stripped[start..end]);
         if parsed.is_empty() {
             // Unrecognized statement — preview the original text so comments
             // written inside the statement still show up verbatim.
@@ -350,7 +373,13 @@ pub fn extract_ddl_operations_located(sql: &str) -> Vec<LocatedDdl> {
 ///
 /// Each operation is paired with the byte offset (relative to `stmt`) of the
 /// token it should be reported against.
-fn parse_statement_ops(stmt: &str) -> Vec<(DdlOperation, usize)> {
+/// Classify one statement.
+///
+/// `stmt` has both comments and string-literal contents blanked and is what the
+/// unanchored regex patterns below match against. `stmt_with_literals` has only
+/// comments blanked, at identical byte offsets, and is used by the ADD COLUMN
+/// tokenizer so a `DEFAULT 'x'` survives verbatim.
+fn parse_statement_ops(stmt: &str, stmt_with_literals: &str) -> Vec<(DdlOperation, usize)> {
     // Order matters — more specific patterns first
 
     // ALTER TABLE ... ADD CONSTRAINT (before ADD COLUMN)
@@ -397,7 +426,7 @@ fn parse_statement_ops(stmt: &str) -> Vec<(DdlOperation, usize)> {
     }
 
     // ALTER TABLE ... ADD [COLUMN] [IF NOT EXISTS] <column> <type> [constraints]
-    if let Some((table, clauses)) = parse_add_columns(stmt) {
+    if let Some((table, clauses)) = parse_add_columns(stmt_with_literals) {
         return clauses
             .into_iter()
             .map(|c| {
@@ -1129,6 +1158,51 @@ fn skip_quoted(sql: &str, i: usize) -> Option<usize> {
     }
 }
 
+/// Blank out the *contents* of every string literal, preserving byte offsets,
+/// line breaks and the surrounding quotes.
+///
+/// [`strip_comments`] skips over quoted regions but leaves their text in place,
+/// so a keyword scan run on its output still sees words that are data rather
+/// than SQL — `INSERT INTO runbook VALUES ('nightly VACUUM of orders')` read as
+/// a `VACUUM` statement. Blanking the interior keeps every offset and line
+/// number intact, so diagnostics still point at the original source.
+///
+/// Quoted *identifiers* (`"..."`, `` `...` ``) are deliberately left alone:
+/// they name real objects and callers need to read them.
+pub fn blank_string_literals(sql: &str) -> String {
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut out = bytes.to_vec();
+    let mut i = 0;
+
+    while i < len {
+        // Comments first: an apostrophe inside a comment must not open a
+        // literal (`-- don't do this`).
+        if let Some(j) = skip_comment(bytes, i) {
+            i = j;
+            continue;
+        }
+        if let Some(j) = skip_quoted(sql, i) {
+            if bytes[i] == b'\'' {
+                // Keep the delimiters, blank what is between them.
+                let inner_end = j.saturating_sub(1).max(i + 1);
+                for b in &mut out[i + 1..inner_end.min(len)] {
+                    if *b != b'\n' {
+                        *b = b' ';
+                    }
+                }
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+
+    // Only ASCII bytes inside literals were replaced with ASCII spaces, so a
+    // multi-byte character cannot be split; the result is still valid UTF-8.
+    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
+}
+
 /// Blank out every comment in `sql`, preserving byte offsets and line breaks.
 ///
 /// Comment bytes become spaces (newlines are kept) so the result has exactly
@@ -1853,5 +1927,107 @@ mod tests {
             split_mysql_statements(sql),
             vec!["-- set up\nCREATE TABLE t (id INT)".to_string()]
         );
+    }
+
+    #[test]
+    fn test_blank_string_literals_preserves_offsets_and_quotes() {
+        let sql = "INSERT INTO t VALUES ('nightly VACUUM run');";
+        let out = blank_string_literals(sql);
+        assert_eq!(out.len(), sql.len(), "byte offsets must be preserved");
+        assert!(
+            !out.contains("VACUUM"),
+            "literal contents must be blanked: {out}"
+        );
+        assert!(
+            out.contains("INSERT INTO t VALUES ("),
+            "SQL outside the literal is untouched"
+        );
+        assert_eq!(out.matches('\'').count(), 2, "the quotes themselves stay");
+    }
+
+    #[test]
+    fn test_blank_string_literals_keeps_line_structure() {
+        let sql = "INSERT INTO t VALUES ('line one\nline two');\nSELECT 1;";
+        let out = blank_string_literals(sql);
+        assert_eq!(out.len(), sql.len());
+        assert_eq!(
+            out.matches('\n').count(),
+            sql.matches('\n').count(),
+            "newlines inside literals must survive so line numbers stay right"
+        );
+    }
+
+    #[test]
+    fn test_blank_string_literals_leaves_quoted_identifiers_alone() {
+        // Quoted identifiers name real objects; callers need to read them.
+        let sql = "CREATE TABLE \"my VACUUM table\" (id int);";
+        let out = blank_string_literals(sql);
+        assert!(out.contains("my VACUUM table"), "got: {out}");
+    }
+
+    #[test]
+    fn test_blank_string_literals_handles_doubled_quote_escape() {
+        let sql = "SELECT 'it''s VACUUM time', 1;";
+        let out = blank_string_literals(sql);
+        assert_eq!(out.len(), sql.len());
+        assert!(!out.contains("VACUUM"), "got: {out}");
+        assert!(
+            out.trim_end().ends_with(", 1;"),
+            "parsing resumed too early: {out}"
+        );
+    }
+
+    #[test]
+    fn test_blank_string_literals_ignores_apostrophe_in_comment() {
+        // An apostrophe in a comment must not be read as opening a literal and
+        // swallow the statement that follows.
+        let sql = "-- don't blank this\nSELECT 'x' FROM t;";
+        let out = blank_string_literals(sql);
+        assert_eq!(out.len(), sql.len());
+        assert!(out.contains("FROM t;"), "got: {out}");
+    }
+
+    #[test]
+    fn test_ddl_keywords_inside_string_literals_are_not_operations() {
+        // An INSERT whose payload mentions DDL is an INSERT. Reading it as a
+        // DROP made `safety` report a table drop that does not exist and, with
+        // block_on_danger, refuse a valid migration.
+        for sql in [
+            "INSERT INTO runbook (step) VALUES ('then DROP TABLE users');",
+            "INSERT INTO n (m) VALUES ('remember to TRUNCATE TABLE orders');",
+            "UPDATE notes SET body = 'ALTER TABLE t DROP COLUMN c' WHERE id = 1;",
+        ] {
+            let ops = extract_ddl_operations(sql);
+            assert!(
+                ops.iter().all(|o| matches!(o, DdlOperation::Other { .. })),
+                "literal payload classified as DDL for {sql:?}: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_real_ddl_is_still_detected_after_literal_blanking() {
+        assert!(matches!(
+            extract_ddl_operations("DROP TABLE users;").as_slice(),
+            [DdlOperation::DropTable { table }] if table == "users"
+        ));
+        assert!(matches!(
+            extract_ddl_operations("TRUNCATE TABLE orders;").as_slice(),
+            [DdlOperation::TruncateTable { table }] if table == "orders"
+        ));
+    }
+
+    #[test]
+    fn test_string_literal_default_survives_blanking() {
+        // `default_expr` is a public field, and a literal is a legitimate
+        // default. The blanked copy is used for matching only.
+        match extract_ddl_operations("ALTER TABLE t ADD COLUMN c text DEFAULT 'busy waiting';")
+            .as_slice()
+        {
+            [DdlOperation::AlterTableAddColumn { default_expr, .. }] => {
+                assert_eq!(default_expr.as_deref(), Some("'busy waiting'"))
+            }
+            other => panic!("expected one AlterTableAddColumn, got {other:?}"),
+        }
     }
 }

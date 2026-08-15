@@ -32,15 +32,16 @@ pub async fn execute(
         return Err(WaypointError::CleanDisabled);
     }
 
+    let schema = &config.migrations.schema;
     let table = &config.migrations.table;
 
     // Acquire advisory lock to prevent concurrent operations
-    db::acquire_advisory_lock(client, table).await?;
+    db::acquire_advisory_lock(client, schema, table).await?;
 
     let result = execute_inner_pg(client, config).await;
 
     // Always release the lock
-    if let Err(e) = db::release_advisory_lock(client, table).await {
+    if let Err(e) = db::release_advisory_lock(client, schema, table).await {
         log::error!("Failed to release advisory lock: {}", e);
     }
 
@@ -57,8 +58,10 @@ pub async fn execute_db(
         return Err(WaypointError::CleanDisabled);
     }
 
+    // Resolve before locking: the lock key is scoped by schema.
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
     let table = &config.migrations.table;
-    client.acquire_lock(table).await?;
+    client.acquire_lock(&schema, table).await?;
 
     let result = match client.dialect_kind() {
         #[cfg(feature = "postgres")]
@@ -75,7 +78,7 @@ pub async fn execute_db(
         )),
     };
 
-    if let Err(e) = client.release_lock(table).await {
+    if let Err(e) = client.release_lock(&schema, table).await {
         log::error!("Failed to release advisory lock: {}", e);
     }
 
@@ -165,27 +168,49 @@ async fn execute_inner_pg(client: &Client, config: &WaypointConfig) -> Result<Ve
         dropped.push(format!("Sequence: {}.{}", schema, name));
     }
 
-    // Drop functions/procedures
+    // Drop routines. PostgreSQL requires the *matching* DROP keyword —
+    // `DROP FUNCTION` on a procedure fails with "is not a function" and on an
+    // aggregate with "is an aggregate function" — so route on `pg_proc.prokind`
+    // rather than dropping everything as a function. Issuing the wrong keyword
+    // aborted `clean` partway, after the tables had already gone.
+    //
+    // Extension-owned routines are excluded: dropping one fails with "cannot
+    // drop ... because extension ... requires it", which is the same
+    // partial-destruction failure by another route. An extension installed into
+    // the managed schema is not waypoint's to remove.
     let rows = client
         .query(
-            "SELECT p.proname, pg_get_function_identity_arguments(p.oid) as args \
+            "SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args, p.prokind \
              FROM pg_proc p \
              JOIN pg_namespace n ON p.pronamespace = n.oid \
-             WHERE n.nspname = $1",
+             WHERE n.nspname = $1 \
+             AND NOT EXISTS ( \
+                 SELECT 1 FROM pg_depend d \
+                 WHERE d.objid = p.oid AND d.deptype = 'e' \
+             )",
             &[&schema],
         )
         .await?;
     for row in rows {
         let name: String = row.get(0);
         let args: String = row.get(1);
+        let prokind: i8 = row.get(2);
+        let (keyword, label) = match prokind as u8 as char {
+            'p' => ("PROCEDURE", "Procedure"),
+            'a' => ("AGGREGATE", "Aggregate"),
+            // 'f' (function) and 'w' (window) are both dropped with
+            // DROP FUNCTION.
+            _ => ("FUNCTION", "Function"),
+        };
         let sql = format!(
-            "DROP FUNCTION IF EXISTS {}.{}({}) CASCADE",
+            "DROP {} IF EXISTS {}.{}({}) CASCADE",
+            keyword,
             schema_q,
             quote_ident(&name),
             args
         );
         client.batch_execute(&sql).await?;
-        dropped.push(format!("Function: {}.{}", schema, name));
+        dropped.push(format!("{}: {}.{}", label, schema, name));
     }
 
     // Drop custom types (enums, composites)

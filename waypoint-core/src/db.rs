@@ -66,6 +66,50 @@ impl TransportConfig {
     }
 }
 
+/// Build a unique name for a throwaway schema or database.
+///
+/// `simulate` and `drift` each create a sandbox, work in it, and then drop it
+/// unconditionally — including when their own `CREATE` failed. That makes the
+/// name safety-critical rather than cosmetic: if two concurrent runs pick the
+/// same one, the loser's `CREATE` fails and its cleanup then drops the sandbox
+/// the *winner* is still using.
+///
+/// Both used to derive the name from a clock alone — milliseconds for
+/// `simulate`, whole seconds for `drift` — so a collision needed only two runs
+/// starting in the same tick. The process id and a random suffix make the name
+/// unique across concurrent processes as well as within one.
+///
+/// Stays inside PostgreSQL's 63-byte and MySQL's 64-byte identifier limits for
+/// the prefixes used here.
+pub fn sandbox_name(prefix: &str) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!(
+        "{}_{}_{:x}_{:08x}",
+        prefix,
+        millis,
+        std::process::id(),
+        fastrand::u32(..)
+    )
+}
+
+/// Quote a value as a SQL string literal.
+///
+/// Doubles any embedded single quote, which is the escape both PostgreSQL and
+/// MySQL accept. Use this for anything that is *data* inside generated SQL —
+/// enum labels, for instance — as opposed to an object name, which wants
+/// [`quote_ident`].
+///
+/// Generated DDL used to interpolate enum labels with a bare `format!("'{}'")`,
+/// so a label containing an apostrophe produced
+/// `CREATE TYPE "mood" AS ENUM ('fine', 'it's bad')` — broken SQL in the
+/// snapshot, which `restore` then skipped with only a warning.
+pub fn quote_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 /// Quote a SQL identifier to prevent SQL injection.
 ///
 /// Doubles any embedded double-quotes and wraps in double-quotes — this is the
@@ -233,14 +277,14 @@ impl DbClient {
     ///
     /// PostgreSQL: `pg_advisory_lock(<i64>)` derived from a CRC32 of the table name.
     /// MySQL: `GET_LOCK('waypoint_<table>', -1)` (named, indefinite-wait).
-    pub async fn acquire_lock(&self, table_name: &str) -> Result<()> {
+    pub async fn acquire_lock(&self, schema: &str, table_name: &str) -> Result<()> {
         match self {
             #[cfg(feature = "postgres")]
-            DbClient::Postgres(c) => acquire_advisory_lock(c, table_name).await,
+            DbClient::Postgres(c) => acquire_advisory_lock(c, schema, table_name).await,
             #[cfg(feature = "mysql")]
             DbClient::Mysql(pool) => {
                 use mysql_async::prelude::*;
-                let key = mysql_lock_key(&mysql_lock_scope(self).await, table_name);
+                let key = mysql_lock_key(schema, table_name);
                 let mut conn = pool.get_conn().await?;
                 let acquired: Option<i64> = conn
                     .exec_first("SELECT GET_LOCK(?, -1)", (key.clone(),))
@@ -262,18 +306,19 @@ impl DbClient {
     /// Try to acquire the advisory lock, polling until acquired or timeout expires.
     pub async fn acquire_lock_with_timeout(
         &self,
+        schema: &str,
         table_name: &str,
         timeout_secs: u32,
     ) -> Result<()> {
         match self {
             #[cfg(feature = "postgres")]
             DbClient::Postgres(c) => {
-                acquire_advisory_lock_with_timeout(c, table_name, timeout_secs).await
+                acquire_advisory_lock_with_timeout(c, schema, table_name, timeout_secs).await
             }
             #[cfg(feature = "mysql")]
             DbClient::Mysql(pool) => {
                 use mysql_async::prelude::*;
-                let key = mysql_lock_key(&mysql_lock_scope(self).await, table_name);
+                let key = mysql_lock_key(schema, table_name);
                 let mut conn = pool.get_conn().await?;
                 let acquired: Option<i64> = conn
                     .exec_first("SELECT GET_LOCK(?, ?)", (key.clone(), timeout_secs as i64))
@@ -297,14 +342,14 @@ impl DbClient {
     }
 
     /// Release the advisory lock acquired via [`Self::acquire_lock`].
-    pub async fn release_lock(&self, table_name: &str) -> Result<()> {
+    pub async fn release_lock(&self, schema: &str, table_name: &str) -> Result<()> {
         match self {
             #[cfg(feature = "postgres")]
-            DbClient::Postgres(c) => release_advisory_lock(c, table_name).await,
+            DbClient::Postgres(c) => release_advisory_lock(c, schema, table_name).await,
             #[cfg(feature = "mysql")]
             DbClient::Mysql(pool) => {
                 use mysql_async::prelude::*;
-                let key = mysql_lock_key(&mysql_lock_scope(self).await, table_name);
+                let key = mysql_lock_key(schema, table_name);
                 // Release on the *same* session that acquired it. A different
                 // connection's RELEASE_LOCK is a silent no-op (returns 0) and
                 // would leak the lock until the server reaps the session.
@@ -476,6 +521,8 @@ pub async fn connect_for_url(
                 conn_string,
                 config.database.ssl_mode,
                 config.database.ssl_root_cert.as_deref(),
+                config.database.statement_timeout_secs,
+                config.database.keepalive_secs,
             )
             .await?;
             Ok(DbClient::with_mysql(pool))
@@ -501,14 +548,57 @@ pub async fn connect_for_url(
 /// connect once eagerly and rebuild the pool without TLS if that fails. The
 /// probe connection is returned to the pool rather than discarded, so the
 /// successful path costs nothing extra. Every other mode stays lazy.
+///
+/// # `statement_timeout`
+///
+/// Applied as `SET SESSION MAX_EXECUTION_TIME`, which `docs/ENGINES.md` has
+/// always documented but the code never issued — the setting was silently
+/// ignored on MySQL. Note the scope the docs already state: MySQL's
+/// `MAX_EXECUTION_TIME` bounds **read-only SELECTs only**, so unlike
+/// PostgreSQL's `statement_timeout` it will not interrupt a long `ALTER TABLE`.
+/// MySQL has no server-side equivalent that does.
+///
+/// # Transport settings that do not apply
+///
+/// `connect_timeout` has no counterpart in `mysql_async` 0.37, and
+/// `connect_retries` has nothing to retry: `Pool` is lazy, so there is no
+/// connect step here to wrap in a loop. Both are recorded as PostgreSQL-only in
+/// `docs/ENGINES.md` rather than being silently dropped.
 #[cfg(feature = "mysql")]
 async fn connect_mysql_pool(
     conn_string: &str,
     ssl_mode: SslMode,
     ssl_root_cert: Option<&std::path::Path>,
+    statement_timeout_secs: u32,
+    keepalive_secs: u32,
 ) -> Result<mysql_async::Pool> {
     let base = mysql_async::Opts::from_url(conn_string)
         .map_err(|e| WaypointError::ConfigError(format!("Invalid MySQL connection URL: {}", e)))?;
+
+    // `setup`, not `init`: the pool issues `COM_RESET_CONNECTION` when a `Conn`
+    // is returned, which clears session variables. `init` runs only when the
+    // connection is first opened, so the timeout survived exactly one checkout
+    // and every later one silently ran unbounded. `setup` re-runs after each
+    // reset.
+    let mut builder = mysql_async::OptsBuilder::from_opts(base);
+
+    if statement_timeout_secs > 0 {
+        let millis = u64::from(statement_timeout_secs).saturating_mul(1000);
+        log::debug!(
+            "Setting MySQL MAX_EXECUTION_TIME={}ms (bounds SELECTs only; DDL is not interruptible \
+             by it)",
+            millis
+        );
+        builder = builder.setup(vec![format!("SET SESSION MAX_EXECUTION_TIME = {}", millis)]);
+    }
+
+    if keepalive_secs > 0 {
+        builder = builder.tcp_keepalive(Some(std::time::Duration::from_secs(u64::from(
+            keepalive_secs,
+        ))));
+    }
+
+    let base = mysql_async::Opts::from(builder);
 
     // mysql_async writes the SSLRequest packet and then silently skips the
     // upgrade for socket connections, handing back a plaintext session that
@@ -610,19 +700,6 @@ fn mysql_lock_key(schema: &str, table_name: &str) -> String {
     } else {
         format!("waypoint_{:08x}", crc32fast::hash(full.as_bytes()))
     }
-}
-
-/// The database name to scope a MySQL lock to.
-///
-/// Falls back to a fixed marker when the connection has no default database;
-/// a lock still has to be taken, and a shared key is safe (it only
-/// over-serialises), whereas skipping the lock would not be.
-#[cfg(feature = "mysql")]
-async fn mysql_lock_scope(client: &DbClient) -> String {
-    client
-        .current_database()
-        .await
-        .unwrap_or_else(|_| "_nodb".to_string())
 }
 
 /// Registry of pinned connections that currently hold a MySQL named lock.
@@ -998,8 +1075,8 @@ pub async fn connect_with_transport(
 ///
 /// This prevents concurrent migration runs from interfering with each other.
 #[cfg(feature = "postgres")]
-pub async fn acquire_advisory_lock(client: &Client, table_name: &str) -> Result<()> {
-    let lock_id = advisory_lock_id(table_name);
+pub async fn acquire_advisory_lock(client: &Client, schema: &str, table_name: &str) -> Result<()> {
+    let lock_id = advisory_lock_id(schema, table_name);
     log::info!(
         "Acquiring advisory lock; lock_id={}, table={}",
         lock_id,
@@ -1021,10 +1098,11 @@ pub async fn acquire_advisory_lock(client: &Client, table_name: &str) -> Result<
 #[cfg(feature = "postgres")]
 pub async fn acquire_advisory_lock_with_timeout(
     client: &Client,
+    schema: &str,
     table_name: &str,
     timeout_secs: u32,
 ) -> Result<()> {
-    let lock_id = advisory_lock_id(table_name);
+    let lock_id = advisory_lock_id(schema, table_name);
     log::info!(
         "Trying to acquire advisory lock with timeout; lock_id={}, table={}, timeout_secs={}",
         lock_id,
@@ -1059,8 +1137,8 @@ pub async fn acquire_advisory_lock_with_timeout(
 
 /// Release the PostgreSQL advisory lock.
 #[cfg(feature = "postgres")]
-pub async fn release_advisory_lock(client: &Client, table_name: &str) -> Result<()> {
-    let lock_id = advisory_lock_id(table_name);
+pub async fn release_advisory_lock(client: &Client, schema: &str, table_name: &str) -> Result<()> {
+    let lock_id = advisory_lock_id(schema, table_name);
     log::info!(
         "Releasing advisory lock; lock_id={}, table={}",
         lock_id,
@@ -1075,13 +1153,37 @@ pub async fn release_advisory_lock(client: &Client, table_name: &str) -> Result<
     Ok(())
 }
 
-/// Compute a stable i64 lock ID from the table name using CRC32.
+/// Compute a stable i64 lock ID from the schema and table name using CRC32.
+///
+/// # Scoping
+///
+/// PostgreSQL advisory locks live in a per-*database* namespace, so two
+/// databases never collide. Two **schemas** in the same database did: the key
+/// used to be a hash of the table name alone, and every schema names its
+/// history table the same thing. Schema-per-tenant and schema-per-service
+/// layouts therefore serialised every migration in the database behind one
+/// lock. It was never unsafe — over-locking cannot corrupt anything — but it
+/// queued work that has nothing to do with each other.
+///
+/// Including the schema mirrors [`mysql_lock_key`], which has always been
+/// scoped this way and whose test says why.
+///
+/// # Upgrading
+///
+/// **The key changed in 0.8.0.** A waypoint before 0.8.0 and a waypoint from
+/// 0.8.0 onwards compute different ids for the same history table, so they do
+/// **not** exclude each other. Finish rolling out the new version before
+/// relying on the lock again — do not run migrations from a mixed fleet
+/// against one database.
 ///
 /// Uses CRC32 instead of DefaultHasher for cross-version stability —
 /// DefaultHasher is not guaranteed to produce the same output across
 /// Rust compiler versions.
-pub fn advisory_lock_id(table_name: &str) -> i64 {
-    crc32fast::hash(table_name.as_bytes()) as i64
+pub fn advisory_lock_id(schema: &str, table_name: &str) -> i64 {
+    // `\0` as the separator: it cannot appear in a PostgreSQL identifier, so
+    // ("a", "b_c") and ("a_b", "c") cannot hash to the same key.
+    let key = format!("{}\0{}", schema, table_name);
+    crc32fast::hash(key.as_bytes()) as i64
 }
 
 /// Get the current database user.
@@ -1265,13 +1367,35 @@ mod tests {
 
     #[test]
     fn test_advisory_lock_id_stability() {
-        // Ensure the same table name always produces the same lock ID
-        let id1 = advisory_lock_id("waypoint_schema_history");
-        let id2 = advisory_lock_id("waypoint_schema_history");
+        // The same schema+table always produces the same lock ID; a
+        // release_lock would otherwise not match its acquire_lock.
+        let id1 = advisory_lock_id("public", "waypoint_schema_history");
+        let id2 = advisory_lock_id("public", "waypoint_schema_history");
         assert_eq!(id1, id2);
-        // Different table names should produce different lock IDs
-        let id3 = advisory_lock_id("other_table");
+        // Different table names produce different lock IDs.
+        let id3 = advisory_lock_id("public", "other_table");
         assert_ne!(id1, id3);
+    }
+
+    #[test]
+    fn test_advisory_lock_id_is_scoped_per_schema() {
+        // PostgreSQL advisory locks are per-database, so two *schemas* in one
+        // database used to share a key — every tenant's migration queued
+        // behind every other tenant's for no reason.
+        let a = advisory_lock_id("tenant_a", "waypoint_schema_history");
+        let b = advisory_lock_id("tenant_b", "waypoint_schema_history");
+        assert_ne!(a, b, "schemas in one database must not share a lock");
+    }
+
+    #[test]
+    fn test_advisory_lock_id_separator_cannot_be_forged() {
+        // A plain concatenation would make ("a", "b_c") and ("a_b", "c")
+        // collide. The NUL separator cannot occur in an identifier.
+        assert_ne!(
+            advisory_lock_id("a", "b_c"),
+            advisory_lock_id("a_b", "c"),
+            "schema/table boundary must be unambiguous"
+        );
     }
 
     #[test]
@@ -1373,5 +1497,56 @@ mod tests {
         // The key has to be reproducible across processes and releases, or a
         // release_lock would not match its acquire_lock.
         assert_eq!(mysql_lock_key("db", "tbl"), mysql_lock_key("db", "tbl"));
+    }
+
+    #[test]
+    fn test_sandbox_name_is_unique_across_rapid_calls() {
+        // `simulate` and `drift` drop their sandbox unconditionally, so two
+        // runs that pick the same name destroy each other's work. The names
+        // used to be a bare clock reading — milliseconds for simulate, whole
+        // seconds for drift — and a loop this tight produced duplicates.
+        let names: std::collections::HashSet<String> =
+            (0..2000).map(|_| sandbox_name("waypoint_sim")).collect();
+        assert_eq!(
+            names.len(),
+            2000,
+            "sandbox names collided within a single tight loop"
+        );
+    }
+
+    #[test]
+    fn test_sandbox_name_fits_identifier_limits() {
+        // PostgreSQL truncates identifiers at 63 bytes and MySQL rejects
+        // database names over 64. A truncated name would reintroduce exactly
+        // the collision this helper exists to prevent.
+        for prefix in ["waypoint_sim", "waypoint_drift_check"] {
+            let name = sandbox_name(prefix);
+            assert!(
+                name.len() <= 63,
+                "{} is {} bytes, over PostgreSQL's 63-byte limit",
+                name,
+                name.len()
+            );
+            assert!(name.starts_with(prefix));
+        }
+    }
+
+    #[test]
+    fn test_quote_literal_escapes_embedded_single_quotes() {
+        // Generated enum DDL used to interpolate labels raw, producing
+        // `ENUM ('fine', 'it's bad')` — a snapshot that will not restore.
+        assert_eq!(quote_literal("fine"), "'fine'");
+        assert_eq!(quote_literal("it's bad"), "'it''s bad'");
+        // Two quotes in: each is doubled, then the delimiters are added.
+        assert_eq!(quote_literal("''"), r"''''''");
+        assert_eq!(quote_literal(""), r"''");
+    }
+
+    #[test]
+    fn test_quote_literal_leaves_other_characters_alone() {
+        // Backslashes are not escapes in a standard-conforming string literal,
+        // so doubling them would corrupt the value.
+        assert_eq!(quote_literal(r"back\slash"), r"'back\slash'");
+        assert_eq!(quote_literal("multi\nline"), "'multi\nline'");
     }
 }

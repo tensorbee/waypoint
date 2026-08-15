@@ -312,6 +312,108 @@ async fn validate_passes_after_migrate() {
     assert!(report2.valid);
 }
 
+/// Issue #2 on the MySQL path. The dry-run branch takes a different route to
+/// the ledger (`history_table_exists_db` instead of `create_history_table_db`),
+/// so it needs its own coverage.
+/// The MySQL `update_checksum` spells the `UNDO_SQL`/`BASELINE` exclusion with
+/// `NOT IN (?, ?)` rather than PostgreSQL's `<> ALL($3)`, so it needs its own
+/// proof that the undo row survives a realignment.
+#[tokio::test]
+async fn repair_does_not_clobber_undo_row_checksums_on_mysql() {
+    use waypoint_core::commands::undo::UndoTarget;
+    let db = fresh_database("repairundo").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[
+            ("V1__Create.sql", "CREATE TABLE t (id INT PRIMARY KEY);"),
+            ("U1__Drop.sql", "DROP TABLE t;"),
+        ],
+    );
+    let config = config_for(name, migrations.clone());
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+    wp.undo(UndoTarget::Last).await.expect("undo");
+
+    let undo_checksum = |label: &'static str| {
+        let name = name.to_string();
+        async move {
+            let pool = mysql_async::Pool::from_url(db_url(&name)).unwrap();
+            let mut conn = pool.get_conn().await.unwrap();
+            let ck: Option<i32> = conn
+                .query_first("SELECT checksum FROM waypoint_schema_history WHERE type = 'UNDO_SQL'")
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            drop(conn);
+            pool.disconnect().await.ok();
+            ck
+        }
+    };
+
+    let before = undo_checksum("before").await.expect("undo row must exist");
+
+    // Drift V1 so repair has a versioned checksum to realign.
+    std::fs::write(
+        migrations.join("V1__Create.sql"),
+        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(20));",
+    )
+    .unwrap();
+    let report = wp.repair().await.expect("repair");
+    assert_eq!(report.checksums_updated, 1);
+
+    let after = undo_checksum("after").await.expect("undo row must survive");
+    assert_eq!(
+        after, before,
+        "repair rewrote the UNDO_SQL row's checksum to the forward migration's"
+    );
+}
+
+#[tokio::test]
+async fn repair_dry_run_makes_no_changes_on_mysql() {
+    let db = fresh_database("repairdry").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[("V1__T.sql", "CREATE TABLE t (id INT PRIMARY KEY);")],
+    );
+    let config = config_for(name, migrations.clone());
+    let wp = Waypoint::new(config).await.expect("connect");
+    wp.migrate(None).await.expect("migrate");
+
+    // Drift the checksum so there is real work to preview.
+    std::fs::write(
+        migrations.join("V1__T.sql"),
+        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(50));",
+    )
+    .unwrap();
+
+    let dry = wp.repair_with(true).await.expect("dry-run repair");
+    assert!(dry.dry_run);
+    assert_eq!(dry.checksums_updated, 1);
+    assert!(
+        dry.details.iter().all(|d| d.starts_with("Would ")),
+        "{:?}",
+        dry.details
+    );
+
+    // Nothing was written, so validate must still fail for the same reason.
+    let err = wp
+        .validate()
+        .await
+        .expect_err("dry run must not have fixed the checksum");
+    assert!(err.to_string().contains("Checksum mismatch"));
+
+    // And the real repair still finds the same work.
+    let real = wp.repair().await.expect("repair");
+    assert!(!real.dry_run);
+    assert_eq!(real.checksums_updated, dry.checksums_updated);
+    assert!(wp.validate().await.expect("validate").valid);
+}
+
 #[tokio::test]
 async fn baseline_records_a_baseline_row() {
     let db = fresh_database("baseline").await;
@@ -854,7 +956,10 @@ async fn advisory_lock_is_actually_held_between_acquire_and_release() {
         "lock should be free before acquire"
     );
 
-    wp.client().acquire_lock(&table).await.expect("acquire");
+    wp.client()
+        .acquire_lock(name, &table)
+        .await
+        .expect("acquire");
 
     let holder: Option<Option<u64>> = observer
         .exec_first("SELECT IS_USED_LOCK(?)", (lock_key.as_str(),))
@@ -874,7 +979,10 @@ async fn advisory_lock_is_actually_held_between_acquire_and_release() {
         .unwrap();
     assert_eq!(busy, Some(0), "a second session must not acquire the lock");
 
-    wp.client().release_lock(&table).await.expect("release");
+    wp.client()
+        .release_lock(name, &table)
+        .await
+        .expect("release");
 
     let holder: Option<Option<u64>> = observer
         .exec_first("SELECT IS_USED_LOCK(?)", (lock_key.as_str(),))
@@ -1495,4 +1603,82 @@ async fn explain_classifies_ddl_and_dml() {
         .expect("V2 explained");
     // INSERT is not DDL.
     assert!(v2.statements.iter().any(|s| !s.is_ddl));
+}
+
+/// `docs/ENGINES.md` documents `statement_timeout` as
+/// `SET SESSION MAX_EXECUTION_TIME` on MySQL, but the code never issued it —
+/// the setting was silently ignored. It has to land on every pooled connection,
+/// not just the first, because the pool resets sessions on return.
+#[tokio::test]
+async fn statement_timeout_is_applied_to_mysql_sessions() {
+    let db = fresh_database("stmttimeout").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let mut config = config_for(name, tempdir.path().to_path_buf());
+    config.database.statement_timeout_secs = 7;
+
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    // Read it back twice: the second read is served by a different pooled
+    // checkout, which is where a one-off SET would have been lost.
+    for attempt in 0..2 {
+        let pool = wp.client().as_mysql().expect("mysql pool");
+        let mut conn = pool.get_conn().await.unwrap();
+        let ms: Option<u64> = conn
+            .query_first("SELECT @@SESSION.MAX_EXECUTION_TIME")
+            .await
+            .unwrap();
+        assert_eq!(
+            ms,
+            Some(7000),
+            "attempt {attempt}: statement_timeout did not reach the session"
+        );
+    }
+}
+
+/// `row_count` reads `information_schema.tables`, which returns no row at all
+/// for a name that does not exist. The MySQL path used to `unwrap_or(0)`, so
+/// `row_count("typo") < 1000000` was quietly *true* and a guard written as a
+/// safety check passed vacuously. PostgreSQL errored on the same input.
+#[tokio::test]
+async fn row_count_guard_on_a_missing_table_fails_instead_of_passing_vacuously() {
+    let db = fresh_database("rowcount").await;
+    let name = db.name();
+    let tempdir = tempfile::tempdir().unwrap();
+    let migrations = tempdir.path().to_path_buf();
+    write_migrations(
+        &migrations,
+        &[(
+            "V1__Guarded.sql",
+            "-- waypoint:require row_count(\"no_such_table\") < 1000000\n\
+             CREATE TABLE t (id INT PRIMARY KEY);",
+        )],
+    );
+    let config = config_for(name, migrations);
+    let wp = Waypoint::new(config).await.expect("connect");
+
+    let err = wp
+        .migrate(None)
+        .await
+        .expect_err("a row_count guard on a missing table must not pass");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no row-count statistics"),
+        "error should explain why: {msg}"
+    );
+
+    // And the migration must not have run.
+    let pool = mysql_async::Pool::from_url(db_url(name)).unwrap();
+    let mut conn = pool.get_conn().await.unwrap();
+    let found: Vec<String> = conn
+        .exec(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_NAME = 't'",
+            (name,),
+        )
+        .await
+        .unwrap();
+    assert!(found.is_empty(), "migration ran despite the failed guard");
+    drop(conn);
+    pool.disconnect().await.ok();
 }

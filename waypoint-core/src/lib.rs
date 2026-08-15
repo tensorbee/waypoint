@@ -204,7 +204,15 @@ impl Waypoint {
 
     /// Repair the schema history table.
     pub async fn repair(&self) -> Result<RepairReport> {
-        commands::repair::execute_db(&self.client, &self.config).await
+        self.repair_with(false).await
+    }
+
+    /// Repair the schema history table, optionally as a preview.
+    ///
+    /// With `dry_run = true` nothing is written: the returned report describes
+    /// the work a real [`Waypoint::repair`] would perform.
+    pub async fn repair_with(&self, dry_run: bool) -> Result<RepairReport> {
+        commands::repair::execute_db_with(&self.client, &self.config, dry_run).await
     }
 
     /// Baseline an existing database.

@@ -101,7 +101,7 @@ pub async fn execute_snapshot(
     std::fs::create_dir_all(dir)?;
 
     // Generate snapshot ID
-    let snapshot_id = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let snapshot_id = new_snapshot_id();
     let sql_path = dir.join(format!("{}.sql", snapshot_id));
     let meta_path = dir.join(format!("{}.json", snapshot_id));
 
@@ -143,6 +143,24 @@ pub async fn execute_snapshot(
     })
 }
 
+/// Mint an identifier for a new snapshot.
+///
+/// A snapshot is written with `fs::write`, which truncates, so two snapshots
+/// sharing an id means the first is silently gone — and a snapshot is the
+/// rollback artefact an operator is relying on. A bare `%Y%m%d_%H%M%S` gave
+/// only one-second resolution, so `auto_snapshot_on_migrate` firing alongside a
+/// manual `waypoint snapshot` was enough to lose one.
+///
+/// The timestamp stays the leading component so ids remain human-readable and
+/// the lexical sort in [`list_snapshots`] still orders newest-first.
+fn new_snapshot_id() -> String {
+    format!(
+        "{}_{:04x}",
+        chrono::Utc::now().format("%Y%m%d_%H%M%S"),
+        fastrand::u16(..)
+    )
+}
+
 /// Resolve a snapshot id to its `.sql` path, rejecting anything that could
 /// escape the snapshot directory.
 ///
@@ -150,8 +168,9 @@ pub async fn execute_snapshot(
 /// and the resulting file is read and then executed as SQL. `Path::join` with
 /// `../..` walks out of the directory, and with an absolute path discards the
 /// base entirely — so an unchecked id turns `restore` into "execute arbitrary
-/// file as SQL". Generated ids are `%Y%m%d_%H%M%S`, so restricting to
-/// `[A-Za-z0-9._-]` (no separators, no `..`) costs nothing.
+/// file as SQL". Generated ids are [`new_snapshot_id`]'s
+/// `%Y%m%d_%H%M%S_<hex>`, so restricting to `[A-Za-z0-9._-]` (no separators,
+/// no `..`) costs nothing.
 fn snapshot_sql_path(snapshot_config: &SnapshotConfig, snapshot_id: &str) -> Result<PathBuf> {
     let valid = !snapshot_id.is_empty()
         && snapshot_id != ".."
@@ -305,13 +324,24 @@ pub async fn execute_snapshot_db(
 }
 
 /// Restore a schema from a snapshot (dialect-aware entry).
+///
+/// Holds the advisory lock for the whole restore. `restore` drops every object
+/// in the managed schema before replaying the snapshot, which makes it the most
+/// destructive command in the tool — and it was the only state-modifying one
+/// that ran unlocked, so a concurrent `migrate` could be applying migrations
+/// into a schema being dropped underneath it.
 pub async fn execute_restore_db(
     client: &DbClient,
     config: &WaypointConfig,
     snapshot_config: &SnapshotConfig,
     snapshot_id: &str,
 ) -> Result<RestoreReport> {
-    match client.dialect_kind() {
+    // Resolve before locking: the lock key is scoped by schema.
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
+    let table = &config.migrations.table;
+    client.acquire_lock(&schema, table).await?;
+
+    let result = match client.dialect_kind() {
         #[cfg(feature = "postgres")]
         DialectKind::Postgres => {
             execute_restore(client.as_postgres()?, config, snapshot_config, snapshot_id).await
@@ -328,7 +358,13 @@ pub async fn execute_restore_db(
         DialectKind::Mysql => Err(WaypointError::ConfigError(
             "MySQL support is not compiled in (enable the `mysql` feature)".into(),
         )),
+    };
+
+    if let Err(e) = client.release_lock(&schema, table).await {
+        log::error!("Failed to release advisory lock: {}", e);
     }
+
+    result
 }
 
 // ── MySQL snapshot/restore ────────────────────────────────────────────────────
@@ -352,7 +388,7 @@ async fn execute_snapshot_mysql(
 
     let dir = &snapshot_config.directory;
     std::fs::create_dir_all(dir)?;
-    let snapshot_id = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+    let snapshot_id = new_snapshot_id();
     let sql_path = dir.join(format!("{}.sql", snapshot_id));
     let meta_path = dir.join(format!("{}.json", snapshot_id));
 

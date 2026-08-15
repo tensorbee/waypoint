@@ -70,11 +70,7 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<DriftRe
     let schema_name = &config.migrations.schema;
     let table = &config.migrations.table;
 
-    // Generate a random temp schema name
-    let temp_schema = format!(
-        "waypoint_drift_check_{}",
-        chrono::Utc::now().format("%Y%m%d%H%M%S")
-    );
+    let temp_schema = db::sandbox_name("waypoint_drift_check");
 
     // Create temp schema
     client
@@ -83,13 +79,25 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<DriftRe
 
     let result = run_drift_check(client, config, schema_name, table, &temp_schema).await;
 
-    // Always clean up temp schema
-    let _ = client
+    // Always clean up the throwaway schema. A failure is logged rather than
+    // discarded: the schema is then left behind in the user's database, and
+    // silence means they only find out by noticing it later. `simulate` has
+    // always reported this; `drift` used to swallow it.
+    if let Err(e) = client
         .batch_execute(&format!(
             "DROP SCHEMA {} CASCADE",
             db::quote_ident(&temp_schema)
         ))
-        .await;
+        .await
+    {
+        log::warn!(
+            "Failed to drop the drift-check schema {}; it has been left behind and \
+             can be removed with `DROP SCHEMA {} CASCADE`: {}",
+            temp_schema,
+            db::quote_ident(&temp_schema),
+            e
+        );
+    }
 
     result
 }
@@ -270,10 +278,7 @@ async fn execute_mysql(client: &DbClient, config: &WaypointConfig) -> Result<Dri
     let schema_name = client.resolve_schema(&config.migrations.schema).await?;
     let table = &config.migrations.table;
 
-    let temp_db = format!(
-        "waypoint_drift_check_{}",
-        chrono::Utc::now().format("%Y%m%d%H%M%S")
-    );
+    let temp_db = crate::db::sandbox_name("waypoint_drift_check");
 
     // Create the throwaway database.
     let mut conn = pool.get_conn().await?;

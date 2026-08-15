@@ -421,12 +421,23 @@ fn download_and_replace(
 
     // Persist (disables auto-cleanup) and rename atomically
     if let Err(e) = tmp_path.persist(&current_exe) {
-        // Try to restore from backup
-        if backup_path.exists() {
-            let _ = fs::rename(&backup_path, &current_exe);
+        // Try to restore from backup. If *that* also fails the installed binary
+        // may be missing entirely, which is the worst moment to say nothing —
+        // tell the operator exactly where their old binary is so they can put
+        // it back by hand.
+        if backup_path.exists()
+            && let Err(restore_err) = fs::rename(&backup_path, &current_exe)
+        {
+            return Err(WaypointError::UpdateError(format!(
+                "Failed to replace binary: {e}. Restoring the previous version also \
+                 failed: {restore_err}. Your previous binary is still at {} — move it \
+                 back to {} to recover.",
+                backup_path.display(),
+                current_exe.display()
+            )));
         }
         return Err(WaypointError::UpdateError(format!(
-            "Failed to replace binary: {e}"
+            "Failed to replace binary: {e}. The previous version was restored."
         )));
     }
 

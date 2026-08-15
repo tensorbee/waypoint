@@ -43,6 +43,19 @@ pub struct AppliedMigration {
     pub reversal_sql: Option<String>,
 }
 
+/// Row types whose checksum must never be realigned against a `V` file.
+///
+/// A `BASELINE` row has no script and carries a NULL checksum. An `UNDO_SQL`
+/// row shares the forward migration's *version* but records the `U` file's
+/// checksum, so matching it by version alone and rewriting it would store a
+/// value the U file never had.
+///
+/// Two places must agree on this list: `commands::repair::compute_repair`,
+/// which decides what to realign, and the `update_checksum` predicate in each
+/// engine, which applies it. Keeping the list here is what stops them drifting
+/// — the guard used to exist only in the deciding half.
+pub const NON_REALIGNABLE_TYPES: [&str; 2] = ["UNDO_SQL", "BASELINE"];
+
 // ── Re-exports of the legacy PG-only entry points ────────────────────────────
 //
 // External callers expect these names at `crate::history::*`. They live in
@@ -76,23 +89,75 @@ pub async fn create_history_table_db(client: &DbClient, schema: &str, table: &st
 }
 
 /// Auto-upgrade the history table to add new columns if they don't exist.
+///
+/// The column is looked up before the `ALTER` rather than issuing it blindly
+/// and swallowing whatever comes back. A blind attempt cannot distinguish
+/// "already there" (benign, and the common case) from "no ALTER privilege"
+/// (fatal) — and the latter used to surface much later as an opaque
+/// "column reversal_sql does not exist" from an unrelated `SELECT`.
 async fn upgrade_history_table_db(client: &DbClient, schema: &str, table: &str) -> Result<()> {
-    let dialect = client.dialect();
-    let fq = dialect.qualified_table(schema, table);
+    if history_column_exists_db(client, schema, table, "reversal_sql").await? {
+        return Ok(());
+    }
+
+    let fq = client.dialect().qualified_table(schema, table);
     let sql = match client.dialect_kind() {
         crate::dialect::DialectKind::Postgres => {
             format!("ALTER TABLE {fq} ADD COLUMN IF NOT EXISTS reversal_sql TEXT")
         }
         crate::dialect::DialectKind::Mysql => {
-            // MySQL 8.0.29+ supports IF NOT EXISTS on ADD COLUMN; older
-            // patch versions error on duplicate column — caller log-ignores.
-            format!("ALTER TABLE {fq} ADD COLUMN IF NOT EXISTS reversal_sql LONGTEXT")
+            // MySQL 8.0.29+ supports IF NOT EXISTS on ADD COLUMN; older patch
+            // versions reject it, so plain ADD COLUMN is used after the
+            // existence check above has already ruled out a duplicate.
+            format!("ALTER TABLE {fq} ADD COLUMN reversal_sql LONGTEXT")
         }
     };
-    if let Err(e) = client.execute_raw(&sql).await {
-        log::debug!("History table upgrade (reversal_sql): {}", e);
+
+    client.execute_raw(&sql).await.map(|_| ()).map_err(|e| {
+        WaypointError::ConfigError(format!(
+            "Could not add the `reversal_sql` column to {}.{}: {}. Waypoint reads \
+             this column on every history query, so the connecting role needs \
+             ALTER on the history table at least once to complete the upgrade.",
+            schema, table, e
+        ))
+    })
+}
+
+/// Whether a named column exists on the history table (dialect-aware).
+async fn history_column_exists_db(
+    client: &DbClient,
+    schema: &str,
+    table: &str,
+    column: &str,
+) -> Result<bool> {
+    match client {
+        #[cfg(feature = "postgres")]
+        DbClient::Postgres(c) => {
+            let row = c
+                .query_one(
+                    "SELECT EXISTS (
+                        SELECT FROM information_schema.columns
+                        WHERE table_schema = $1 AND table_name = $2 AND column_name = $3
+                    )",
+                    &[&schema, &table, &column],
+                )
+                .await?;
+            Ok(row.get::<_, bool>(0))
+        }
+        #[cfg(feature = "mysql")]
+        DbClient::Mysql(pool) => {
+            use mysql_async::prelude::*;
+            let mut conn = pool.get_conn().await?;
+            let found: Option<i64> = conn
+                .exec_first(
+                    "SELECT 1 FROM information_schema.columns \
+                     WHERE table_schema = ? AND table_name = ? AND column_name = ? LIMIT 1",
+                    (schema, table, column),
+                )
+                .await?;
+            Ok(found.is_some())
+        }
     }
-    Ok(())
 }
 
 /// Whether an error message indicates a benign "duplicate index/key name"

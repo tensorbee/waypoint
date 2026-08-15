@@ -26,13 +26,14 @@ pub async fn execute(
     baseline_version: Option<&str>,
     baseline_description: Option<&str>,
 ) -> Result<()> {
+    let schema = &config.migrations.schema;
     let table = &config.migrations.table;
 
-    db::acquire_advisory_lock(client, table).await?;
+    db::acquire_advisory_lock(client, schema, table).await?;
 
     let result = execute_inner_pg(client, config, baseline_version, baseline_description).await;
 
-    if let Err(e) = db::release_advisory_lock(client, table).await {
+    if let Err(e) = db::release_advisory_lock(client, schema, table).await {
         log::error!("Failed to release advisory lock: {}", e);
     }
 
@@ -93,13 +94,16 @@ pub async fn execute_db(
     baseline_version: Option<&str>,
     baseline_description: Option<&str>,
 ) -> Result<()> {
+    // Resolve before locking: the lock key is scoped by schema, so it has to
+    // be the same name the rest of the command uses.
+    let schema = client.resolve_schema(&config.migrations.schema).await?;
     let table = &config.migrations.table;
 
-    client.acquire_lock(table).await?;
+    client.acquire_lock(&schema, table).await?;
 
     let result = execute_inner_db(client, config, baseline_version, baseline_description).await;
 
-    if let Err(e) = client.release_lock(table).await {
+    if let Err(e) = client.release_lock(&schema, table).await {
         log::error!("Failed to release advisory lock: {}", e);
     }
 

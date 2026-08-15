@@ -47,6 +47,26 @@ pub struct MigrateReport {
     pub hooks_executed: usize,
     /// Total execution time of all hooks in milliseconds.
     pub hooks_time_ms: i32,
+    /// Migrations that were pending but skipped by a `require` guard under
+    /// `guards.on_require_fail = "skip"`.
+    ///
+    /// Previously a skip left no trace in the report at all — only an `INFO`
+    /// log line, which both `--json` and `--quiet` suppress. A pipeline reading
+    /// `migrations_applied` had no way to tell a deliberate skip from there
+    /// being nothing to do.
+    #[serde(default)]
+    pub skipped: Vec<SkippedMigration>,
+}
+
+/// A pending migration that a `require` guard skipped.
+#[derive(Debug, Serialize)]
+pub struct SkippedMigration {
+    /// Version string, or `None` for a repeatable migration.
+    pub version: Option<String>,
+    /// Filename of the migration that was skipped.
+    pub script: String,
+    /// The `require` expression that was not satisfied.
+    pub expression: String,
 }
 
 /// Details of a single applied migration within a migrate run.
@@ -69,7 +89,11 @@ pub(crate) enum GuardAction {
     /// All preconditions passed; proceed with the migration.
     Continue,
     /// A precondition failed with on_require_fail=Skip; skip this migration.
-    Skip,
+    ///
+    /// Carries the expression that failed so the run can *report* the skip.
+    /// It used to carry nothing, and the only trace was an `INFO` log line —
+    /// which `--json` and `--quiet` both suppress.
+    Skip(String),
     /// A precondition failed fatally; abort with the given error.
     Error(WaypointError),
 }
@@ -98,7 +122,7 @@ pub(crate) fn classify_require(
                     script,
                     expr_str
                 );
-                GuardAction::Skip
+                GuardAction::Skip(expr_str.to_string())
             }
             crate::guard::OnRequireFail::Warn => {
                 log::warn!(

@@ -44,16 +44,35 @@ CREATE INDEX IF NOT EXISTS {ver_idx_name} ON {fq} (version);
 }
 
 /// Auto-upgrade the history table to add new columns if they don't exist.
+///
+/// Checks for the column before altering, so a genuine permission failure is
+/// reported rather than swallowed. See the dialect-aware twin in
+/// `crate::history::upgrade_history_table_db`.
 async fn upgrade_history_table(client: &Client, schema: &str, table: &str) -> Result<()> {
-    let fq = format!("{}.{}", quote_ident(schema), quote_ident(table));
-    let sql = format!(
-        "ALTER TABLE {fq} ADD COLUMN IF NOT EXISTS reversal_sql TEXT",
-        fq = fq,
-    );
-    if let Err(e) = client.batch_execute(&sql).await {
-        log::debug!("History table upgrade (reversal_sql): {}", e);
+    let exists = client
+        .query_one(
+            "SELECT EXISTS (
+                SELECT FROM information_schema.columns
+                WHERE table_schema = $1 AND table_name = $2 AND column_name = 'reversal_sql'
+            )",
+            &[&schema, &table],
+        )
+        .await?
+        .get::<_, bool>(0);
+    if exists {
+        return Ok(());
     }
-    Ok(())
+
+    let fq = format!("{}.{}", quote_ident(schema), quote_ident(table));
+    let sql = format!("ALTER TABLE {fq} ADD COLUMN IF NOT EXISTS reversal_sql TEXT");
+    client.batch_execute(&sql).await.map_err(|e| {
+        crate::error::WaypointError::ConfigError(format!(
+            "Could not add the `reversal_sql` column to {}.{}: {}. Waypoint reads \
+             this column on every history query, so the connecting role needs \
+             ALTER on the history table at least once to complete the upgrade.",
+            schema, table, e
+        ))
+    })
 }
 
 /// Check if the history table exists.
@@ -169,6 +188,13 @@ pub async fn delete_failed_migrations(client: &Client, schema: &str, table: &str
 }
 
 /// Update the checksum for a specific migration by version.
+///
+/// `UNDO_SQL` and `BASELINE` rows are excluded even when they carry the same
+/// version. An undo row records the *U* file's checksum and a baseline row has
+/// none, so realigning them against the forward migration's file would write a
+/// value that was never true. This predicate is the enforcement of the skip
+/// list in `commands::repair::compute_repair` — the two must agree, and
+/// `crate::history::REALIGNABLE_TYPES` names them in one place.
 pub async fn update_checksum(
     client: &Client,
     schema: &str,
@@ -177,15 +203,24 @@ pub async fn update_checksum(
     new_checksum: i32,
 ) -> Result<()> {
     let sql = format!(
-        "UPDATE {}.{} SET checksum = $1 WHERE version = $2",
+        "UPDATE {}.{} SET checksum = $1 WHERE version = $2 AND type <> ALL($3)",
         quote_ident(schema),
         quote_ident(table)
     );
-    client.execute(&sql, &[&new_checksum, &version]).await?;
+    let excluded: Vec<&str> = crate::history::NON_REALIGNABLE_TYPES.to_vec();
+    client
+        .execute(&sql, &[&new_checksum, &version, &excluded])
+        .await?;
     Ok(())
 }
 
 /// Update the checksum for a repeatable migration by script (version IS NULL).
+///
+/// **Not used by `repair`, deliberately.** A repeatable migration is pending
+/// exactly when its stored checksum differs from the file, so realigning that
+/// value without executing the script marks a modified migration as applied
+/// while the database keeps the previous definition. Call this only from a path
+/// that has actually run the script.
 pub async fn update_repeatable_checksum(
     client: &Client,
     schema: &str,

@@ -965,20 +965,15 @@ fn eval_expr<'a>(
                     .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
                     .collect();
 
-                let row = client.query_one(&sql, &params).await.map_err(|e| {
-                    WaypointError::GuardFailed {
-                        kind: "evaluation".to_string(),
-                        script: String::new(),
-                        expression: format!(
-                            "{name}({}) failed: {e}",
-                            string_args
-                                .iter()
-                                .map(|a| format!("\"{a}\""))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        ),
-                    }
-                })?;
+                // See the dialect-aware twin below: `query_opt` so a `row_count`
+                // against something that is not a plain table reports *why*.
+                let row = client
+                    .query_opt(&sql, &params)
+                    .await
+                    .map_err(|e| guard_failed(name, &string_args, &e.to_string()))?
+                    .ok_or_else(|| {
+                        guard_failed(name, &string_args, &missing_row_reason(&string_args))
+                    })?;
 
                 if is_boolean {
                     let val: bool = row.get(0);
@@ -1113,10 +1108,16 @@ async fn exec_builtin(
                 .iter()
                 .map(|s| s as &(dyn tokio_postgres::types::ToSql + Sync))
                 .collect();
+            // `query_opt`, not `query_one`: `row_count` reads
+            // `pg_stat_user_tables`, which has no row for a name that is not a
+            // plain table. `query_one` turned that into tokio-postgres's
+            // "query returned an unexpected number of rows", which tells the
+            // operator nothing about what is actually wrong.
             let row = pg
-                .query_one(&sql, &params)
+                .query_opt(&sql, &params)
                 .await
-                .map_err(|e| guard_failed(name, string_args, &e.to_string()))?;
+                .map_err(|e| guard_failed(name, string_args, &e.to_string()))?
+                .ok_or_else(|| guard_failed(name, string_args, &missing_row_reason(string_args)))?;
             if is_boolean {
                 Ok(GuardValue::Bool(row.get(0)))
             } else {
@@ -1155,9 +1156,17 @@ async fn exec_builtin(
             if is_boolean {
                 Ok(GuardValue::Bool(matches!(result, Some(n) if n != 0)))
             } else {
-                // COUNT(*) always returns a row, so None here means a malformed
-                // builtin query — treat as 0 rather than panic.
-                Ok(GuardValue::Number(result.unwrap_or(0)))
+                // `row_count` selects from `information_schema.tables`, which
+                // returns **no row at all** for a name that does not exist —
+                // the old code's `unwrap_or(0)` therefore made
+                // `row_count("typo") < 1000000` quietly *true*, so a guard the
+                // operator wrote as a safety check passed vacuously. (The
+                // comment here used to claim "COUNT(*) always returns a row",
+                // which was never what this query does.) PostgreSQL errors on
+                // the same input, so this also keeps the two engines in step.
+                result.map(GuardValue::Number).ok_or_else(|| {
+                    guard_failed(name, string_args, &missing_row_reason(string_args))
+                })
             }
         }
         #[cfg(not(feature = "mysql"))]
@@ -1165,6 +1174,21 @@ async fn exec_builtin(
             "MySQL support is not compiled in".into(),
         )),
     }
+}
+
+/// Explain a numeric builtin that matched no catalog row.
+///
+/// The only numeric builtin is `row_count`, and it reads a statistics/catalog
+/// view rather than the table itself. "No row" therefore means the name is not
+/// a plain table there — most often a typo, but also a view or a partitioned
+/// parent. Saying so is the difference between an operator fixing the guard and
+/// staring at "query returned an unexpected number of rows".
+fn missing_row_reason(args: &[String]) -> String {
+    let target = args.first().map(String::as_str).unwrap_or("<unknown>");
+    format!(
+        "no row-count statistics for '{target}' — it may not exist in this schema, \
+         or may be a view or partitioned parent rather than a plain table"
+    )
 }
 
 fn guard_failed(name: &str, args: &[String], reason: &str) -> WaypointError {

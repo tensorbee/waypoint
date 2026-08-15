@@ -87,11 +87,36 @@ pub fn print_migrate_summary(report: &waypoint_core::MigrateReport) {
         );
     }
 
-    if report.migrations_applied == 0 {
+    // Guard-skipped migrations are reported before anything else. Saying
+    // "Schema is up to date" when a pending migration was deliberately skipped
+    // is simply untrue, and the only other trace of a skip is an INFO log line
+    // that `--json` and `--quiet` both suppress.
+    if !report.skipped.is_empty() {
         println!(
             "{}",
-            "Schema is up to date. No migration necessary.".green()
+            format!(
+                "Skipped {} migration(s): a `require` guard was not satisfied",
+                report.skipped.len()
+            )
+            .yellow()
+            .bold()
         );
+        for s in &report.skipped {
+            let label = match &s.version {
+                Some(v) => format!("V{} ({})", v, s.script),
+                None => s.script.clone(),
+            };
+            println!("  {} {} — require {}", "→".yellow(), label, s.expression);
+        }
+    }
+
+    if report.migrations_applied == 0 {
+        let msg = if report.skipped.is_empty() {
+            "Schema is up to date. No migration necessary."
+        } else {
+            "Nothing was applied — every pending migration was skipped by a guard."
+        };
+        println!("{}", msg.green());
         return;
     }
 
@@ -140,7 +165,25 @@ pub fn print_validate_result(report: &waypoint_core::ValidateReport) {
 /// Print a repair report.
 pub fn print_repair_result(report: &waypoint_core::RepairReport) {
     if report.failed_removed == 0 && report.checksums_updated == 0 {
-        println!("{}", "Repair complete. No changes needed.".green());
+        let msg = if report.dry_run {
+            "Repair dry run: nothing to repair. No changes were made."
+        } else {
+            "Repair complete. No changes needed."
+        };
+        println!("{}", msg.green());
+        return;
+    }
+
+    if report.dry_run {
+        println!(
+            "{}",
+            "Repair dry run — no changes were made. A real `waypoint repair` would:"
+                .yellow()
+                .bold()
+        );
+        for detail in &report.details {
+            println!("  {} {}", "→".yellow(), detail);
+        }
         return;
     }
 
@@ -492,7 +535,29 @@ pub fn print_explain_report(report: &waypoint_core::ExplainReport) {
                 println!("    {} {}", "!".yellow(), warning.yellow());
             }
         }
+
+        if let Some(ref err) = migration.error {
+            println!(
+                "    {} {}",
+                "✗".red().bold(),
+                format!("Dry run stopped: {}", err).red().bold()
+            );
+            println!(
+                "    {}",
+                "Statements after this one were not checked — the transaction was already aborted."
+                    .dimmed()
+            );
+        }
         println!();
+    }
+
+    if report.has_failures() {
+        println!(
+            "{}",
+            "This migration would FAIL. Nothing was applied."
+                .red()
+                .bold()
+        );
     }
 }
 

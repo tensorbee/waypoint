@@ -56,14 +56,7 @@ pub async fn execute(client: &Client, config: &WaypointConfig) -> Result<Simulat
     // Create history table if needed (for querying applied state)
     history::create_history_table(client, schema_name, table).await?;
 
-    // Generate a unique temp schema name
-    let temp_schema = format!(
-        "waypoint_sim_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
+    let temp_schema = crate::db::sandbox_name("waypoint_sim");
 
     let result = run_simulation(client, config, &temp_schema).await;
 
@@ -241,13 +234,7 @@ async fn execute_mysql(client: &DbClient, config: &WaypointConfig) -> Result<Sim
 
     history::create_history_table_db(client, &source_db, table).await?;
 
-    let temp_db = format!(
-        "waypoint_sim_{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
+    let temp_db = crate::db::sandbox_name("waypoint_sim");
 
     let result = run_simulation_mysql(client, config, &source_db, &temp_db).await;
 

@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use tokio_postgres::Client;
 
 use crate::commands::migrate::{
-    GuardAction, MigrateDetail, MigrateReport, PendingCriteria, classify_ensure, classify_require,
-    guard_parse_error, select_pending,
+    GuardAction, MigrateDetail, MigrateReport, PendingCriteria, SkippedMigration, classify_ensure,
+    classify_require, guard_parse_error, select_pending,
 };
 use crate::config::WaypointConfig;
 use crate::db;
@@ -242,9 +242,10 @@ pub async fn execute_with_options(
     target_version: Option<&str>,
     force: bool,
 ) -> Result<MigrateReport> {
+    let schema = &config.migrations.schema;
     let table = &config.migrations.table;
 
-    db::acquire_advisory_lock(client, table).await?;
+    db::acquire_advisory_lock(client, schema, table).await?;
 
     let result = if config.migrations.batch_transaction {
         run_batch_migrate(client, config, target_version, force).await
@@ -252,7 +253,7 @@ pub async fn execute_with_options(
         run_migrate(client, config, target_version, force).await
     };
 
-    if let Err(e) = db::release_advisory_lock(client, table).await {
+    if let Err(e) = db::release_advisory_lock(client, schema, table).await {
         log::error!("Failed to release advisory lock: {}", e);
     }
 
@@ -286,6 +287,7 @@ async fn run_migrate(
         details: Vec::new(),
         hooks_executed: 0,
         hooks_time_ms: 0,
+        skipped: Vec::new(),
     };
 
     let before_placeholders = build_placeholders(
@@ -321,16 +323,12 @@ async fn run_migrate(
             &setup.db_name,
             &migration.script,
         );
-        let (count, ms) = hooks::run_hooks(
-            client,
-            &setup.all_hooks,
-            &HookType::BeforeEachMigrate,
-            &each_placeholders,
-        )
-        .await?;
-        report.hooks_executed += count;
-        report.hooks_time_ms += ms;
-
+        // Safety and `require` guards are evaluated *before* the
+        // `beforeEachMigrate` hook, because either can decide the migration
+        // will not run. Running the before-hook first left a guard-skipped
+        // migration with no matching `afterEachMigrate`, so anything the pair
+        // sets up and tears down was left dangling. The MySQL path, the
+        // repeatable loop below and `run_batch_migrate` all order it this way.
         if config.safety.enabled {
             let safety_report = crate::safety::analyze_migration(
                 client,
@@ -354,9 +352,26 @@ async fn run_migrate(
 
         match evaluate_require_guards(client, schema, migration, config).await? {
             GuardAction::Continue => {}
-            GuardAction::Skip => continue,
+            GuardAction::Skip(expression) => {
+                report.skipped.push(SkippedMigration {
+                    version: Some(version.raw.clone()),
+                    script: migration.script.clone(),
+                    expression,
+                });
+                continue;
+            }
             GuardAction::Error(e) => return Err(e),
         }
+
+        let (count, ms) = hooks::run_hooks(
+            client,
+            &setup.all_hooks,
+            &HookType::BeforeEachMigrate,
+            &each_placeholders,
+        )
+        .await?;
+        report.hooks_executed += count;
+        report.hooks_time_ms += ms;
 
         let before_snapshot = if config.reversals.enabled && migration.is_versioned() {
             Some(crate::reversal::capture_before(client, schema).await?)
@@ -462,12 +477,20 @@ async fn run_migrate(
             );
         }
 
-        // Repeatable migrations honour `require` guards too — the same
-        // precondition semantics as versioned ones. (`ensure` guards need the
-        // hold-transaction path, which repeatables do not use.)
+        // Repeatable migrations honour `require` and `ensure` guards on the
+        // same terms as versioned ones. MySQL already did; PostgreSQL used to
+        // skip `ensure` here, which meant the same directive was enforced on
+        // one engine and silently ignored on the other.
         match evaluate_require_guards(client, schema, migration, config).await? {
             GuardAction::Continue => {}
-            GuardAction::Skip => continue,
+            GuardAction::Skip(expression) => {
+                report.skipped.push(SkippedMigration {
+                    version: None,
+                    script: migration.script.clone(),
+                    expression,
+                });
+                continue;
+            }
             GuardAction::Error(e) => return Err(e),
         }
 
@@ -488,6 +511,7 @@ async fn run_migrate(
         report.hooks_executed += count;
         report.hooks_time_ms += ms;
 
+        let has_ensure_guards = config.guards.enabled && !migration.directives.ensure.is_empty();
         let exec_time = apply_migration(
             client,
             config,
@@ -497,9 +521,23 @@ async fn run_migrate(
             &setup.installed_by,
             &setup.db_user,
             &setup.db_name,
-            false,
+            has_ensure_guards,
         )
         .await?;
+
+        if has_ensure_guards {
+            if let Err(guard_err) = evaluate_ensure_guards(client, schema, migration, config).await
+            {
+                if let Err(rollback_err) = client.batch_execute("ROLLBACK").await {
+                    log::error!(
+                        "Failed to rollback after ensure guard failure: {}",
+                        rollback_err
+                    );
+                }
+                return Err(guard_err);
+            }
+            client.batch_execute("COMMIT").await?;
+        }
 
         let (count, ms) = hooks::run_hooks(
             client,
@@ -565,7 +603,13 @@ mod batch_regexes {
 /// `strip_comments` preserves byte offsets, so the regexes below still line up
 /// with the original source.
 fn validate_batch_compatible(script: &str, raw_sql: &str) -> Result<()> {
-    let sql = &crate::sql_parser::strip_comments(raw_sql);
+    // Literals are blanked as well as comments: the checks below are keyword
+    // scans, and a keyword inside `'...'` is data, not a statement. Refusing
+    // `INSERT INTO runbook VALUES ('nightly VACUUM …')` as non-transactional is
+    // a false rejection of a perfectly valid migration. Both helpers preserve
+    // byte offsets, so the regexes still line up with the original source.
+    let sql =
+        &crate::sql_parser::blank_string_literals(&crate::sql_parser::strip_comments(raw_sql));
     let upper = sql.to_uppercase();
 
     if upper.contains("CONCURRENTLY") {
@@ -638,7 +682,7 @@ async fn run_batch_migrate(
 
     let pending = select_pending(&setup.resolved, &setup.criteria(config))?;
     let mut pending_versioned = pending.versioned;
-    let pending_repeatables = pending.repeatables;
+    let mut pending_repeatables = pending.repeatables;
 
     let placeholders_map = build_placeholders(
         &config.placeholders,
@@ -675,17 +719,30 @@ async fn run_batch_migrate(
         }
     }
 
-    let mut skipped_scripts: HashSet<&str> = HashSet::new();
-    for migration in &pending_versioned {
+    // `require` guards are evaluated up front, before the batch transaction
+    // opens, so a skip removes the migration from the batch rather than
+    // aborting one that is already half-applied. Repeatables are included:
+    // they honour `require` on the non-batch path and on MySQL, and omitting
+    // them here meant the same directive was enforced or ignored depending on
+    // whether `batch_transaction` happened to be set.
+    let mut skipped_scripts: HashSet<String> = HashSet::new();
+    let mut skipped: Vec<SkippedMigration> = Vec::new();
+    for migration in pending_versioned.iter().chain(pending_repeatables.iter()) {
         match evaluate_require_guards(client, schema, migration, config).await? {
             GuardAction::Continue => {}
-            GuardAction::Skip => {
-                skipped_scripts.insert(&migration.script);
+            GuardAction::Skip(expression) => {
+                skipped_scripts.insert(migration.script.clone());
+                skipped.push(SkippedMigration {
+                    version: migration.version().map(|v| v.raw.clone()),
+                    script: migration.script.clone(),
+                    expression,
+                });
             }
             GuardAction::Error(e) => return Err(e),
         }
     }
     pending_versioned.retain(|m| !skipped_scripts.contains(m.script.as_str()));
+    pending_repeatables.retain(|m| !skipped_scripts.contains(m.script.as_str()));
 
     let mut report = MigrateReport {
         migrations_applied: 0,
@@ -693,6 +750,7 @@ async fn run_batch_migrate(
         details: Vec::new(),
         hooks_executed: 0,
         hooks_time_ms: 0,
+        skipped,
     };
 
     let before_placeholders = build_placeholders(
@@ -800,6 +858,14 @@ async fn run_batch_migrate(
             )
             .await?;
 
+            // `ensure` postconditions are evaluated here, inside the batch
+            // transaction. A failure propagates out of this async block and the
+            // caller rolls the whole batch back, which is the right semantics
+            // for all-or-nothing mode. Batch mode used to skip `ensure`
+            // entirely: the directive was silently ignored and the migration
+            // reported as applied.
+            evaluate_ensure_guards(client, schema, migration, config).await?;
+
             let (count, ms) = hooks::run_hooks(
                 client,
                 &setup.all_hooks,
@@ -865,6 +931,8 @@ async fn run_batch_migrate(
                 true,
             )
             .await?;
+
+            evaluate_ensure_guards(client, schema, migration, config).await?;
 
             let (count, ms) = hooks::run_hooks(
                 client,
@@ -1158,6 +1226,20 @@ mod tests {
                    CREATE TABLE users (id SERIAL PRIMARY KEY);";
         let result = validate_batch_compatible("V1__Init.sql", sql);
         assert!(result.is_ok(), "unexpected error: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_batch_compatible_ignores_keywords_in_string_literals() {
+        // `strip_comments` blanks comments but leaves string literals intact,
+        // so the keyword scan used to match text that is data, not SQL, and
+        // refuse a perfectly transactional migration.
+        let sql = "INSERT INTO runbook (step) VALUES ('nightly VACUUM of the orders table');";
+        let result = validate_batch_compatible("V1__Runbook.sql", sql);
+        assert!(
+            result.is_ok(),
+            "keyword inside a string literal must not be read as a statement: {:?}",
+            result.err()
+        );
     }
 
     #[test]

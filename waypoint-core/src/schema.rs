@@ -845,11 +845,77 @@ fn diff_columns(
     }
 }
 
+/// Dependency rank for emitting a diff as DDL.
+///
+/// `generate_ddl` used to emit statements in whatever order `diff` produced
+/// them, which is not a runnable order. An auto-reversal for a dropped table
+/// came out as `CREATE TABLE orders (id integer DEFAULT nextval('orders_id_seq'
+/// …))` followed *later* by `CREATE SEQUENCE orders_id_seq`, so `undo` failed
+/// with `relation "orders_id_seq" does not exist` and the table never came
+/// back.
+///
+/// Creates run outwards from the things nothing depends on; drops run inwards.
+/// The sort is stable, so objects within a rank keep their diff order.
+fn ddl_rank(d: &SchemaDiff) -> u8 {
+    match d {
+        // Drops first, most dependent first.
+        SchemaDiff::TriggerDropped { .. } => 0,
+        SchemaDiff::ViewDropped(_) => 1,
+        SchemaDiff::FunctionDropped(_) => 2,
+        SchemaDiff::IndexDropped { .. } => 3,
+        SchemaDiff::ConstraintDropped { .. } => 4,
+        SchemaDiff::ColumnDropped { .. } => 5,
+        SchemaDiff::TableDropped(_) => 6,
+        SchemaDiff::SequenceDropped(_) => 7,
+        SchemaDiff::EnumDropped(_) => 8,
+        SchemaDiff::ExtensionDropped(_) => 9,
+
+        // Then creates, least dependent first.
+        SchemaDiff::ExtensionAdded(_) => 10,
+        SchemaDiff::EnumAdded(_) => 11,
+        SchemaDiff::SequenceAdded(_) => 12,
+        SchemaDiff::TableAdded(_) => 13,
+        SchemaDiff::ColumnAdded { .. } => 14,
+        SchemaDiff::ColumnAltered { .. } => 15,
+        SchemaDiff::ConstraintAdded(_) => 16,
+        SchemaDiff::IndexAdded(_) => 17,
+        SchemaDiff::ViewAdded(_) | SchemaDiff::ViewAltered { .. } => 18,
+        SchemaDiff::FunctionAdded(_) | SchemaDiff::FunctionAltered { .. } => 19,
+        SchemaDiff::TriggerAdded(_) => 20,
+    }
+}
+
+/// Order diffs into a sequence that can actually be executed, and drop indexes
+/// that a constraint in the same set will create anyway.
+///
+/// PostgreSQL builds a backing index for every `PRIMARY KEY` / `UNIQUE`
+/// constraint, and introspection sees both. Emitting both made the reversal
+/// fail on the second one with "relation already exists".
+fn order_diffs_for_ddl(diffs: &[SchemaDiff]) -> Vec<&SchemaDiff> {
+    let constraint_names: std::collections::HashSet<&str> = diffs
+        .iter()
+        .filter_map(|d| match d {
+            SchemaDiff::ConstraintAdded(c) => Some(c.name.as_str()),
+            _ => None,
+        })
+        .collect();
+
+    let mut ordered: Vec<&SchemaDiff> = diffs
+        .iter()
+        .filter(|d| match d {
+            SchemaDiff::IndexAdded(idx) => !constraint_names.contains(idx.name.as_str()),
+            _ => true,
+        })
+        .collect();
+    ordered.sort_by_key(|d| ddl_rank(d));
+    ordered
+}
+
 /// Generate DDL statements from schema diffs.
 pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
     let mut statements = Vec::new();
 
-    for d in diffs {
+    for d in order_diffs_for_ddl(diffs) {
         match d {
             SchemaDiff::TableAdded(t) => {
                 let cols: Vec<String> = t
@@ -997,7 +1063,11 @@ pub fn generate_ddl(diffs: &[SchemaDiff]) -> String {
                 ));
             }
             SchemaDiff::EnumAdded(e) => {
-                let values: Vec<String> = e.values.iter().map(|v| format!("'{}'", v)).collect();
+                let values: Vec<String> = e
+                    .values
+                    .iter()
+                    .map(|v| crate::db::quote_literal(v))
+                    .collect();
                 statements.push(format!(
                     "CREATE TYPE {} AS ENUM ({});",
                     quote_ident(&e.name),
@@ -1067,7 +1137,11 @@ pub fn to_ddl(snapshot: &SchemaSnapshot) -> String {
 
     // Enums before tables (types must exist for columns)
     for e in &snapshot.enums {
-        let values: Vec<String> = e.values.iter().map(|v| format!("'{}'", v)).collect();
+        let values: Vec<String> = e
+            .values
+            .iter()
+            .map(|v| crate::db::quote_literal(v))
+            .collect();
         statements.push(format!(
             "CREATE TYPE {} AS ENUM ({});",
             quote_ident(&e.name),

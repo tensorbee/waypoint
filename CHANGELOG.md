@@ -5,6 +5,287 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-08-15
+
+Beyond the issue #2 fix, this release carries the results of a full-crate
+audit. The recurring theme is **work the tool did, or declined to do, without
+telling the operator**.
+
+### Fixed — ledger integrity
+
+- **`repair` rewrote the checksum of `UNDO_SQL` and `BASELINE` rows.** The
+  realignment `UPDATE` matched on `version` alone, with no `type` predicate.
+  An undo row carries the *U* file's checksum under the forward migration's
+  version, so repairing a drifted `V1` also overwrote the `U1` row's checksum
+  with a value that was never true. `compute_repair` had always skipped those
+  row types when *deciding* — the guard was simply never carried into the
+  statement that *applied* the decision. Both halves now read
+  `history::NON_REALIGNABLE_TYPES`.
+- **`repair` silently discarded a pending repeatable migration.** A repeatable
+  is pending exactly when its stored checksum differs from the file, so
+  realigning that checksum without executing the script marked a modified
+  `R__*.sql` as applied while the database kept the previous definition — with
+  nothing reporting the discrepancy. Repeatable checksums are no longer
+  realigned; drift there is the designed re-run signal, not corruption, which
+  is why `validate` never flagged it either.
+
+### Fixed — migrations that quietly did not run
+
+- **`ensure` guards were ignored in batch-transaction mode.** With
+  `batch_transaction = true` (or `--transaction`), every `-- waypoint:ensure`
+  directive was skipped — not even parsed — and the migration reported as
+  applied. They are now evaluated inside the batch transaction, so a failure
+  rolls the whole batch back.
+- **`ensure` guards were ignored for repeatable migrations on PostgreSQL**
+  while MySQL enforced them, and **`require` guards were ignored for
+  repeatable migrations in batch mode** while every other path enforced them.
+  All four apply paths now agree on the order: safety → require → beforeEach →
+  apply → ensure → afterEach.
+- **`beforeEachMigrate` ran for migrations a `require` guard then skipped**, so
+  the paired `afterEachMigrate` never ran and anything the pair sets up was
+  left dangling. Guards are now evaluated before the hook.
+- **Guard-skipped migrations left no trace in the report.** The only record was
+  an `INFO` log line, which `--json` and `--quiet` both suppress, and the CLI
+  then printed "Schema is up to date. No migration necessary." `MigrateReport`
+  gains `skipped`, and the CLI names each skipped migration and the guard that
+  failed.
+- **`.sql` files that were neither hooks nor `V`/`U`/`R` migrations were
+  skipped in silence**, so `v1__create.sql` with a lowercase `v` was never
+  applied and never mentioned. `is_hook_file` also accepted near-misses like
+  `beforeMigrate_typo.sql` that `scan_hooks` then rejected, leaving the file to
+  run as neither; the two now apply the same rule.
+- **Misspelled directives were indistinguishable from ordinary comments.**
+  `-- waypoint:requires …` (plural) dropped the precondition silently. Any
+  unrecognised `waypoint:` directive now warns.
+
+### Fixed — destructive operations
+
+- **`clean` aborted partway through on any schema containing a procedure or an
+  aggregate**, after the views, tables and sequences had already been dropped.
+  It issued `DROP FUNCTION` for every `pg_proc` row; PostgreSQL rejects that
+  for procedures and aggregates. Routines are now dropped with the keyword
+  matching `pg_proc.prokind`, and extension-owned routines are left alone
+  rather than failing the same way.
+- **`simulate` and `drift` named their throwaway sandbox from a bare clock
+  reading** — milliseconds for `simulate`, whole *seconds* for `drift` — and
+  drop it unconditionally, including when their own `CREATE` failed. Two runs
+  starting in the same tick meant the loser dropped the sandbox the winner was
+  still using. Names now include the process id and a random suffix.
+- **`restore` ran without the advisory lock**, alone among the state-modifying
+  commands, while being the most destructive one in the tool.
+- **Snapshot ids collided at one-second resolution and silently overwrote each
+  other**, including when `auto_snapshot_on_migrate` fired alongside a manual
+  `waypoint snapshot`.
+
+### Fixed — auto-reversal did not work
+
+- **`undo` via an auto-generated reversal failed on a dropped table, and the
+  table did not come back.** Three faults compounded: statements were emitted
+  in diff order rather than dependency order (so `CREATE TABLE … DEFAULT
+  nextval('s')` preceded `CREATE SEQUENCE s`); the constraint-backing indexes
+  PostgreSQL creates for `PRIMARY KEY`/`UNIQUE` were emitted *alongside* the
+  constraints that recreate them; and the DDL used unqualified names while
+  nothing sets `search_path`, so it targeted the wrong schema. A round-trip now
+  restores the table with its columns, constraints and indexes intact.
+
+### Fixed — the dry run said a broken migration was fine
+
+- **`migrate --dry-run` reported every statement as checked even when the
+  migration could not possibly apply.** The preview executes each DDL statement
+  inside a transaction it rolls back afterwards; a failing statement was
+  swallowed at `debug` level, and PostgreSQL aborts the whole transaction on
+  the first error, so every later statement failed and was swallowed too. A
+  migration that creates the same table twice previewed as four clean
+  statements and exited 0. The preview now records the first failure, stops
+  rather than listing statements it never really checked, says so prominently,
+  and exits 15 — so a CI job cannot go green on a migration that will fail.
+  (The MySQL path deliberately does not execute DDL, so its `EXPLAIN` failures
+  remain expected rather than being treated as preview failures.)
+- **The preview ran each migration in its own rolled-back transaction**, so V2
+  could not see the table V1 had just created. Once failures stopped being
+  swallowed this surfaced as a *false* failure for any migration that builds on
+  an earlier pending one — the ordinary case. The whole preview now runs in one
+  transaction, in order, exactly as `migrate` would, and rolls back at the end.
+- `ExplainReport::has_failures()` and `MigrationExplain::error` expose the same
+  information to `--json` consumers and library callers.
+
+### Fixed — remaining silent failures and unstable output
+
+- **`drift` left its throwaway schema behind without saying so** when the
+  cleanup `DROP SCHEMA` failed. The MySQL path already warned; PostgreSQL
+  discarded the error. The message now names the schema and the statement that
+  removes it.
+- **A failed rollback of the dry-run transaction was discarded**, leaving the
+  connection holding uncommitted schema changes with no indication — which
+  matters for library callers that keep using the client.
+- **`self-update` said nothing when restoring the previous binary also failed.**
+  That is the one moment the operator most needs to be told where their old
+  binary is; the error now names the backup path and how to put it back.
+- **MySQL's `advise` generated fix SQL without quoting identifiers**, unlike the
+  PostgreSQL rules which use `quote_ident` throughout.
+- **The "available placeholders" list in a `PlaceholderNotFound` error came out
+  of a `HashMap`**, so the same error was worded differently on every run.
+
+### Fixed — `check-conflicts`
+
+- **`[migrations] locations` was silently overridden.** Any file named
+  `V*.sql` or `R*.sql` counted as a migration wherever it lived, so example
+  migrations under a docs or fixtures directory were compared between
+  branches. A false conflict exits 11 and blocks a git hook. Files that look
+  like migrations outside the configured locations are now reported instead of
+  silently included.
+- The list of conflicting objects came out of a `HashSet`, so the same conflict
+  was described in a different order on every run.
+
+### Fixed — non-deterministic ordering
+
+- **`dependency_ordering` applied migrations in a different order on almost
+  every run.** Kahn's ready-queue was fed from a `HashSet`, whose iteration
+  order is randomly seeded per process — five of six test processes produced a
+  different order. The order `explain` previewed was not necessarily the order
+  `migrate` used, and environments disagreed on `installed_rank`. Ties now
+  break by version.
+- **Multi-database execution order had the same defect**, seeded from a
+  `HashMap`, so `--fail-fast` left a different subset migrated each time. Ties
+  now break by `[[databases]]` declaration order, and the
+  missing-dependency and cycle error messages are stable too.
+
+### Fixed — guards that did not guard
+
+- **`row_count` guards passed vacuously on MySQL.** The builtin reads
+  `information_schema.tables`, which returns no row for a name that does not
+  exist, and the result was `unwrap_or(0)` — so
+  `require row_count("typo") < 1000000` evaluated to true and the migration
+  ran. PostgreSQL errored on the same input, so the engines disagreed as well.
+  Both now fail with a message naming the likely cause (typo, view, or
+  partitioned parent) instead of tokio-postgres's "query returned an unexpected
+  number of rows".
+
+### Fixed — wrong answers
+
+- **A DDL keyword inside a string literal was extracted as a real DDL
+  operation.** `INSERT INTO runbook (step) VALUES ('then DROP TABLE users')`
+  was read as a `DROP TABLE`, so `safety` reported a table drop that did not
+  exist — and under `block_on_danger` refused the migration, pushing the
+  operator towards `--force`, which also disables the checks that are real.
+  `extract_ddl_operations` now matches against a literal-blanked copy while
+  still extracting `DEFAULT 'x'` verbatim.
+- **Generated DDL did not escape quotes in enum labels.** A label containing an
+  apostrophe produced `CREATE TYPE "mood" AS ENUM ('fine', 'it's bad')` —
+  invalid SQL in the snapshot, which `restore` then skipped with only a
+  warning, silently losing the type and every column using it.
+- **`validate_batch_compatible` refused valid migrations** whose string
+  literals happened to contain `VACUUM`, `CLUSTER` or `CONCURRENTLY`.
+
+### Fixed — settings that were accepted and ignored
+
+- **`statement_timeout` and `keepalive` were silently ignored on MySQL**, even
+  though `docs/ENGINES.md` documented the former. Both are now applied;
+  `MAX_EXECUTION_TIME` is set via `setup` rather than `init` so it survives the
+  pool's connection reset. `connect_timeout` and `connect_retries` genuinely do
+  not map to `mysql_async`'s lazy pool and are now documented as
+  PostgreSQL-only rather than left to be discovered.
+- **Five numeric environment variables discarded invalid values in silence** —
+  `WAYPOINT_DATABASE_PORT`, `WAYPOINT_CONNECT_RETRIES`,
+  `WAYPOINT_CONNECT_TIMEOUT`, `WAYPOINT_STATEMENT_TIMEOUT`,
+  `WAYPOINT_KEEPALIVE`. `WAYPOINT_CONNECT_TIMEOUT=30s` left the default in
+  force while the operator believed otherwise.
+- **`WAYPOINT_BATCH_TRANSACTION` coerced anything unrecognised to `false`**,
+  so `yes`, `on` or a typo silently turned off all-or-nothing mode that the
+  TOML had switched on.
+- **The top-level `[migrations]` block was ignored for `[[databases]]`
+  entries.** Per-database settings started from defaults rather than from the
+  global block, so a configured `table` or `schema` reverted per target and the
+  ledger was written to `public.waypoint_schema_history`. `[database]` already
+  inherited; `[migrations]` now does too.
+- **`upgrade_history_table` swallowed every error at `debug`**, so a genuine
+  permission failure surfaced much later as an opaque "column reversal_sql does
+  not exist" from an unrelated query.
+- The generic `Hint: Check your waypoint.toml …` is no longer appended to
+  configuration errors that already state their own remedy.
+
+### Breaking
+
+- **`--dry-run` is now refused on subcommands that cannot honour it.** It is a
+  `global = true` flag, so clap advertises "Preview what would be done without
+  making changes" in every subcommand's `--help`, but only `migrate` ever
+  implemented it. `baseline`, `undo`, `clean`, `restore <id>` and
+  `self-update` accepted the flag and made their changes anyway. They now exit
+  non-zero with a message naming the read-only alternative. `waypoint restore`
+  with no snapshot ID only lists snapshots, so it is unaffected.
+- **`repair` no longer realigns repeatable checksums** (see above).
+- **`RepairReport` gained `dry_run`; `MigrateReport` gained `skipped`.**
+  Additive, but an exhaustive struct literal will need updating.
+- **The advisory-lock functions take the schema.** `db::advisory_lock_id`,
+  `db::acquire_advisory_lock`, `db::acquire_advisory_lock_with_timeout`,
+  `db::release_advisory_lock` and the `DbClient::{acquire_lock,
+  acquire_lock_with_timeout, release_lock}` methods all gained a `schema`
+  parameter. See the upgrade note above for the operational consequence.
+- **Snapshot ids gained a random suffix**, becoming
+  `%Y%m%d_%H%M%S_<hex>`. The timestamp is still the leading component, so
+  prefix matching and newest-first ordering are unchanged.
+
+### Added
+
+- `Waypoint::repair_with(dry_run)` and `commands::repair::execute_db_with`
+  expose the repair preview to library callers.
+- `db::quote_literal`, `db::sandbox_name`, `sql_parser::blank_string_literals`
+  and `history::NON_REALIGNABLE_TYPES` — small shared helpers that exist to
+  stop the defects above being reintroduced in one place while fixed in
+  another.
+
+### Upgrading — read before deploying
+
+**The PostgreSQL advisory-lock key changed, and mixed versions do not exclude
+each other.**
+
+Until now the lock id was a hash of the history-*table* name alone. PostgreSQL
+advisory locks are scoped per database, so two *schemas* in the same database
+shared one lock: with a schema per tenant or per service, every migration in
+the database queued behind every other one. It was never unsafe — over-locking
+cannot corrupt anything — but it serialised work that has nothing to do with
+each other. The key now includes the schema, matching what the MySQL key has
+always done.
+
+The consequence: **a waypoint before 0.8.0 and a waypoint from 0.8.0 onwards
+compute different lock ids for the same history table, so they will not block
+each other.** Before relying on the lock again:
+
+1. Finish rolling 0.8.0 out everywhere that runs migrations — CI runners,
+   deploy jobs, operator laptops.
+2. Until that is done, do not run migrations against the same database from a
+   mix of old and new versions.
+
+If you cannot complete the rollout in one go, run migrations from a single
+known-version place for the duration. A one-off overlap is only a risk if two
+migrations actually run at the same moment.
+
+### Original issue
+
+- **`repair --dry-run` performed the repair.** ([#2]) The flag was never
+  threaded into `commands::repair`, so a "preview" deleted every
+  `success = false` row and rewrote drifted checksums exactly as a real
+  repair would — and then reported it in the past tense (`Removed 4 failed
+  migration(s)`), giving the operator no signal that a preview had just
+  mutated the ledger. Running `repair` afterwards said `No changes needed`,
+  because the dry run had already applied them. `repair` now computes its
+  whole plan from a `SELECT` and issues no write under `--dry-run`: not the
+  `DELETE`, not the checksum `UPDATE`s, and not the
+  `CREATE TABLE IF NOT EXISTS` that bootstraps a missing history table.
+- **`repair` modified the history table when it could not see the migration
+  files.** ([#2]) A missing `[migrations] locations` directory only produced
+  `WARN Migration location does not exist`, after which `repair` compared the
+  ledger against zero files, concluded no checksum needed updating, and still
+  deleted the failed rows. A repair with nothing to compare against has no
+  basis for any decision, so it now fails with a `ConfigError` (exit 2)
+  before touching the table.
+- Dry-run output reads as a proposal — `Would remove 4 failed migration(s)`,
+  `Would update checksum for version 0005` — under a header stating that no
+  changes were made. `RepairReport` carries a `dry_run` flag so `--json`
+  consumers can tell the two apart.
+
+[#2]: https://github.com/tensorbee/waypoint/issues/2
+
 ## [0.7.1] - 2026-07-30
 
 ### Fixed
@@ -495,6 +776,8 @@ Closed the four production cautions previously documented in `docs/ENGINES.md`:
 - CI/CD with GitHub Actions
 - Colored table output with `comfy-table`
 
+[0.8.0]: https://github.com/tensorbee/waypoint/compare/v0.7.1...v0.8.0
+[0.7.1]: https://github.com/tensorbee/waypoint/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/tensorbee/waypoint/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/tensorbee/waypoint/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/tensorbee/waypoint/compare/v0.5.0...v0.6.0

@@ -20,7 +20,9 @@ For a one-line "does X work on Y" lookup, see the per-command status table in
 | Schema vs database | namespace within a DB | "schema" === database |
 | Default `schema` config | `"public"` | auto-falls back to `DATABASE()` |
 | History table TZ column | `TIMESTAMPTZ` | `TIMESTAMP` (UTC by convention) |
-| Statement timeout | `SET statement_timeout = '<n>s'` | `SET SESSION MAX_EXECUTION_TIME = <n_ms>` (SELECT only) |
+| Statement timeout | `SET statement_timeout = '<n>s'` | `SET SESSION MAX_EXECUTION_TIME = <n_ms>` (SELECT only — does **not** bound DDL) |
+| `connect_timeout` / `connect_retries` | honoured | **not applied** — `mysql_async` exposes no connect timeout, and its `Pool` is lazy so there is no connect step to retry |
+| `keepalive` | libpq `keepalives_idle` | `tcp_keepalive` |
 | Replication lag unit | bytes (WAL) — `max_replication_lag_mb` | seconds — `max_replication_lag_secs` |
 
 ## Commands
@@ -33,7 +35,7 @@ are behavioral, not "does this command exist".
 | `migrate` | ✅ | ✅ | `batch_transaction = true` errors on MySQL (no transactional DDL) |
 | `info` | ✅ | ✅ | Same output shape both engines |
 | `validate` | ✅ | ✅ | CRC32 checksums byte-identical across engines (Flyway-compat) |
-| `repair` | ✅ | ✅ | Drops failed rows + updates checksums on both |
+| `repair` | ✅ | ✅ | Drops failed rows + realigns **versioned** checksums on both. Repeatables are left alone: their checksum drift *is* the pending signal, so realigning it would mark a modified `R__` script as applied without running it |
 | `baseline` | ✅ | ✅ | Refuses if history table has any entries |
 | `clean` | ✅ | ✅ | PG: `DROP SCHEMA CASCADE`. MySQL: drops views→tables→routines→events with FK checks off |
 | `undo` | ✅ | ✅ | Both: manual U-file > auto-reversal fallback (if `[reversals] enabled`) |

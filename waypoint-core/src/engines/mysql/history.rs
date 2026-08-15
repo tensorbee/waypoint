@@ -156,6 +156,9 @@ pub async fn delete_failed_migrations(pool: &Pool, schema: &str, table: &str) ->
 }
 
 /// Update the checksum for a versioned migration.
+///
+/// Excludes `UNDO_SQL` and `BASELINE` rows sharing the version, for the reason
+/// given on the PostgreSQL twin in `engines::postgres::history::update_checksum`.
 pub async fn update_checksum(
     pool: &Pool,
     schema: &str,
@@ -163,16 +166,29 @@ pub async fn update_checksum(
     version: &str,
     new_checksum: i32,
 ) -> Result<()> {
+    // MySQL has no array parameter, so the fixed type list is expanded into
+    // placeholders rather than interpolated.
+    let placeholders = vec!["?"; crate::history::NON_REALIGNABLE_TYPES.len()].join(", ");
     let sql = format!(
-        "UPDATE {} SET checksum = ? WHERE version = ?",
-        fq(schema, table)
+        "UPDATE {} SET checksum = ? WHERE version = ? AND type NOT IN ({})",
+        fq(schema, table),
+        placeholders
+    );
+    let mut params: Vec<mysql_async::Value> = vec![new_checksum.into(), version.into()];
+    params.extend(
+        crate::history::NON_REALIGNABLE_TYPES
+            .iter()
+            .map(|t| (*t).into()),
     );
     let mut conn = pool.get_conn().await?;
-    conn.exec_drop(&sql, (new_checksum, version)).await?;
+    conn.exec_drop(&sql, params).await?;
     Ok(())
 }
 
 /// Update the checksum for a repeatable migration.
+///
+/// **Not used by `repair`, deliberately** — see the PostgreSQL twin in
+/// `engines::postgres::history::update_repeatable_checksum` for why.
 pub async fn update_repeatable_checksum(
     pool: &Pool,
     schema: &str,

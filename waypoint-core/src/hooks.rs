@@ -59,10 +59,20 @@ const HOOK_PREFIXES: &[HookPrefixEntry] = &[
 ];
 
 /// Check if a filename is a hook callback file (not a migration).
+///
+/// Applies the same `prefix.sql` / `prefix__*.sql` rule as [`scan_hooks`].
+/// It used to accept any `prefix*`, which meant `beforeMigrate_typo.sql`
+/// was claimed as a hook here, then rejected by `scan_hooks` — and so ran as
+/// neither. `scan_migrations` skips whatever this returns true for, so a
+/// mismatch between the two is a file that silently does nothing.
 pub fn is_hook_file(filename: &str) -> bool {
-    HOOK_PREFIXES
-        .iter()
-        .any(|(prefix, _)| filename.starts_with(prefix) && filename.ends_with(".sql"))
+    let Some(stem) = filename.strip_suffix(".sql") else {
+        return false;
+    };
+    HOOK_PREFIXES.iter().any(|(prefix, _)| {
+        stem.strip_prefix(prefix)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with("__"))
+    })
 }
 
 /// Scan migration locations for SQL callback hook files.
@@ -298,6 +308,46 @@ mod tests {
         assert!(!is_hook_file("R__Create_view.sql"));
         assert!(!is_hook_file("beforeMigrate.txt"));
         assert!(!is_hook_file("random.sql"));
+
+        // Must agree with `scan_hooks`, which requires `prefix.sql` or
+        // `prefix__*.sql`. A near-miss is not a hook — claiming it here while
+        // `scan_hooks` rejects it makes the file run as neither, silently.
+        assert!(!is_hook_file("beforeMigrate_typo.sql"));
+        assert!(!is_hook_file("beforeMigrateXYZ.sql"));
+        assert!(!is_hook_file("afterMigrate-extra.sql"));
+    }
+
+    #[test]
+    fn test_is_hook_file_agrees_with_scan_hooks() {
+        let dir = create_temp_dir("agree");
+        let names = [
+            "beforeMigrate.sql",
+            "beforeMigrate__ok.sql",
+            "beforeMigrate_typo.sql",
+            "afterMigrateXYZ.sql",
+            "V1__Real.sql",
+        ];
+        for n in &names {
+            fs::write(dir.join(n), "SELECT 1;").unwrap();
+        }
+
+        let collected: std::collections::HashSet<String> = scan_hooks(std::slice::from_ref(&dir))
+            .unwrap()
+            .into_iter()
+            .map(|h| h.script_name)
+            .collect();
+
+        for n in &names {
+            assert_eq!(
+                is_hook_file(n),
+                collected.contains(*n),
+                "{n}: is_hook_file says {}, scan_hooks says {}",
+                is_hook_file(n),
+                collected.contains(*n)
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
