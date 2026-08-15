@@ -5,12 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.1] - 2026-08-15
+
+A dependency-only release. No behaviour changes.
+
+### Security
+
+- **`lru` 0.18.1 → 0.18.2** for [RUSTSEC-2026-0253] — a potential
+  use-after-free from missing panic safety in `LruCache::pop()`. It reaches
+  waypoint transitively through `mysql_async`, so only builds with the `mysql`
+  feature are affected.
+
+  This advisory was published after v0.8.0 was tagged, so **the v0.8.0 binaries
+  and Docker image still contain the affected version**. Anyone using the
+  `mysql` feature should move to v0.8.1.
+
+[RUSTSEC-2026-0253]: https://rustsec.org/advisories/RUSTSEC-2026-0253
 
 ### Dependencies
 
-Every dependency is now at its latest published version, and `cargo audit`
-reports no known advisories.
+Every remaining dependency is now at its latest published version, and
+`cargo audit` reports no known advisories.
 
 - `comfy-table` 7 → 8. The preset API changed: `load_preset(UTF8_FULL)` plus
   `apply_modifier(UTF8_ROUND_CORNERS)` became
@@ -254,14 +269,6 @@ telling the operator**.
   and `history::NON_REALIGNABLE_TYPES` — small shared helpers that exist to
   stop the defects above being reintroduced in one place while fixed in
   another.
-
-### Security
-
-- Updated the `lru` transitive dependency (via `mysql_async`) from 0.18.1 to
-  0.18.2 for [RUSTSEC-2026-0253] — a potential use-after-free from missing
-  panic safety in `LruCache::pop()`. Affects the `mysql` feature only.
-
-[RUSTSEC-2026-0253]: https://rustsec.org/advisories/RUSTSEC-2026-0253
 
 ### Upgrading — read before deploying
 
@@ -805,6 +812,7 @@ Closed the four production cautions previously documented in `docs/ENGINES.md`:
 - CI/CD with GitHub Actions
 - Colored table output with `comfy-table`
 
+[0.8.1]: https://github.com/tensorbee/waypoint/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/tensorbee/waypoint/compare/v0.7.1...v0.8.0
 [0.7.1]: https://github.com/tensorbee/waypoint/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/tensorbee/waypoint/compare/v0.6.1...v0.7.0
