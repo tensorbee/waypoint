@@ -109,7 +109,7 @@ curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh |
 Pin a specific version:
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | WAYPOINT_VERSION=v0.8.0 sh
+curl -sSf https://raw.githubusercontent.com/tensorbee/waypoint/main/install.sh | WAYPOINT_VERSION=v0.8.1 sh
 ```
 
 The installer verifies the downloaded archive against the release
@@ -122,7 +122,7 @@ with keyless [cosign](https://github.com/sigstore/cosign). CI consumers can
 verify a download without maintaining their own digest:
 
 ```bash
-TAG=v0.8.0
+TAG=v0.8.1
 BASE="https://github.com/tensorbee/waypoint/releases/download/${TAG}"
 
 curl -sSfLO "${BASE}/waypoint-${TAG}-linux-amd64.tar.gz"

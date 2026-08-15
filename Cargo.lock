@@ -2149,7 +2149,7 @@ dependencies = [
 
 [[package]]
 name = "waypoint-cli"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "clap",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "waypoint-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "crc32fast",
