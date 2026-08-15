@@ -1,6 +1,6 @@
 [package]
 name = "waypoint-cli"
-version = "0.7.1"
+version = "0.8.0"
 edition = "2024"
 # Edition 2024 requires 1.85; let-chains used in this crate require 1.88.
 rust-version = "1.88"
@@ -18,7 +18,7 @@ name = "waypoint"
 path = "src/main.rs"
 
 [dependencies]
-waypoint-core = { version = "0.7.1", path = "../waypoint-core", default-features = false }
+waypoint-core = { version = "0.8.0", path = "../waypoint-core", default-features = false }
 clap = { version = "4", features = ["derive"] }
 comfy-table = "7"
 colored = "3"
