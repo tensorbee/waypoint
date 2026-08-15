@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Dependencies
+
+Every dependency is now at its latest published version, and `cargo audit`
+reports no known advisories.
+
+- `comfy-table` 7 → 8. The preset API changed: `load_preset(UTF8_FULL)` plus
+  `apply_modifier(UTF8_ROUND_CORNERS)` became
+  `load_style(UTF8_FULL.with_rounded_corners())`, presets now being
+  `TableStyle` values rather than strings. Table rendering is unchanged —
+  verified against live `info` and `restore` output.
+- `sha2` 0.10 → 0.11, used to verify the release checksum in `self-update`.
+  The known-answer test (`sha256_matches_known_vector`) still passes.
+- 51 compatible updates picked up by `cargo update`.
+
+One transitive dependency is deliberately held back: `generic-array` stays at
+0.14.7 because `crypto-common 0.1.7` pins it exactly (`=0.14.7`), reached
+through `mysql_common` → `mysql_async`. It carries no advisory, and moving it
+requires an upstream release.
+
 ## [0.8.0] - 2026-08-15
 
 Beyond the issue #2 fix, this release carries the results of a full-crate

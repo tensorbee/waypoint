@@ -20,7 +20,7 @@ path = "src/main.rs"
 [dependencies]
 waypoint-core = { version = "0.8.0", path = "../waypoint-core", default-features = false }
 clap = { version = "4", features = ["derive"] }
-comfy-table = "7"
+comfy-table = "8"
 colored = "3"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -32,7 +32,7 @@ tempfile = { version = "3", optional = true }
 flate2 = { version = "1", optional = true }
 tar = { version = "0.4", optional = true }
 # Verifies the release SHA256SUMS entry before a downloaded binary is trusted.
-sha2 = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 
 [features]
 default = ["self-update", "postgres"]
