@@ -234,6 +234,14 @@ telling the operator**.
   stop the defects above being reintroduced in one place while fixed in
   another.
 
+### Security
+
+- Updated the `lru` transitive dependency (via `mysql_async`) from 0.18.1 to
+  0.18.2 for [RUSTSEC-2026-0253] — a potential use-after-free from missing
+  panic safety in `LruCache::pop()`. Affects the `mysql` feature only.
+
+[RUSTSEC-2026-0253]: https://rustsec.org/advisories/RUSTSEC-2026-0253
+
 ### Upgrading — read before deploying
 
 **The PostgreSQL advisory-lock key changed, and mixed versions do not exclude
